@@ -70,6 +70,10 @@ fn pick_mapping(candidates: &[ProcessMapping], window_titles: &[String]) -> Opti
     candidates.iter().find(|m| m.title_filter.is_none()).cloned()
 }
 
+/// How long to ignore a process after a session ends (prevents brief launcher re-spawns from
+/// starting a phantom second session, e.g. javaw.exe relaunching during Minecraft mod pack close).
+const POST_SESSION_COOLDOWN: Duration = Duration::from_secs(15);
+
 /// Active session: we're currently tracking this process.
 #[derive(Debug, Clone)]
 pub struct ActiveSession {
@@ -120,6 +124,7 @@ fn try_run_wmi_watch(
     shutdown: Arc<AtomicBool>,
     tx: mpsc::Sender<(String, ProcessMapping, f64)>,
     on_session_started: Arc<dyn Fn(String, ProcessMapping) + Send + Sync + 'static>,
+    last_ended: Arc<std::sync::RwLock<Option<(String, Instant)>>>,
 ) -> bool {
     use serde::Deserialize;
     use wmi::{COMLibrary, WMIConnection};
@@ -179,6 +184,17 @@ fn try_run_wmi_watch(
 
             if !needs_title_check {
                 // No title filter — start immediately (existing behaviour).
+                // Skip if this process just ended (brief launcher re-spawn cooldown).
+                {
+                    let le = last_ended.read().unwrap();
+                    if let Some((ref last_proc, last_time)) = *le {
+                        if last_proc.eq_ignore_ascii_case(&event.process_name)
+                            && last_time.elapsed() < POST_SESSION_COOLDOWN
+                        {
+                            continue;
+                        }
+                    }
+                }
                 let mut cur = current_session.write().unwrap();
                 if cur.is_some() {
                     continue;
@@ -201,6 +217,7 @@ fn try_run_wmi_watch(
                 let on_session_started = Arc::clone(&on_session_started);
                 let process_name = event.process_name.clone();
                 let process_id = event.process_id;
+                let last_ended_clone = Arc::clone(&last_ended);
 
                 std::thread::spawn(move || {
                     let pid = Pid::from(process_id as usize);
@@ -208,6 +225,18 @@ fn try_run_wmi_watch(
                     while Instant::now() < deadline {
                         if current_session.read().unwrap().is_some() {
                             return; // Another session started meanwhile.
+                        }
+                        // Respect cooldown from a recent session end for this process.
+                        {
+                            let le = last_ended_clone.read().unwrap();
+                            if let Some((ref last_proc, last_time)) = *le {
+                                if last_proc.eq_ignore_ascii_case(&process_name)
+                                    && last_time.elapsed() < POST_SESSION_COOLDOWN
+                                {
+                                    std::thread::sleep(Duration::from_millis(500));
+                                    continue;
+                                }
+                            }
                         }
                         let window_titles = get_window_titles_for_pid(process_id);
                         if let Some(mapping) = pick_mapping(&candidates, &window_titles) {
@@ -249,6 +278,10 @@ pub fn run_poll_loop(
 ) {
     let (tx, rx) = mpsc::channel::<(String, ProcessMapping, f64)>();
 
+    // Tracks when the last session ended per process name, to suppress phantom re-launches.
+    let last_ended: Arc<std::sync::RwLock<Option<(String, Instant)>>> =
+        Arc::new(std::sync::RwLock::new(None));
+
     // Wrap in Arc so it can be shared between WMI path and polling fallback.
     let on_started: Arc<dyn Fn(String, ProcessMapping) + Send + Sync + 'static> =
         Arc::new(on_session_started);
@@ -260,6 +293,7 @@ pub fn run_poll_loop(
         Arc::clone(&shutdown),
         tx.clone(),
         Arc::clone(&on_started),
+        Arc::clone(&last_ended),
     );
 
     #[cfg(not(windows))]
@@ -271,6 +305,7 @@ pub fn run_poll_loop(
         let current_session = Arc::clone(&current_session);
         let shutdown = Arc::clone(&shutdown);
         let tx = tx.clone();
+        let last_ended_poll = Arc::clone(&last_ended);
 
         std::thread::spawn(move || {
             let mut system = System::new_all();
@@ -297,6 +332,17 @@ pub fn run_poll_loop(
                                 .collect();
                             if candidates.is_empty() {
                                 continue 'proc_scan;
+                            }
+                            // Skip if this process is in its post-session cooldown window.
+                            {
+                                let le = last_ended_poll.read().unwrap();
+                                if let Some((ref last_proc, last_time)) = *le {
+                                    if last_proc.eq_ignore_ascii_case(&name)
+                                        && last_time.elapsed() < POST_SESSION_COOLDOWN
+                                    {
+                                        continue 'proc_scan;
+                                    }
+                                }
                             }
                             let needs_title_check =
                                 candidates.iter().any(|m| m.title_filter.is_some());
@@ -348,6 +394,8 @@ pub fn run_poll_loop(
     std::thread::spawn(move || loop {
         match rx.recv_timeout(Duration::from_secs(5)) {
             Ok((process_name, mapping, duration_secs)) => {
+                // Record end time before clearing session so the cooldown window starts immediately.
+                *last_ended.write().unwrap() = Some((process_name.clone(), Instant::now()));
                 *current_session.write().unwrap() = None;
                 on_session_ended(process_name, mapping, duration_secs);
             }

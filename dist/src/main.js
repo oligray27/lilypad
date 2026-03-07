@@ -6,7 +6,7 @@ const $ = (id) => document.getElementById(id);
 
 const VIEW_SIZE = {
   loginView: { width: 560, height: 315 },
-  mainView: { width: 680, height: 335 },
+  mainView: { width: 550, height: 335 },
   mappingsView: { width: 642, height: 625 },
   sessionView: { width: 440, height: 165 },
 };
@@ -58,8 +58,14 @@ async function onLogin(e) {
 }
 
 // Main view (about screen)
-function loadMainView() {
-  // Static content; nothing to load
+function loadMainView() {}
+
+function loadVersion() {
+  window.__TAURI__.app.getVersion().then((v) => {
+    document.querySelectorAll('.app-version').forEach((el) => {
+      el.innerHTML = `v${v} <a href="#" class="ext-link" data-url="https://github.com/oligray27/lilypad/releases/latest" title="View releases">(?)</a>`;
+    });
+  }).catch(() => {});
 }
 
 // --- Mappings view: table of games with exe column ---
@@ -354,6 +360,7 @@ listen('show-login', () => {
 
 // Init: check if we have auth
 async function init() {
+  loadVersion();
   try {
     const auth = await invoke('get_auth_config');
     if (auth && auth.token) {
@@ -369,7 +376,7 @@ async function init() {
 const app = document.getElementById('app');
 app.innerHTML = `
   <div data-view id="loginView">
-    <h2>LilyPad – Login</h2>
+    <div class="page-header"><h2>LilyPad – Login</h2><span class="app-version"></span></div>
     <p class="muted">Enter your FrogLog credentials. The app runs in the system tray and tracks game time when you have process mappings set up.</p>
     <form id="loginForm">
       <label>Username</label>
@@ -381,9 +388,9 @@ app.innerHTML = `
     </form>
   </div>
   <div data-view id="mainView" hidden>
-    <div class="about-header">
-      <h2>LilyPad</h2>
-      <p class="about-subtitle">for FrogLog</p>
+    <div class="page-header">
+      <h2>LilyPad <small class="about-subtitle">for FrogLog</small></h2>
+      <span class="app-version"></span>
     </div>
     <p>A lightweight system tray companion for <a href="#" class="ext-link" data-url="https://froglog.co.uk/">FrogLog</a>, the personal game tracking app. LilyPad watches for game processes in the background and prompts you to log a session when you stop playing.</p>
     <hr />
@@ -395,7 +402,7 @@ app.innerHTML = `
     </ol>
   </div>
   <div data-view id="mappingsView" hidden>
-    <h2>Configuration</h2>
+    <div class="page-header"><h2>Configuration</h2><span class="app-version"></span></div>
     <p class="muted">Type the executable name (e.g. <code>game.exe</code>) in the exe column. Once a session ends, LilyPad will prompt you to log the session.</p>
     <label class="mappings-auto-submit-label"><input type="checkbox" id="mappingsAutoSubmitRegular" /> Auto-submit regular game sessions</label>
     <label class="mappings-auto-submit-label"><input type="checkbox" id="mappingsAutoSubmitLive" /> Auto-submit live service sessions</label>
@@ -420,7 +427,7 @@ app.innerHTML = `
     </div>
   </div>
   <div data-view id="sessionView" hidden>
-    <h2>Session ended</h2>
+    <div class="page-header"><h2>Session ended</h2><span class="app-version"></span></div>
     <p><strong id="sessionGameTitle"></strong> – <span id="sessionDuration"></span></p>
     <form id="sessionForm">
       <div id="sessionNotesWrap" hidden>

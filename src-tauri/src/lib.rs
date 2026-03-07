@@ -3,11 +3,13 @@ mod config;
 mod monitor;
 
 use api::FroglogClient;
-use config::{AuthConfig, ProcessMapConfig, auth_config_path, process_map_path_for_auth};
+use config::{AuthConfig, ProcessMapConfig, ProcessMapping, auth_config_path, process_map_path_for_auth};
 use monitor::{run_poll_loop, ActiveSession};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::time::{Duration, Instant, SystemTime};
+use sysinfo::{ProcessesToUpdate, System};
 use tauri::menu::{Menu, MenuItemBuilder, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{Emitter, Manager, WindowEvent};
@@ -70,6 +72,90 @@ fn api_client(auth: &AuthConfig) -> Option<FroglogClient> {
     let mut c = FroglogClient::new(base.to_string());
     c.set_token(auth.token.clone());
     Some(c)
+}
+
+/// Persisted to disk when a session starts; cleared when it ends normally.
+/// Survives LilyPad crashes so sessions can be recovered on next launch.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedSession {
+    process: String,
+    game_type: String,
+    froglog_id: i32,
+    title: Option<String>,
+    started_at_secs: u64,
+}
+
+/// Shared session-ended handler used by both the normal monitor path and crash recovery.
+fn handle_session_ended(
+    app: tauri::AppHandle,
+    process_name: String,
+    mapping: config::ProcessMapping,
+    duration_secs: f64,
+) {
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        let auto_submit = {
+            let cfg = state.process_map_arc.read().unwrap();
+            if mapping.r#type.eq_ignore_ascii_case("live") {
+                cfg.auto_submit_live
+            } else if mapping.r#type.eq_ignore_ascii_case("session") {
+                cfg.auto_submit_session
+            } else {
+                cfg.auto_submit_regular
+            }
+        };
+        let auth = state.auth.read().unwrap().clone();
+        drop(state);
+
+        if auto_submit {
+            let raw_hours = duration_secs / 3600.0;
+            let hours = { let r = (raw_hours * 100.0).round() / 100.0; if r < 0.01 { 0.01 } else { r } };
+            let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+            let mapping2 = mapping.clone();
+            let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+            std::thread::spawn(move || {
+                let ok = if let Some(client) = api_client(&auth) {
+                    if mapping2.r#type.eq_ignore_ascii_case("live") {
+                        client.add_live_service_session(mapping2.froglog_id, Some(date), Some(hours), Some("Session auto submitted with LilyPad".to_string())).is_ok()
+                    } else if mapping2.r#type.eq_ignore_ascii_case("session") {
+                        client.add_game_session(mapping2.froglog_id, Some(date), Some(hours), Some("Session auto submitted with LilyPad".to_string())).is_ok()
+                    } else {
+                        client.update_game_hours(mapping2.froglog_id, hours).is_ok()
+                    }
+                } else { false };
+                let _ = tx.send(ok);
+            });
+            let submitted = rx.await.unwrap_or(false);
+            if submitted {
+                let title = mapping.title.as_deref().unwrap_or_else(|| mapping.process.as_str());
+                let _ = app.notification().builder()
+                    .title("LilyPad")
+                    .body(format!("Session auto-submitted: {}", title))
+                    .show();
+                return;
+            }
+        }
+
+        let _ = app.emit("session-ended", serde_json::json!({
+            "processName": process_name,
+            "mapping": {
+                "process": mapping.process,
+                "type": mapping.r#type,
+                "froglogId": mapping.froglog_id,
+                "title": mapping.title,
+            },
+            "durationSecs": duration_secs,
+        }));
+        if let Some(w) = app.get_webview_window("main") {
+            let has_notes = mapping.r#type.eq_ignore_ascii_case("live") || mapping.r#type.eq_ignore_ascii_case("session");
+            let (sh, tb) = if has_notes {
+                (SESSION_HEIGHT_LIVE, SESSION_TASKBAR_LIVE)
+            } else {
+                (SESSION_HEIGHT_REGULAR, SESSION_TASKBAR_REGULAR)
+            };
+            show_session_window(&w, sh, tb);
+        }
+    });
 }
 
 fn build_tray_menu(app: &tauri::AppHandle, logged_in: bool) -> Result<Menu<Wry>, Box<dyn std::error::Error + Send + Sync>> {
@@ -390,6 +476,75 @@ pub fn run() {
             let state = app.state::<AppState>();
             let config = Arc::clone(&state.process_map_arc);
             let current_session = Arc::clone(&state.current_session_arc);
+
+            // Path used to persist the active session across crashes/restarts.
+            let session_path = app_handle.path().app_data_dir()
+                .map(|d| d.join("active-session.json"))
+                .unwrap_or_else(|_| std::path::PathBuf::from("active-session.json"));
+
+            // Recover any session that was interrupted by a LilyPad crash or driver restart.
+            if let Ok(json) = std::fs::read_to_string(&session_path) {
+                if let Ok(persisted) = serde_json::from_str::<PersistedSession>(&json) {
+                    let saved_wall = SystemTime::UNIX_EPOCH + Duration::from_secs(persisted.started_at_secs);
+                    let duration_so_far = SystemTime::now().duration_since(saved_wall).unwrap_or_default();
+                    let recovery_mapping = ProcessMapping {
+                        process: persisted.process.clone(),
+                        r#type: persisted.game_type.clone(),
+                        froglog_id: persisted.froglog_id,
+                        title: persisted.title.clone(),
+                        title_filter: None,
+                    };
+
+                    let mut sys = System::new_all();
+                    sys.refresh_processes(ProcessesToUpdate::All);
+                    let still_running_pid = sys.processes().iter().find_map(|(pid, p)| {
+                        let exe_name = p.exe()
+                            .and_then(|path| path.file_name().and_then(|n| n.to_str().map(String::from)))
+                            .unwrap_or_else(|| p.name().to_string_lossy().into_owned());
+                        if exe_name.eq_ignore_ascii_case(&persisted.process) { Some(*pid) } else { None }
+                    });
+
+                    if let Some(pid) = still_running_pid {
+                        // Game still running — restore the session with the correct original start time.
+                        let started_at = Instant::now().checked_sub(duration_so_far).unwrap_or_else(Instant::now);
+                        *current_session.write().unwrap() = Some(ActiveSession {
+                            process_name: persisted.process.clone(),
+                            mapping: recovery_mapping.clone(),
+                            started_at,
+                        });
+                        let session_path_w = session_path.clone();
+                        let current_session_w = Arc::clone(&current_session);
+                        let handle_w = app_handle.clone();
+                        let process_name_w = persisted.process.clone();
+                        let saved_secs = persisted.started_at_secs;
+                        std::thread::spawn(move || {
+                            let mut sys2 = System::new_all();
+                            let deadline = Instant::now() + Duration::from_secs(10);
+                            loop {
+                                sys2.refresh_processes(ProcessesToUpdate::All);
+                                if let Some(proc) = sys2.process(pid) {
+                                    proc.wait();
+                                    break;
+                                }
+                                if Instant::now() > deadline { break; }
+                                std::thread::sleep(Duration::from_secs(1));
+                            }
+                            let duration_secs = SystemTime::now()
+                                .duration_since(SystemTime::UNIX_EPOCH + Duration::from_secs(saved_secs))
+                                .unwrap_or_default()
+                                .as_secs_f64();
+                            let _ = std::fs::remove_file(&session_path_w);
+                            *current_session_w.write().unwrap() = None;
+                            handle_session_ended(handle_w, process_name_w, recovery_mapping, duration_secs);
+                        });
+                    } else {
+                        // Game already gone — report the session immediately.
+                        let _ = std::fs::remove_file(&session_path);
+                        handle_session_ended(app_handle.clone(), persisted.process, recovery_mapping, duration_so_far.as_secs_f64());
+                    }
+                }
+            }
+
             run_poll_loop(
                 config,
                 current_session,
@@ -397,7 +552,22 @@ pub fn run() {
                 2,
                 {
                     let handle = app_handle.clone();
-                    move |process_name, mapping| {
+                    let session_path_start = session_path.clone();
+                    move |process_name, mapping: ProcessMapping| {
+                        // Persist session start so it survives a LilyPad crash.
+                        let secs = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs();
+                        if let Ok(json) = serde_json::to_string(&PersistedSession {
+                            process: mapping.process.clone(),
+                            game_type: mapping.r#type.clone(),
+                            froglog_id: mapping.froglog_id,
+                            title: mapping.title.clone(),
+                            started_at_secs: secs,
+                        }) {
+                            if let Some(parent) = session_path_start.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            let _ = std::fs::write(&session_path_start, json);
+                        }
                         let title = mapping.title.as_deref().unwrap_or_else(|| process_name.as_str());
                         let body = format!("Tracking started: {}", title);
                         let _ = handle.notification().builder()
@@ -406,76 +576,12 @@ pub fn run() {
                             .show();
                     }
                 },
-                move |process_name, mapping, duration_secs| {
-                    let handle = app_handle.clone();
-                    tauri::async_runtime::spawn(async move {
-                        let state = handle.state::<AppState>();
-                        let auto_submit = {
-                            let cfg = state.process_map_arc.read().unwrap();
-                            if mapping.r#type.eq_ignore_ascii_case("live") {
-                                cfg.auto_submit_live
-                            } else if mapping.r#type.eq_ignore_ascii_case("session") {
-                                cfg.auto_submit_session
-                            } else {
-                                cfg.auto_submit_regular
-                            }
-                        };
-                        let auth = state.auth.read().unwrap().clone();
-                        drop(state);
-
-                        if auto_submit {
-                            let raw_hours = duration_secs / 3600.0;
-                            let hours = { let r = (raw_hours * 100.0).round() / 100.0; if r < 0.01 { 0.01 } else { r } };
-                            let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-                            let mapping2 = mapping.clone();
-                            let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
-                            // Create the reqwest::blocking::Client inside the OS thread — creating or
-                            // dropping it inside a tokio context panics ("cannot start/drop a runtime
-                            // from within a runtime").
-                            std::thread::spawn(move || {
-                                let ok = if let Some(client) = api_client(&auth) {
-                                    if mapping2.r#type.eq_ignore_ascii_case("live") {
-                                        client.add_live_service_session(mapping2.froglog_id, Some(date), Some(hours), Some("Session auto submitted with LilyPad".to_string())).is_ok()
-                                    } else if mapping2.r#type.eq_ignore_ascii_case("session") {
-                                        client.add_game_session(mapping2.froglog_id, Some(date), Some(hours), Some("Session auto submitted with LilyPad".to_string())).is_ok()
-                                    } else {
-                                        client.update_game_hours(mapping2.froglog_id, hours).is_ok()
-                                    }
-                                } else { false };
-                                let _ = tx.send(ok);
-                            });
-                            let submitted = rx.await.unwrap_or(false);
-                            if submitted {
-                                let title = mapping.title.as_deref().unwrap_or_else(|| mapping.process.as_str());
-                                let _ = handle.notification().builder()
-                                    .title("LilyPad")
-                                    .body(format!("Session auto-submitted: {}", title))
-                                    .show();
-                                return;
-                            }
-                        }
-
-                        // Show popup (auto-submit off, or not logged in, or submission failed)
-                        let _ = handle.emit("session-ended", serde_json::json!({
-                            "processName": process_name,
-                            "mapping": {
-                                "process": mapping.process,
-                                "type": mapping.r#type,
-                                "froglogId": mapping.froglog_id,
-                                "title": mapping.title,
-                            },
-                            "durationSecs": duration_secs,
-                        }));
-                        if let Some(w) = handle.get_webview_window("main") {
-                            let has_notes = mapping.r#type.eq_ignore_ascii_case("live") || mapping.r#type.eq_ignore_ascii_case("session");
-                            let (sh, tb) = if has_notes {
-                                (SESSION_HEIGHT_LIVE, SESSION_TASKBAR_LIVE)
-                            } else {
-                                (SESSION_HEIGHT_REGULAR, SESSION_TASKBAR_REGULAR)
-                            };
-                            show_session_window(&w, sh, tb);
-                        }
-                    });
+                {
+                    let session_path_end = session_path.clone();
+                    move |process_name, mapping, duration_secs| {
+                        let _ = std::fs::remove_file(&session_path_end);
+                        handle_session_ended(app_handle.clone(), process_name, mapping, duration_secs);
+                    }
                 },
             );
 
