@@ -1,10 +1,11 @@
 {
   "name": "lilypad",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "description": "Froglog game time tracker - system tray app",
   "private": true,
   "scripts": {
     "tauri": "tauri",
+    "copy-frontend": "node scripts/copy-frontend.js",
     "dev": "tauri dev",
     "build": "tauri build"
   },

@@ -35,6 +35,7 @@ pub struct Game {
     pub rel_date: Option<String>,
     pub status: Option<String>,
     pub forklift_certified: Option<bool>,
+    pub session_tracking: Option<bool>,
 }
 
 // Backend returns snake_case. total_hours is SUM(DECIMAL) → string; session_count is COUNT() → bigint string.
@@ -154,6 +155,31 @@ impl FroglogClient {
             .client
             .get(self.url("/live-service"))
             .headers(self.headers())
+            .send()
+            .map_err(|e: reqwest::Error| e.to_string())?;
+        if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err("Unauthorized".to_string());
+        }
+        if !res.status().is_success() {
+            let err: serde_json::Value = res.json().unwrap_or_default();
+            return Err(err["error"].as_str().unwrap_or("Request failed").to_string());
+        }
+        res.json().map_err(|e: reqwest::Error| e.to_string())
+    }
+
+    pub fn add_game_session(
+        &self,
+        game_id: i32,
+        date: Option<String>,
+        hours: Option<f64>,
+        notes: Option<String>,
+    ) -> Result<serde_json::Value, String> {
+        let body = AddSessionBody { date, hours, notes };
+        let res = self
+            .client
+            .post(self.url(&format!("/games/{}/sessions", game_id)))
+            .headers(self.headers())
+            .json(&body)
             .send()
             .map_err(|e: reqwest::Error| e.to_string())?;
         if res.status() == reqwest::StatusCode::UNAUTHORIZED {

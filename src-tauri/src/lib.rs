@@ -19,9 +19,9 @@ use tauri_plugin_opener::OpenerExt;
 /// Tray icon (embedded at compile time from icons/icon.ico).
 const TRAY_ICON: tauri::image::Image<'_> = tauri::include_image!("icons/icon.ico");
 
-const DEFAULT_HEIGHT: f64 = 590.0;
-const MAIN_ABOUT_HEIGHT: f64 = 320.0;
-const WINDOW_WIDTH: f64 = 680.0;
+const DEFAULT_HEIGHT: f64 = 625.0;
+const MAIN_ABOUT_HEIGHT: f64 = 335.0;
+const WINDOW_WIDTH: f64 = 642.0;
 const SESSION_WIDTH: f64 = 440.0;
 const SESSION_HEIGHT_REGULAR: f64 = 165.0;
 const SESSION_HEIGHT_LIVE: f64 = 255.0;
@@ -108,12 +108,20 @@ fn login(
     let res = client.login(&username, &password)?;
     let token = res.token.clone();
     client.set_token(Some(token.clone()));
-    // Persist and switch to this account's process map
+    // Persist and switch to this account's process map (username = stable key so same user reuses same map after re-login)
     let mut auth = state.auth.write().unwrap();
+    let old_map_path = process_map_path_for_auth(&*auth);
     auth.base_url = Some(base_url.trim_end_matches('/').to_string());
     auth.token = Some(token);
+    auth.username = res.username.clone().or_else(|| Some(username.clone()));
     auth.save_to(&auth_config_path()).map_err(|e| e.to_string())?;
-    let map_path = process_map_path_for_auth(&auth);
+    let map_path = process_map_path_for_auth(&*auth);
+    // Migrate: if path changed (token-key -> username-key) and old file exists, copy so mappings are preserved.
+    // Do not copy when old path is the anonymous map (process-map.json) or we would overwrite user data after re-login.
+    let anonymous_path = process_map_path_for_auth(&AuthConfig::default());
+    if old_map_path != map_path && old_map_path != anonymous_path && old_map_path.exists() {
+        let _ = std::fs::copy(&old_map_path, &map_path);
+    }
     let process_map = ProcessMapConfig::load_from(&map_path);
     *state.process_map_arc.write().unwrap() = process_map;
     Ok(serde_json::json!({ "token": res.token, "username": res.username }))
@@ -155,7 +163,7 @@ fn get_live_service_games(state: tauri::State<AppState>) -> Result<Vec<api::Live
 #[tauri::command]
 fn submit_session(
     state: tauri::State<AppState>,
-    game_type: String, // "regular" | "live"
+    game_type: String, // "regular" | "live" | "session"
     game_id: i32,
     hours: f64,
     notes: Option<String>,
@@ -165,6 +173,8 @@ fn submit_session(
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
     if game_type.eq_ignore_ascii_case("live") {
         client.add_live_service_session(game_id, Some(date), Some(hours), notes)
+    } else if game_type.eq_ignore_ascii_case("session") {
+        client.add_game_session(game_id, Some(date), Some(hours), notes)
     } else {
         client.update_game_hours(game_id, hours)
     }
@@ -208,10 +218,11 @@ fn save_process_mapping(
 }
 
 #[tauri::command]
-fn save_auto_submit(state: tauri::State<AppState>, regular: bool, live: bool) -> Result<(), String> {
+fn save_auto_submit(state: tauri::State<AppState>, regular: bool, live: bool, session: bool) -> Result<(), String> {
     let mut map = state.process_map_arc.read().unwrap().clone();
     map.auto_submit_regular = regular;
     map.auto_submit_live = live;
+    map.auto_submit_session = session;
     map.save_to(&process_map_path_for_auth(&state.auth.read().unwrap()))
         .map_err(|e| e.to_string())?;
     *state.process_map_arc.write().unwrap() = map;
@@ -401,7 +412,13 @@ pub fn run() {
                         let state = handle.state::<AppState>();
                         let auto_submit = {
                             let cfg = state.process_map_arc.read().unwrap();
-                            if mapping.r#type.eq_ignore_ascii_case("live") { cfg.auto_submit_live } else { cfg.auto_submit_regular }
+                            if mapping.r#type.eq_ignore_ascii_case("live") {
+                                cfg.auto_submit_live
+                            } else if mapping.r#type.eq_ignore_ascii_case("session") {
+                                cfg.auto_submit_session
+                            } else {
+                                cfg.auto_submit_regular
+                            }
                         };
                         let auth = state.auth.read().unwrap().clone();
                         drop(state);
@@ -419,6 +436,8 @@ pub fn run() {
                                 let ok = if let Some(client) = api_client(&auth) {
                                     if mapping2.r#type.eq_ignore_ascii_case("live") {
                                         client.add_live_service_session(mapping2.froglog_id, Some(date), Some(hours), Some("Session auto submitted with LilyPad".to_string())).is_ok()
+                                    } else if mapping2.r#type.eq_ignore_ascii_case("session") {
+                                        client.add_game_session(mapping2.froglog_id, Some(date), Some(hours), Some("Session auto submitted with LilyPad".to_string())).is_ok()
                                     } else {
                                         client.update_game_hours(mapping2.froglog_id, hours).is_ok()
                                     }
@@ -448,8 +467,8 @@ pub fn run() {
                             "durationSecs": duration_secs,
                         }));
                         if let Some(w) = handle.get_webview_window("main") {
-                            let is_live = mapping.r#type.eq_ignore_ascii_case("live");
-                            let (sh, tb) = if is_live {
+                            let has_notes = mapping.r#type.eq_ignore_ascii_case("live") || mapping.r#type.eq_ignore_ascii_case("session");
+                            let (sh, tb) = if has_notes {
                                 (SESSION_HEIGHT_LIVE, SESSION_TASKBAR_LIVE)
                             } else {
                                 (SESSION_HEIGHT_REGULAR, SESSION_TASKBAR_REGULAR)

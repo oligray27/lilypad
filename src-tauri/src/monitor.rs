@@ -72,9 +72,10 @@ fn pick_mapping(candidates: &[ProcessMapping], window_titles: &[String]) -> Opti
 
 /// Active session: we're currently tracking this process.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct ActiveSession {
+    #[allow(dead_code)]
     pub process_name: String,
+    #[allow(dead_code)]
     pub mapping: ProcessMapping,
     pub started_at: Instant,
 }

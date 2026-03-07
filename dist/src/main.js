@@ -4,12 +4,29 @@ const { listen } = window.__TAURI__.event;
 
 const $ = (id) => document.getElementById(id);
 
-function showView(id, height) {
+const VIEW_SIZE = {
+  loginView: { width: 560, height: 315 },
+  mainView: { width: 680, height: 335 },
+  mappingsView: { width: 642, height: 625 },
+  sessionView: { width: 440, height: 165 },
+};
+
+function showView(id, heightOrOpts) {
   document.querySelectorAll('[data-view]').forEach((el) => {
     el.hidden = el.id !== id;
   });
-  const h = height ?? (id === 'sessionView' ? 200 : 590);
-  invoke('set_window_height', { height: Math.round(h * window.devicePixelRatio) }).catch(() => {});
+  const spec = VIEW_SIZE[id] || { width: 642, height: 625 };
+  let w = spec.width;
+  let h = spec.height;
+  if (heightOrOpts != null) {
+    if (typeof heightOrOpts === 'number') {
+      h = heightOrOpts;
+    } else {
+      if (heightOrOpts.width != null) w = heightOrOpts.width;
+      if (heightOrOpts.height != null) h = heightOrOpts.height;
+    }
+  }
+  invoke('set_window_size', { width: w, height: h }).catch(() => {});
 }
 
 function formatDuration(secs) {
@@ -49,7 +66,7 @@ function loadMainView() {
 let mappingsAllRows = [];
 let mappingsExeFor = {};
 let mappingsTitleFilterFor = {};
-let mappingsMode = 'regular'; // 'regular' | 'live'
+let mappingsMode = 'regular'; // 'regular' | 'live' | 'session'
 let mappingsPage = 0;
 let mappingsSearch = '';
 const MAPPINGS_PAGE_SIZE = 6;
@@ -90,8 +107,8 @@ function renderMappingsTable() {
       const tfEsc = escapeAttr(titleFilter);
       return `<tr data-type="${escapeAttr(row.type)}" data-id="${row.id}" data-title="${escapeAttr(row.title)}">
         <td class="mappings-title">${titleEsc}</td>
-        <td class="mappings-exe-cell"><input type="text" class="mappings-exe" value="${exeEsc}" placeholder="e.g. hl2.exe" data-type="${escapeAttr(row.type)}" data-id="${row.id}" data-title="${escapeAttr(row.title)}" /><button type="button" class="mappings-browse">Browse…</button></td>
-        <td><input type="text" class="mappings-title-filter" value="${tfEsc}" placeholder="optional" data-type="${escapeAttr(row.type)}" data-id="${row.id}" data-title="${escapeAttr(row.title)}" /></td>
+        <td class="mappings-exe-cell"><div class="mappings-exe-cell-inner"><input type="text" class="mappings-exe" value="${exeEsc}" placeholder="e.g. hl2.exe" data-type="${escapeAttr(row.type)}" data-id="${row.id}" data-title="${escapeAttr(row.title)}" /><button type="button" class="mappings-browse">Browse…</button></div></td>
+        <td class="mappings-title-filter-cell"><input type="text" class="mappings-title-filter" value="${tfEsc}" placeholder="optional" data-type="${escapeAttr(row.type)}" data-id="${row.id}" data-title="${escapeAttr(row.title)}" /></td>
       </tr>`;
     })
     .join('');
@@ -106,8 +123,10 @@ function renderMappingsTable() {
   });
   const btnGames = $('mappingsSwitchGames');
   const btnLive = $('mappingsSwitchLive');
+  const btnSession = $('mappingsSwitchSession');
   if (btnGames) btnGames.classList.toggle('active', mappingsMode === 'regular');
   if (btnLive) btnLive.classList.toggle('active', mappingsMode === 'live');
+  if (btnSession) btnSession.classList.toggle('active', mappingsMode === 'session');
   const paginationEl = $('mappingsPagination');
   const prevBtn = $('mappingsPrev');
   const nextBtn = $('mappingsNext');
@@ -133,7 +152,7 @@ async function loadMappingsView() {
       invoke('get_process_mappings'),
     ]);
     const knownKeys = new Set([
-      ...(games || []).map((g) => mappingKey('regular', g.id)),
+      ...(games || []).map((g) => mappingKey(g.session_tracking ? 'session' : 'regular', g.id)),
       ...(liveService || []).map((g) => mappingKey('live', g.id)),
     ]);
     const toRemove = (mapConfig.mappings || []).filter((m) => !knownKeys.has(mappingKey(m.type, m.froglog_id)));
@@ -144,7 +163,7 @@ async function loadMappingsView() {
     mappingsExeFor = exeByGame(mapConfigAfter.mappings || []);
     mappingsTitleFilterFor = titleFilterByGame(mapConfigAfter.mappings || []);
     mappingsAllRows = [
-      ...(games || []).map((g) => ({ id: g.id, title: g.title || `#${g.id}`, type: 'regular' })),
+      ...(games || []).map((g) => ({ id: g.id, title: g.title || `#${g.id}`, type: g.session_tracking ? 'session' : 'regular' })),
       ...(liveService || []).map((g) => ({ id: g.id, title: g.title || `#${g.id}`, type: 'live' })),
     ];
     mappingsMode = 'regular';
@@ -156,6 +175,8 @@ async function loadMappingsView() {
     if (asRegEl) asRegEl.checked = !!mapConfigAfter.auto_submit_regular;
     const asLiveEl = $('mappingsAutoSubmitLive');
     if (asLiveEl) asLiveEl.checked = !!mapConfigAfter.auto_submit_live;
+    const asSessionEl = $('mappingsAutoSubmitSession');
+    if (asSessionEl) asSessionEl.checked = !!mapConfigAfter.auto_submit_session;
     tableWrap.hidden = false;
     renderMappingsTable();
   } catch (e) {
@@ -272,11 +293,11 @@ function showPostPlay(data) {
   $('sessionGameTitle').textContent = title;
   $('sessionDuration').textContent = formatDuration(data.durationSecs || 0);
   $('sessionNotes').value = '';
-  const isLive = mapping.type === 'live';
+  const hasNotes = mapping.type === 'live' || mapping.type === 'session';
   const notesWrap = $('sessionNotesWrap');
-  if (notesWrap) notesWrap.hidden = !isLive;
+  if (notesWrap) notesWrap.hidden = !hasNotes;
   $('sessionError').textContent = '';
-  showView('sessionView', isLive ? 290 : 200);
+  showView('sessionView', { height: hasNotes ? 255 : 165 });
 }
 
 async function onSubmitSession(e) {
@@ -285,7 +306,7 @@ async function onSubmitSession(e) {
   const mapping = pendingSession.mapping || {};
   const gameId = mapping.froglogId;
   const gameType = mapping.type || 'regular';
-  const notes = gameType === 'live' ? ($('sessionNotes').value.trim() || null) : null;
+  const notes = (gameType === 'live' || gameType === 'session') ? ($('sessionNotes').value.trim() || null) : null;
   const errEl = $('sessionError');
   errEl.textContent = '';
   const rawHours = (pendingSession.durationSecs || 0) / 3600;
@@ -314,7 +335,7 @@ listen('session-ended', (event) => {
   showPostPlay(event.payload);
 });
 
-// Tray "Assign exes" opens window and asks frontend to show mappings view
+// Tray "Configure…" opens window and asks frontend to show mappings view
 listen('open-mappings', () => {
   showView('mappingsView');
   loadMappingsView();
@@ -378,15 +399,17 @@ app.innerHTML = `
     <p class="muted">Type the executable name (e.g. <code>game.exe</code>) in the exe column. Once a session ends, LilyPad will prompt you to log the session.</p>
     <label class="mappings-auto-submit-label"><input type="checkbox" id="mappingsAutoSubmitRegular" /> Auto-submit regular game sessions</label>
     <label class="mappings-auto-submit-label"><input type="checkbox" id="mappingsAutoSubmitLive" /> Auto-submit live service sessions</label>
+    <label class="mappings-auto-submit-label"><input type="checkbox" id="mappingsAutoSubmitSession" /> Auto-submit session-tracked game sessions</label>
     <div class="mappings-switch">
       <button type="button" id="mappingsSwitchGames" class="active">Games</button>
+      <button type="button" id="mappingsSwitchSession">Session tracked</button>
       <button type="button" id="mappingsSwitchLive">Live service</button>
     </div>
-    <input type="search" id="mappingsSearch" class="mappings-search" placeholder="Search…" />
+    <div class="mappings-search-wrap"><input type="search" id="mappingsSearch" class="mappings-search" placeholder="Search…" /></div>
     <p id="mappingsError" class="error"></p>
     <div id="mappingsTableWrap" class="mappings-table-wrap">
       <table class="mappings-table">
-        <thead><tr><th>Game</th><th>exe</th><th>Window title filter</th></tr></thead>
+        <thead><tr><th>Game</th><th>exe</th><th class="mappings-th-window-title">Window title filter</th></tr></thead>
         <tbody id="mappingsTableBody"></tbody>
       </table>
     </div>
@@ -425,12 +448,14 @@ document.getElementById('sessionForm').addEventListener('submit', onSubmitSessio
 document.getElementById('skipSession').addEventListener('click', onSkipSession);
 $('mappingsSwitchGames').addEventListener('click', () => setMappingsMode('regular'));
 $('mappingsSwitchLive').addEventListener('click', () => setMappingsMode('live'));
+$('mappingsSwitchSession').addEventListener('click', () => setMappingsMode('session'));
 $('mappingsPrev').addEventListener('click', () => { mappingsPage--; renderMappingsTable(); });
 $('mappingsNext').addEventListener('click', () => { mappingsPage++; renderMappingsTable(); });
 $('mappingsSearch').addEventListener('input', (e) => { mappingsSearch = e.target.value; mappingsPage = 0; renderMappingsTable(); });
 function saveAutoSubmit() {
-  invoke('save_auto_submit', { regular: !!$('mappingsAutoSubmitRegular').checked, live: !!$('mappingsAutoSubmitLive').checked }).catch(() => {});
+  invoke('save_auto_submit', { regular: !!$('mappingsAutoSubmitRegular').checked, live: !!$('mappingsAutoSubmitLive').checked, session: !!$('mappingsAutoSubmitSession').checked }).catch(() => {});
 }
 $('mappingsAutoSubmitRegular').addEventListener('change', saveAutoSubmit);
 $('mappingsAutoSubmitLive').addEventListener('change', saveAutoSubmit);
+$('mappingsAutoSubmitSession').addEventListener('change', saveAutoSubmit);
 init();

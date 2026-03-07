@@ -7,7 +7,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessMapping {
     pub process: String,
-    /// "regular" or "live"
+    /// "regular", "live", or "session"
     pub r#type: String,
     pub froglog_id: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -26,6 +26,8 @@ pub struct ProcessMapConfig {
     pub auto_submit_regular: bool,
     #[serde(default)]
     pub auto_submit_live: bool,
+    #[serde(default)]
+    pub auto_submit_session: bool,
 }
 
 impl ProcessMapConfig {
@@ -64,8 +66,15 @@ pub fn app_data_dir() -> PathBuf {
         .join("froglog-lilypad")
 }
 
-/// Stable key for the current user (from token) so each account has its own process-map file.
+/// Stable key for the current user so each account has its own process-map file.
+/// Uses username when present (stable across logout/login); otherwise token hash for backwards compat.
+/// Username is normalized to lowercase so the key is stable regardless of login input casing.
 fn process_map_user_key(auth: &AuthConfig) -> String {
+    if let Some(ref u) = auth.username {
+        let normalized = u.to_lowercase();
+        let h = normalized.bytes().fold(0u32, |a, b| a.wrapping_mul(31).wrapping_add(b as u32));
+        return format!("{:08x}", h);
+    }
     match &auth.token {
         None => "anonymous".to_string(),
         Some(t) => {
@@ -77,18 +86,21 @@ fn process_map_user_key(auth: &AuthConfig) -> String {
 
 /// Process-map path for the given auth. Logged-in users get process-map-{key}.json; anonymous uses process-map.json.
 pub fn process_map_path_for_auth(auth: &AuthConfig) -> PathBuf {
-    let name = match &auth.token {
-        None => "process-map.json".to_string(),
-        Some(_) => format!("process-map-{}.json", process_map_user_key(auth)),
+    let name = if auth.token.is_some() || auth.username.is_some() {
+        format!("process-map-{}.json", process_map_user_key(auth))
+    } else {
+        "process-map.json".to_string()
     };
     app_data_dir().join(name)
 }
 
-/// Auth/config: base URL + token.
+/// Auth/config: base URL, token, and optional username (used for stable process-map path across re-login).
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct AuthConfig {
     pub base_url: Option<String>,
     pub token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
 }
 
 pub fn auth_config_path() -> PathBuf {

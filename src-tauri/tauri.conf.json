@@ -1,11 +1,11 @@
 {
   "productName": "LilyPad",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "identifier": "uk.co.froglog.lilypad",
   "build": {
-    "beforeDevCommand": "npx -y serve dist -l 1430",
+    "beforeDevCommand": "npm run copy-frontend && npx -y serve dist -l 1430",
     "devUrl": "http://localhost:1430",
-    "beforeBuildCommand": "",
+    "beforeBuildCommand": "npm run copy-frontend",
     "frontendDist": "../dist"
   },
   "app": {
@@ -13,7 +13,7 @@
     "windows": [
       {
         "title": "LilyPad - FrogLog Auto Tracker",
-        "width": 680,
+        "width": 642,
         "height": 515,
         "resizable": true,
         "visible": false
