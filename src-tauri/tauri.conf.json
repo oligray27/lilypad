@@ -1,0 +1,57 @@
+{
+  "productName": "LilyPad",
+  "version": "0.4.3",
+  "identifier": "uk.co.froglog.lilypad",
+  "build": {
+    "beforeDevCommand": "npx -y serve dist -l 1430",
+    "devUrl": "http://localhost:1430",
+    "beforeBuildCommand": "",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "LilyPad - FrogLog Auto Tracker",
+        "width": 680,
+        "height": 515,
+        "resizable": true,
+        "visible": false
+      }
+    ],
+    "security": {
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["**"]
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "certificateThumbprint": null,
+      "digestAlgorithm": "sha256",
+      "timestampUrl": "",
+      "nsis": {
+        "installerIcon": "icons/icon.ico",
+        "startMenuFolder": "LilyPad"
+      }
+    },
+    "longDescription": "FrogLog game time tracker - runs in system tray, detects game processes and logs play time.",
+    "shortDescription": "FrogLog game time tracker",
+    "category": "Utility",
+    "copyright": "",
+    "licenseFile": null,
+    "resources": [],
+    "externalBin": []
+  },
+  "plugins": {}
+}

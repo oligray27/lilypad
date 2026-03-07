@@ -1,0 +1,15 @@
+node_modules/
+
+# Tauri build artifacts
+src-tauri/target/
+src-tauri/gen/
+
+# Logs
+*.log
+error.log
+
+# Local scripts
+update_hours.py
+
+# Local env
+.env

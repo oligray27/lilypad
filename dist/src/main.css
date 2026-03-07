@@ -1,0 +1,72 @@
+:root {
+  color-scheme: light dark;
+  --bg: #fff;
+  --text: #000;
+  --muted: #666;
+  --error: #c00;
+  --border: #ccc;
+  --border-subtle: #eee;
+  --code-bg: #eee;
+  --switch-bg: #f5f5f5;
+  --switch-active-bg: #333;
+  --switch-active-text: #fff;
+  --subtitle: #888;
+  --link: #06c;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1e1e1e;
+    --text: #e8e8e8;
+    --muted: #999;
+    --error: #f77;
+    --border: #555;
+    --border-subtle: #383838;
+    --code-bg: #2a2a2a;
+    --switch-bg: #2a2a2a;
+    --switch-active-bg: #e0e0e0;
+    --switch-active-text: #111;
+    --subtitle: #aaa;
+    --link: #4db6ff;
+  }
+}
+* { box-sizing: border-box; }
+body { font-family: system-ui, sans-serif; padding: 1rem; margin: 0; background: var(--bg); color: var(--text); }
+h2 { margin-top: 0; }
+label { display: block; margin-top: 0.5rem; }
+input, textarea { width: 100%; margin-top: 0.25rem; padding: 0.4rem; }
+button { margin-right: 0.5rem; margin-top: 0.5rem; padding: 0.4rem 0.8rem; }
+.error { color: var(--error); font-size: 0.9rem; margin-top: 0.5rem; }
+.muted { color: var(--muted); font-size: 0.9rem; line-height: 1.4; }
+code { font-size: 0.85em; background: var(--code-bg); padding: 0.1em 0.3em; border-radius: 3px; }
+[data-view] { max-width: 760px; }
+.mappings-switch { display: flex; gap: 0; margin-top: 0.5rem; }
+.mappings-switch button { padding: 0.4rem 1rem; border: 1px solid var(--border); background: var(--switch-bg); color: var(--text); cursor: pointer; font-size: 0.9rem; display: inline-flex; align-items: center; justify-content: center; min-height: 2rem; }
+.mappings-switch button:first-child { border-radius: 4px 0 0 4px; margin-right: -1px; }
+.mappings-switch button:last-child { border-radius: 0 4px 4px 0; }
+.mappings-switch button.active { background: var(--switch-active-bg); color: var(--switch-active-text); border-color: var(--switch-active-bg); z-index: 1; }
+.mappings-auto-submit-label { display: flex; align-items: center; gap: 0.4rem; margin-top: 0.4rem; font-size: 0.9rem; cursor: pointer; width: fit-content; }
+.mappings-auto-submit-label input { width: auto; margin: 0; }
+.mappings-search { margin-top: 0.5rem; }
+.mappings-table-wrap { overflow-x: auto; margin-top: 0.5rem; }
+.mappings-table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+.mappings-table th { text-align: left; padding: 0.35rem 0.5rem; border-bottom: 1px solid var(--border); font-weight: 600; }
+.mappings-table th:nth-child(2) { width: 220px; }
+.mappings-table th:nth-child(3) { width: 155px; }
+.mappings-table td { padding: 0.25rem 0.5rem; border-bottom: 1px solid var(--border-subtle); vertical-align: middle; }
+.mappings-table .mappings-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mappings-table .mappings-type { color: var(--muted); font-size: 0.9em; white-space: nowrap; }
+.mappings-exe-cell { display: flex; align-items: center; gap: 0.35rem; }
+.mappings-exe-cell input { margin-top: 0; }
+.mappings-table .mappings-exe { width: 130px; flex-shrink: 0; padding: 0.25rem 0.4rem; font-family: ui-monospace, monospace; font-size: 0.9em; height: 1.75rem; margin-bottom: 2px; }
+.mappings-browse { margin: 0; padding: 0 0.5rem; font-size: 0.85rem; white-space: nowrap; height: 1.75rem; }
+.mappings-title-filter { width: 100%; margin-top: 0; margin-bottom: 1px; padding: 0.25rem 0.4rem; font-size: 0.9em; height: 1.75rem; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.about-header { display: flex; align-items: baseline; gap: 0.5rem; margin-bottom: 0.25rem; }
+.about-header h2 { margin: 0; }
+.about-subtitle { margin: 0; font-size: 0.85rem; font-weight: 400; color: var(--subtitle); }
+.about-steps { margin: 0.25rem 0 0 1.25rem; padding: 0; font-size: 0.9rem; line-height: 1.6; }
+.about-steps li { margin-bottom: 0.2rem; }
+.mappings-pagination { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.5rem; margin-right: 0.5rem; }
+.mappings-pagination button { margin: 0; padding: 0.25rem 0.5rem; font-size: 0.85rem; }
+.mappings-pagination span { flex: 1; text-align: center; font-size: 0.9rem; color: var(--muted); }
