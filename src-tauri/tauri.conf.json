@@ -1,6 +1,6 @@
 {
   "productName": "LilyPad",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "identifier": "uk.co.froglog.lilypad",
   "build": {
     "beforeDevCommand": "npm run copy-frontend && npx -y serve dist -l 1430",
@@ -22,7 +22,9 @@
     "security": {
       "assetProtocol": {
         "enable": true,
-        "scope": ["**"]
+        "scope": [
+          "**"
+        ]
       }
     }
   },

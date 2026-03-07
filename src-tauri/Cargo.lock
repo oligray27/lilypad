@@ -2085,7 +2085,7 @@ dependencies = [
 
 [[package]]
 name = "lilypad"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "chrono",
  "dirs 5.0.1",
