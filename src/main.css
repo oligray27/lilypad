@@ -39,7 +39,8 @@ button { margin-right: 0.5rem; margin-top: 0.5rem; padding: 0.4rem 0.8rem; }
 .muted { color: var(--muted); font-size: 0.9rem; line-height: 1.4; }
 code { font-size: 0.85em; background: var(--code-bg); padding: 0.1em 0.3em; border-radius: 3px; }
 [data-view] { max-width: 520px; }
-#mappingsView { width: 100%; max-width: none; }
+#mappingsView { width: 100%; max-width: none; display: flex; flex-direction: column; height: calc(100vh - 2rem); }
+.mappings-scrollable { flex: 1; overflow-y: auto; min-height: 0; }
 .mappings-switch { display: flex; gap: 0; margin-top: 0.5rem; }
 .mappings-switch button { padding: 0.4rem 1rem; border: 1px solid var(--border); background: var(--switch-bg); color: var(--text); cursor: pointer; font-size: 0.9rem; display: inline-flex; align-items: center; justify-content: center; min-height: 2rem; }
 .mappings-switch button:first-child { border-radius: 4px 0 0 4px; margin-right: -1px; }
@@ -80,6 +81,12 @@ a:hover { text-decoration: underline; }
 .mappings-pagination { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.5rem; margin-right: 0.35rem; }
 .mappings-pagination button { margin: 0; padding: 0.25rem 0.5rem; font-size: 0.85rem; }
 .mappings-pagination span { flex: 1; text-align: center; font-size: 0.9rem; color: var(--muted); }
+.mappings-exe-conflict { border-color: var(--error) !important; outline: 1px solid var(--error); }
+.mappings-switch button.mappings-switch-conflict { border-color: var(--error); color: var(--error); }
+.mappings-switch button.mappings-switch-conflict.active { background: var(--error); color: #fff; border-color: var(--error); }
+.mappings-switch button.mappings-switch-conflict + button { border-left-color: var(--error); }
+.mappings-footer { display: flex; justify-content: flex-end; border-top: 1px solid var(--border); padding: 0.5rem 0.35rem 0 0; }
+.mappings-footer button { margin: 0; padding: 0.25rem 0; font-size: 0.85rem; width: 65.75px; }
 #loginView input { width: 98%; box-sizing: border-box; }
 #sessionView #sessionForm { width: 100%; }
 #sessionView .session-form-actions { display: flex; justify-content: space-between; align-items: center; margin-top: 0.5rem; width: 100%; }

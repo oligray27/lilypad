@@ -21,7 +21,7 @@ use tauri_plugin_opener::OpenerExt;
 /// Tray icon (embedded at compile time from icons/icon.ico).
 const TRAY_ICON: tauri::image::Image<'_> = tauri::include_image!("icons/icon.ico");
 
-const DEFAULT_HEIGHT: f64 = 625.0;
+const DEFAULT_HEIGHT: f64 = 690.0;
 const MAIN_ABOUT_HEIGHT: f64 = 335.0;
 const WINDOW_WIDTH: f64 = 642.0;
 const SESSION_WIDTH: f64 = 440.0;

@@ -7,7 +7,7 @@ const $ = (id) => document.getElementById(id);
 const VIEW_SIZE = {
   loginView: { width: 560, height: 315 },
   mainView: { width: 550, height: 335 },
-  mappingsView: { width: 642, height: 625 },
+  mappingsView: { width: 642, height: 690 },
   sessionView: { width: 440, height: 165 },
 };
 
@@ -70,8 +70,10 @@ function loadVersion() {
 
 // --- Mappings view: table of games with exe column ---
 let mappingsAllRows = [];
-let mappingsExeFor = {};
-let mappingsTitleFilterFor = {};
+let pendingExeFor = {};        // working copy (not yet saved to disk)
+let pendingTitleFilterFor = {};
+let savedExeFor = {};          // reflects what's currently on disk
+let savedTitleFilterFor = {};
 let mappingsMode = 'regular'; // 'regular' | 'live' | 'session'
 let mappingsPage = 0;
 let mappingsSearch = '';
@@ -106,8 +108,8 @@ function renderMappingsTable() {
   tableBody.innerHTML = rows
     .map((row) => {
       const key = mappingKey(row.type, row.id);
-      const exe = mappingsExeFor[key] || '';
-      const titleFilter = mappingsTitleFilterFor[key] || '';
+      const exe = pendingExeFor[key] || '';
+      const titleFilter = pendingTitleFilterFor[key] || '';
       const titleEsc = escapeHtml(row.title);
       const exeEsc = escapeAttr(exe);
       const tfEsc = escapeAttr(titleFilter);
@@ -141,6 +143,7 @@ function renderMappingsTable() {
   if (prevBtn) prevBtn.disabled = mappingsPage === 0;
   if (nextBtn) nextBtn.disabled = mappingsPage >= totalPages - 1;
   if (pageInfo) pageInfo.textContent = `${mappingsPage + 1} / ${totalPages}`;
+  refreshMappingsState();
 }
 
 async function loadMappingsView() {
@@ -166,8 +169,12 @@ async function loadMappingsView() {
       await invoke('delete_process_mapping', { froglogId: m.froglog_id, gameType: m.type });
     }
     const mapConfigAfter = toRemove.length ? await invoke('get_process_mappings') : mapConfig;
-    mappingsExeFor = exeByGame(mapConfigAfter.mappings || []);
-    mappingsTitleFilterFor = titleFilterByGame(mapConfigAfter.mappings || []);
+    const loadedExe = exeByGame(mapConfigAfter.mappings || []);
+    const loadedTitleFilter = titleFilterByGame(mapConfigAfter.mappings || []);
+    pendingExeFor = { ...loadedExe };
+    pendingTitleFilterFor = { ...loadedTitleFilter };
+    savedExeFor = { ...loadedExe };
+    savedTitleFilterFor = { ...loadedTitleFilter };
     mappingsAllRows = [
       ...(games || []).map((g) => ({ id: g.id, title: g.title || `#${g.id}`, type: g.session_tracking ? 'session' : 'regular' })),
       ...(liveService || []).map((g) => ({ id: g.id, title: g.title || `#${g.id}`, type: 'live' })),
@@ -208,6 +215,90 @@ function escapeAttr(s) {
   return escapeHtml(s == null ? '' : s).replace(/"/g, '&quot;');
 }
 
+function norm(v) {
+  return (v || '').trim();
+}
+
+/** Returns a Set of mapping keys that conflict with each other.
+ * Conflict = two different entries sharing the same exe where both have no title filter,
+ * or both have the same (non-empty) title filter. */
+function detectConflicts() {
+  const conflicts = new Set();
+  const byExe = {};
+  for (const [key, exe] of Object.entries(pendingExeFor)) {
+    if (!exe) continue;
+    const exeLower = exe.toLowerCase();
+    if (!byExe[exeLower]) byExe[exeLower] = [];
+    byExe[exeLower].push({ key, titleFilter: norm(pendingTitleFilterFor[key]).toLowerCase() });
+  }
+  for (const entries of Object.values(byExe)) {
+    if (entries.length < 2) continue;
+    for (let i = 0; i < entries.length; i++) {
+      for (let j = i + 1; j < entries.length; j++) {
+        const a = entries[i], b = entries[j];
+        const aBare = !a.titleFilter, bBare = !b.titleFilter;
+        const sameFilter = a.titleFilter && b.titleFilter && a.titleFilter === b.titleFilter;
+        if ((aBare && bBare) || sameFilter) {
+          conflicts.add(a.key);
+          conflicts.add(b.key);
+        }
+      }
+    }
+  }
+  return conflicts;
+}
+
+/** Update conflict highlights, Apply button enabled state, and error text. */
+function refreshMappingsState() {
+  const conflicts = detectConflicts();
+
+  // Dirty check: any key where pending differs from saved
+  const allKeys = new Set([
+    ...Object.keys(pendingExeFor),
+    ...Object.keys(savedExeFor),
+    ...Object.keys(pendingTitleFilterFor),
+    ...Object.keys(savedTitleFilterFor),
+  ]);
+  let hasDirty = false;
+  for (const k of allKeys) {
+    if (norm(pendingExeFor[k]) !== norm(savedExeFor[k]) ||
+        norm(pendingTitleFilterFor[k]) !== norm(savedTitleFilterFor[k])) {
+      hasDirty = true;
+      break;
+    }
+  }
+
+  // Highlight conflicting exe and title-filter inputs in visible rows
+  document.querySelectorAll('.mappings-exe, .mappings-title-filter').forEach((input) => {
+    const key = mappingKey(input.dataset.type, input.dataset.id);
+    input.classList.toggle('mappings-exe-conflict', conflicts.has(key));
+  });
+
+  // Highlight mode switch buttons whose tab contains conflicts
+  const conflictTypes = new Set([...conflicts].map((k) => k.split(':')[0]));
+  const switchBtnMap = { regular: 'mappingsSwitchGames', session: 'mappingsSwitchSession', live: 'mappingsSwitchLive' };
+  for (const [type, btnId] of Object.entries(switchBtnMap)) {
+    const btn = $(btnId);
+    if (btn) btn.classList.toggle('mappings-switch-conflict', conflictTypes.has(type));
+  }
+
+  // Apply button state
+  const applyBtn = $('mappingsApply');
+  if (applyBtn) {
+    applyBtn.disabled = conflicts.size > 0 || !hasDirty;
+  }
+
+  // Error/conflict message
+  const errEl = $('mappingsError');
+  if (errEl) {
+    if (conflicts.size > 0) {
+      errEl.textContent = 'Conflicted mappings highlighted in red. Each mapping must be a unique combination.';
+    } else if (errEl.textContent.startsWith('Conflicted')) {
+      errEl.textContent = '';
+    }
+  }
+}
+
 async function onExeBrowse(e) {
   const btn = e.target;
   const cell = btn.closest('.mappings-exe-cell');
@@ -228,59 +319,60 @@ async function onExeBrowse(e) {
   }
 }
 
-async function onExeBlur(e) {
+function onExeBlur(e) {
   const input = e.target;
-  const next = input.value.trim();
   const gameType = input.dataset.type;
   const gameId = parseInt(input.dataset.id, 10);
-  const title = input.dataset.title || null;
   const key = mappingKey(gameType, gameId);
-  const titleFilter = mappingsTitleFilterFor[key] || null;
-  const errEl = $('mappingsError');
-  errEl.textContent = '';
-  try {
-    if (next) {
-      await invoke('save_process_mapping', {
-        process: next,
-        gameType: gameType,
-        froglogId: gameId,
-        title: title || undefined,
-        titleFilter: titleFilter || undefined,
-      });
-      mappingsExeFor[key] = next;
-    } else {
-      await invoke('delete_process_mapping', { froglogId: gameId, gameType });
-      delete mappingsExeFor[key];
-      delete mappingsTitleFilterFor[key];
-    }
-  } catch (err) {
-    errEl.textContent = String(err);
-  }
+  pendingExeFor[key] = input.value.trim();
+  refreshMappingsState();
 }
 
-async function onTitleFilterBlur(e) {
+function onTitleFilterBlur(e) {
   const input = e.target;
   const gameType = input.dataset.type;
   const gameId = parseInt(input.dataset.id, 10);
   const key = mappingKey(gameType, gameId);
-  const exe = mappingsExeFor[key];
-  if (!exe) return; // No exe set — nothing to save yet.
-  const title = input.dataset.title || null;
-  const titleFilter = input.value.trim() || null;
+  pendingTitleFilterFor[key] = input.value.trim();
+  refreshMappingsState();
+}
+
+async function doApply() {
   const errEl = $('mappingsError');
-  errEl.textContent = '';
-  try {
-    await invoke('save_process_mapping', {
-      process: exe,
-      gameType,
-      froglogId: gameId,
-      title: title || undefined,
-      titleFilter: titleFilter || undefined,
-    });
-    mappingsTitleFilterFor[key] = titleFilter || '';
-  } catch (err) {
-    errEl.textContent = String(err);
+  if (errEl) errEl.textContent = '';
+  const allKeys = new Set([
+    ...Object.keys(pendingExeFor),
+    ...Object.keys(savedExeFor),
+  ]);
+  for (const key of allKeys) {
+    const [gameType, idStr] = key.split(':');
+    const gameId = parseInt(idStr, 10);
+    const newExe = norm(pendingExeFor[key]);
+    const oldExe = norm(savedExeFor[key]);
+    const newFilter = norm(pendingTitleFilterFor[key]) || null;
+    const oldFilter = norm(savedTitleFilterFor[key]) || null;
+    if (newExe === oldExe && newFilter === oldFilter) continue;
+    try {
+      if (newExe) {
+        const row = mappingsAllRows.find((r) => mappingKey(r.type, r.id) === key);
+        await invoke('save_process_mapping', {
+          process: newExe,
+          gameType,
+          froglogId: gameId,
+          title: (row && row.title) || undefined,
+          titleFilter: newFilter || undefined,
+        });
+      } else {
+        await invoke('delete_process_mapping', { froglogId: gameId, gameType });
+      }
+      savedExeFor[key] = newExe;
+      savedTitleFilterFor[key] = newFilter || '';
+    } catch (err) {
+      if (errEl) errEl.textContent = String(err);
+      return;
+    }
   }
+  refreshMappingsState();
 }
 
 // Post-play popup (shown when session-ended fires)
@@ -402,28 +494,33 @@ app.innerHTML = `
     </ol>
   </div>
   <div data-view id="mappingsView" hidden>
-    <div class="page-header"><h2>Configuration</h2><span class="app-version"></span></div>
-    <p class="muted">Type the executable name (e.g. <code>game.exe</code>) in the exe column. Once a session ends, LilyPad will prompt you to log the session.</p>
-    <label class="mappings-auto-submit-label"><input type="checkbox" id="mappingsAutoSubmitRegular" /> Auto-submit regular game sessions</label>
-    <label class="mappings-auto-submit-label"><input type="checkbox" id="mappingsAutoSubmitLive" /> Auto-submit live service sessions</label>
-    <label class="mappings-auto-submit-label"><input type="checkbox" id="mappingsAutoSubmitSession" /> Auto-submit session-tracked game sessions</label>
-    <div class="mappings-switch">
-      <button type="button" id="mappingsSwitchGames" class="active">Games</button>
-      <button type="button" id="mappingsSwitchSession">Session tracked</button>
-      <button type="button" id="mappingsSwitchLive">Live service</button>
+    <div class="mappings-scrollable">
+      <div class="page-header"><h2>Configuration</h2><span class="app-version"></span></div>
+      <p class="muted">Type the executable name (e.g. <code>game.exe</code>) in the exe column. Once a session ends, LilyPad will prompt you to log the session.</p>
+      <label class="mappings-auto-submit-label"><input type="checkbox" id="mappingsAutoSubmitRegular" /> Auto-submit regular game sessions</label>
+      <label class="mappings-auto-submit-label"><input type="checkbox" id="mappingsAutoSubmitSession" /> Auto-submit session-tracked game sessions</label>
+      <label class="mappings-auto-submit-label"><input type="checkbox" id="mappingsAutoSubmitLive" /> Auto-submit live service sessions</label>
+      <div class="mappings-switch">
+        <button type="button" id="mappingsSwitchGames" class="active">Games</button>
+        <button type="button" id="mappingsSwitchSession">Session tracked</button>
+        <button type="button" id="mappingsSwitchLive">Live service</button>
+      </div>
+      <div class="mappings-search-wrap"><input type="search" id="mappingsSearch" class="mappings-search" placeholder="Search…" /></div>
+      <p id="mappingsError" class="error"></p>
+      <div id="mappingsTableWrap" class="mappings-table-wrap">
+        <table class="mappings-table">
+          <thead><tr><th>Game</th><th>exe</th><th class="mappings-th-window-title">Window title filter</th></tr></thead>
+          <tbody id="mappingsTableBody"></tbody>
+        </table>
+      </div>
+      <div id="mappingsPagination" class="mappings-pagination" hidden>
+        <button type="button" id="mappingsPrev"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px"><polyline points="15 18 9 12 15 6"/></svg> Prev</button>
+        <span id="mappingsPageInfo"></span>
+        <button type="button" id="mappingsNext">Next <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px"><polyline points="9 18 15 12 9 6"/></svg></button>
+      </div>
     </div>
-    <div class="mappings-search-wrap"><input type="search" id="mappingsSearch" class="mappings-search" placeholder="Search…" /></div>
-    <p id="mappingsError" class="error"></p>
-    <div id="mappingsTableWrap" class="mappings-table-wrap">
-      <table class="mappings-table">
-        <thead><tr><th>Game</th><th>exe</th><th class="mappings-th-window-title">Window title filter</th></tr></thead>
-        <tbody id="mappingsTableBody"></tbody>
-      </table>
-    </div>
-    <div id="mappingsPagination" class="mappings-pagination" hidden>
-      <button type="button" id="mappingsPrev"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px"><polyline points="15 18 9 12 15 6"/></svg> Prev</button>
-      <span id="mappingsPageInfo"></span>
-      <button type="button" id="mappingsNext">Next <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px"><polyline points="9 18 15 12 9 6"/></svg></button>
+    <div class="mappings-footer">
+      <button type="button" id="mappingsApply" disabled>Apply</button>
     </div>
   </div>
   <div data-view id="sessionView" hidden>
@@ -459,6 +556,7 @@ $('mappingsSwitchSession').addEventListener('click', () => setMappingsMode('sess
 $('mappingsPrev').addEventListener('click', () => { mappingsPage--; renderMappingsTable(); });
 $('mappingsNext').addEventListener('click', () => { mappingsPage++; renderMappingsTable(); });
 $('mappingsSearch').addEventListener('input', (e) => { mappingsSearch = e.target.value; mappingsPage = 0; renderMappingsTable(); });
+$('mappingsApply').addEventListener('click', doApply);
 function saveAutoSubmit() {
   invoke('save_auto_submit', { regular: !!$('mappingsAutoSubmitRegular').checked, live: !!$('mappingsAutoSubmitLive').checked, session: !!$('mappingsAutoSubmitSession').checked }).catch(() => {});
 }
