@@ -30,6 +30,7 @@
   }
 }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 body { font-family: system-ui, sans-serif; padding: 1rem; margin: 0; background: var(--bg); color: var(--text); }
 h2 { margin-top: 0; }
 label { display: block; margin-top: 0.5rem; }
