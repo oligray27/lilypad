@@ -63,9 +63,7 @@ git push origin "v$NEW"
 # --- Collect installer artifacts (latest only) ---
 ASSETS=()
 NSIS_EXE=$(ls -t src-tauri/target/release/bundle/nsis/*.exe 2>/dev/null | head -1)
-MSI_FILE=$(ls -t src-tauri/target/release/bundle/msi/*.msi 2>/dev/null | head -1)
 [ -n "$NSIS_EXE" ] && ASSETS+=("$NSIS_EXE")
-[ -n "$MSI_FILE" ] && ASSETS+=("$MSI_FILE")
 
 # --- Create GitHub release ---
 if [ ${#ASSETS[@]} -eq 0 ]; then

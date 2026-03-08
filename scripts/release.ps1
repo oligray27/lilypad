@@ -52,13 +52,8 @@ git push origin "v$New"
 # --- Collect installer artifacts (latest only) ---
 $Assets = @()
 $NsisDir = 'src-tauri/target/release/bundle/nsis'
-$MsiDir  = 'src-tauri/target/release/bundle/msi'
 if (Test-Path $NsisDir) {
     $f = Get-ChildItem $NsisDir -Filter '*.exe' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    if ($f) { $Assets += $f.FullName }
-}
-if (Test-Path $MsiDir) {
-    $f = Get-ChildItem $MsiDir -Filter '*.msi' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
     if ($f) { $Assets += $f.FullName }
 }
 
