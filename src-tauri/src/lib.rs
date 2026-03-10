@@ -107,6 +107,17 @@ fn handle_session_ended(
         let auth = state.auth.read().unwrap().clone();
         drop(state);
 
+        // Always clear now_playing when a session ends, regardless of auto_submit setting
+        let auth_clear = auth.clone();
+        std::thread::spawn(move || {
+            if let Some(client) = api_client(&auth_clear) {
+                println!("[LilyPad] handle_session_ended: clearing now_playing");
+                let _ = client.clear_now_playing();
+            } else {
+                println!("[LilyPad] handle_session_ended: no API client available to clear now_playing");
+            }
+        });
+
         if auto_submit {
             let raw_hours = duration_secs / 3600.0;
             let hours = { let r = (raw_hours * 100.0).round() / 100.0; if r < 0.01 { 0.01 } else { r } };
@@ -115,6 +126,8 @@ fn handle_session_ended(
             let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
             std::thread::spawn(move || {
                 let ok = if let Some(client) = api_client(&auth) {
+                    println!("[LilyPad] handle_session_ended: auto-submitting hours");
+                    // clear_now_playing removed from here as it runs above for all cases
                     if mapping2.r#type.eq_ignore_ascii_case("live") {
                         client.add_live_service_session(mapping2.froglog_id, Some(date), Some(hours), Some("Session auto submitted with LilyPad".to_string())).is_ok()
                     } else if mapping2.r#type.eq_ignore_ascii_case("session") {
@@ -122,7 +135,10 @@ fn handle_session_ended(
                     } else {
                         client.update_game_hours(mapping2.froglog_id, hours).is_ok()
                     }
-                } else { false };
+                } else {
+                     println!("[LilyPad] handle_session_ended: no API client available");
+                    false
+                };
                 let _ = tx.send(ok);
             });
             let submitted = rx.await.unwrap_or(false);
@@ -137,22 +153,22 @@ fn handle_session_ended(
         }
 
         let _ = app.emit("session-ended", serde_json::json!({
-            "processName": process_name,
-            "mapping": {
-                "process": mapping.process,
-                "type": mapping.r#type,
-                "froglogId": mapping.froglog_id,
-                "title": mapping.title,
+             "processName": process_name,
+             "mapping": {
+                 "process": mapping.process,
+                 "type": mapping.r#type,
+                 "froglogId": mapping.froglog_id,
+                 "title": mapping.title,
             },
-            "durationSecs": duration_secs,
+             "durationSecs": duration_secs,
         }));
-        if let Some(w) = app.get_webview_window("main") {
+            if let Some(w) = app.get_webview_window("main") {
             let has_notes = mapping.r#type.eq_ignore_ascii_case("live") || mapping.r#type.eq_ignore_ascii_case("session");
             let (sh, tb) = if has_notes {
                 (SESSION_HEIGHT_LIVE, SESSION_TASKBAR_LIVE)
             } else {
                 (SESSION_HEIGHT_REGULAR, SESSION_TASKBAR_REGULAR)
-            };
+             };
             show_session_window(&w, sh, tb);
         }
     });
@@ -316,6 +332,27 @@ fn save_auto_submit(state: tauri::State<AppState>, regular: bool, live: bool, se
 }
 
 #[tauri::command]
+fn save_now_playing_share(state: tauri::State<AppState>, share: bool) -> Result<(), String> {
+    let mut map = state.process_map_arc.read().unwrap().clone();
+    map.share_now_playing = share;
+    map.save_to(&process_map_path_for_auth(&state.auth.read().unwrap()))
+        .map_err(|e| e.to_string())?;
+    *state.process_map_arc.write().unwrap() = map;
+
+    let auth = state.auth.read().unwrap().clone();
+    std::thread::spawn(move || {
+        if let Some(client) = api_client(&auth) {
+            println!("[LilyPad] save_now_playing_share: updating show_current_session on FrogLog to {}", share);
+            let _ = client.set_show_current_session(share);
+        } else {
+            println!("[LilyPad] save_now_playing_share: no API client available to update show_current_session");
+        }
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
 fn delete_process_mapping(
     state: tauri::State<AppState>,
     froglog_id: i32,
@@ -403,6 +440,7 @@ pub fn run() {
             save_process_mapping,
             delete_process_mapping,
             save_auto_submit,
+            save_now_playing_share,
             hide_window,
             set_window_size,
             open_url,
@@ -574,6 +612,25 @@ pub fn run() {
                             .title("LilyPad")
                             .body(body)
                             .show();
+                        let started_at_iso = chrono::Utc::now().to_rfc3339();
+                        let (auth, share_now_playing) = {
+                            let state = handle.state::<AppState>();
+                            let auth_guard = state.auth.read().unwrap();
+                            let map_guard = state.process_map_arc.read().unwrap();
+                            (auth_guard.clone(), map_guard.share_now_playing)
+                        };
+                        if share_now_playing {
+                            std::thread::spawn(move || {
+                                if let Some(client) = api_client(&auth) {
+                                    let _ = client.set_now_playing(
+                                        mapping.froglog_id,
+                                        mapping.r#type.clone(),
+                                        mapping.title.clone(),
+                                        Some(started_at_iso),
+                                    );
+                                }
+                            });
+                        }
                     }
                 },
                 {

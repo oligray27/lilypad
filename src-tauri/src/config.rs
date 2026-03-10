@@ -28,6 +28,8 @@ pub struct ProcessMapConfig {
     pub auto_submit_live: bool,
     #[serde(default)]
     pub auto_submit_session: bool,
+    #[serde(default)]
+    pub share_now_playing: bool,
 }
 
 impl ProcessMapConfig {

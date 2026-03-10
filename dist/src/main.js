@@ -160,6 +160,7 @@ async function loadMappingsView() {
       invoke('get_live_service_games'),
       invoke('get_process_mappings'),
     ]);
+    console.log('[LilyPad] loadMappingsView mapConfig:', mapConfig);
     const knownKeys = new Set([
       ...(games || []).map((g) => mappingKey(g.session_tracking ? 'session' : 'regular', g.id)),
       ...(liveService || []).map((g) => mappingKey('live', g.id)),
@@ -190,6 +191,11 @@ async function loadMappingsView() {
     if (asLiveEl) asLiveEl.checked = !!mapConfigAfter.auto_submit_live;
     const asSessionEl = $('mappingsAutoSubmitSession');
     if (asSessionEl) asSessionEl.checked = !!mapConfigAfter.auto_submit_session;
+    const shareNowEl = $('shareNowPlaying');
+    if (shareNowEl) {
+      shareNowEl.checked = !!mapConfigAfter.share_now_playing;
+      console.log('[LilyPad] share_now_playing loaded as:', shareNowEl.checked);
+    }
     tableWrap.hidden = false;
     renderMappingsTable();
   } catch (e) {
@@ -500,6 +506,7 @@ app.innerHTML = `
       <label class="mappings-auto-submit-label"><input type="checkbox" id="mappingsAutoSubmitRegular" /> Auto-submit regular game sessions</label>
       <label class="mappings-auto-submit-label"><input type="checkbox" id="mappingsAutoSubmitSession" /> Auto-submit session-tracked game sessions</label>
       <label class="mappings-auto-submit-label"><input type="checkbox" id="mappingsAutoSubmitLive" /> Auto-submit live service sessions</label>
+      <label class="mappings-auto-submit-label"><input type="checkbox" id="shareNowPlaying" /> Enable online presence on FrogLog</label>
       <div class="mappings-switch">
         <button type="button" id="mappingsSwitchGames" class="active">Games</button>
         <button type="button" id="mappingsSwitchSession">Session tracked</button>
@@ -560,7 +567,15 @@ $('mappingsApply').addEventListener('click', doApply);
 function saveAutoSubmit() {
   invoke('save_auto_submit', { regular: !!$('mappingsAutoSubmitRegular').checked, live: !!$('mappingsAutoSubmitLive').checked, session: !!$('mappingsAutoSubmitSession').checked }).catch(() => {});
 }
+function saveShareNowPlaying() {
+  const share = !!$('shareNowPlaying').checked;
+  console.log('[LilyPad] saveShareNowPlaying toggled to:', share);
+  invoke('save_now_playing_share', { share }).catch((err) => {
+    console.error('[LilyPad] save_now_playing_share error:', err);
+  });
+}
 $('mappingsAutoSubmitRegular').addEventListener('change', saveAutoSubmit);
 $('mappingsAutoSubmitLive').addEventListener('change', saveAutoSubmit);
 $('mappingsAutoSubmitSession').addEventListener('change', saveAutoSubmit);
+$('shareNowPlaying').addEventListener('change', saveShareNowPlaying);
 init();
