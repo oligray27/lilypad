@@ -7,7 +7,7 @@ const $ = (id) => document.getElementById(id);
 const VIEW_SIZE = {
   loginView: { width: 560, height: 315 },
   mainView: { width: 550, height: 335 },
-  mappingsView: { width: 642, height: 690 },
+  mappingsView: { width: 642, height: 740 },
   sessionView: { width: 440, height: 165 },
 };
 
@@ -226,83 +226,121 @@ function norm(v) {
 }
 
 /** Returns a Set of mapping keys that conflict with each other.
- * Conflict = two different entries sharing the same exe where both have no title filter,
- * or both have the same (non-empty) title filter. */
+Conflict = two different entries sharing the same exe where:
+- Both have no title filter, OR
+- Both have the same (non-empty) title filter, OR
+- One has no filter when multiple games share the exe */
 function detectConflicts() {
-  const conflicts = new Set();
-  const byExe = {};
-  for (const [key, exe] of Object.entries(pendingExeFor)) {
-    if (!exe) continue;
-    const exeLower = exe.toLowerCase();
-    if (!byExe[exeLower]) byExe[exeLower] = [];
-    byExe[exeLower].push({ key, titleFilter: norm(pendingTitleFilterFor[key]).toLowerCase() });
-  }
-  for (const entries of Object.values(byExe)) {
-    if (entries.length < 2) continue;
-    for (let i = 0; i < entries.length; i++) {
-      for (let j = i + 1; j < entries.length; j++) {
-        const a = entries[i], b = entries[j];
-        const aBare = !a.titleFilter, bBare = !b.titleFilter;
-        const sameFilter = a.titleFilter && b.titleFilter && a.titleFilter === b.titleFilter;
-        if ((aBare && bBare) || sameFilter) {
-          conflicts.add(a.key);
-          conflicts.add(b.key);
-        }
-      }
+    const conflicts = new Set();
+    const byExe = {};
+    
+    for (const [key, exe] of Object.entries(pendingExeFor)) {
+        if (!exe) continue;
+        const exeLower = exe.toLowerCase();
+        if (!byExe[exeLower]) byExe[exeLower] = [];
+        byExe[exeLower].push({ 
+            key, 
+            titleFilter: norm(pendingTitleFilterFor[key]).toLowerCase() 
+        });
     }
-  }
-  return conflicts;
+    
+    for (const [exeLower, entries] of Object.entries(byExe)) {
+        if (entries.length < 2) continue;
+        
+        // Check if any entry is missing a filter when there are multiple games
+        const hasMissingFilter = entries.some(e => !e.titleFilter);
+        
+        for (let i = 0; i < entries.length; i++) {
+            for (let j = i + 1; j < entries.length; j++) {
+                const a = entries[i], b = entries[j];
+                const aBare = !a.titleFilter, bBare = !b.titleFilter;
+                const sameFilter = a.titleFilter && b.titleFilter && a.titleFilter === b.titleFilter;
+                
+                // Conflict if: both missing filters, same filter, OR missing filter when multiple exist
+                if ((aBare && bBare) || sameFilter || (hasMissingFilter && entries.length > 1)) {
+                    conflicts.add(a.key);
+                    conflicts.add(b.key);
+                }
+            }
+        }
+    }
+    
+    return conflicts;
 }
 
 /** Update conflict highlights, Apply button enabled state, and error text. */
 function refreshMappingsState() {
-  const conflicts = detectConflicts();
-
-  // Dirty check: any key where pending differs from saved
-  const allKeys = new Set([
-    ...Object.keys(pendingExeFor),
-    ...Object.keys(savedExeFor),
-    ...Object.keys(pendingTitleFilterFor),
-    ...Object.keys(savedTitleFilterFor),
-  ]);
-  let hasDirty = false;
-  for (const k of allKeys) {
-    if (norm(pendingExeFor[k]) !== norm(savedExeFor[k]) ||
-        norm(pendingTitleFilterFor[k]) !== norm(savedTitleFilterFor[k])) {
-      hasDirty = true;
-      break;
+    const conflicts = detectConflicts();
+    
+    // Dirty check: any key where pending differs from saved
+    const allKeys = new Set([
+        ...Object.keys(pendingExeFor),
+        ...Object.keys(savedExeFor),
+        ...Object.keys(pendingTitleFilterFor),
+        ...Object.keys(savedTitleFilterFor),
+    ]);
+    let hasDirty = false;
+    for (const k of allKeys) {
+        if (norm(pendingExeFor[k]) !== norm(savedExeFor[k]) ||
+            norm(pendingTitleFilterFor[k]) !== norm(savedTitleFilterFor[k])) {
+            hasDirty = true;
+            break;
+        }
     }
-  }
 
-  // Highlight conflicting exe and title-filter inputs in visible rows
-  document.querySelectorAll('.mappings-exe, .mappings-title-filter').forEach((input) => {
-    const key = mappingKey(input.dataset.type, input.dataset.id);
-    input.classList.toggle('mappings-exe-conflict', conflicts.has(key));
-  });
-
-  // Highlight mode switch buttons whose tab contains conflicts
-  const conflictTypes = new Set([...conflicts].map((k) => k.split(':')[0]));
-  const switchBtnMap = { regular: 'mappingsSwitchGames', session: 'mappingsSwitchSession', live: 'mappingsSwitchLive' };
-  for (const [type, btnId] of Object.entries(switchBtnMap)) {
-    const btn = $(btnId);
-    if (btn) btn.classList.toggle('mappings-switch-conflict', conflictTypes.has(type));
-  }
-
-  // Apply button state
-  const applyBtn = $('mappingsApply');
-  if (applyBtn) {
-    applyBtn.disabled = conflicts.size > 0 || !hasDirty;
-  }
-
-  // Error/conflict message
-  const errEl = $('mappingsError');
-  if (errEl) {
-    if (conflicts.size > 0) {
-      errEl.textContent = 'Conflicted mappings highlighted in red. Each mapping must be a unique combination.';
-    } else if (errEl.textContent.startsWith('Conflicted')) {
-      errEl.textContent = '';
+    // Highlight conflicting exe and title-filter inputs in visible rows
+    document.querySelectorAll('.mappings-exe, .mappings-title-filter').forEach((input) => {
+        const key = mappingKey(input.dataset.type, input.dataset.id);
+        input.classList.toggle('mappings-exe-conflict', conflicts.has(key));
+    });
+    
+    // Highlight mode switch buttons whose tab contains conflicts
+    const conflictTypes = new Set([...conflicts].map((k) => k.split(':')[0]));
+    const switchBtnMap = { 
+        regular: 'mappingsSwitchGames', 
+        session: 'mappingsSwitchSession', 
+        live: 'mappingsSwitchLive' 
+    };
+    for (const [type, btnId] of Object.entries(switchBtnMap)) {
+        const btn = $(btnId);
+        if (btn) btn.classList.toggle('mappings-switch-conflict', conflictTypes.has(type));
     }
-  }
+    
+    // Apply button state
+    const applyBtn = $('mappingsApply');
+    if (applyBtn) {
+        applyBtn.disabled = conflicts.size > 0 || !hasDirty;
+    }
+    
+    // Error/conflict message
+    const errEl = $('mappingsError');
+    if (errEl) {
+        if (conflicts.size > 0) {
+            // Check what type of conflict
+            const byExe = {};
+            for (const [key, exe] of Object.entries(pendingExeFor)) {
+                if (!exe) continue;
+                const exeLower = exe.toLowerCase();
+                if (!byExe[exeLower]) byExe[exeLower] = [];
+                byExe[exeLower].push({ 
+                    key, 
+                    titleFilter: norm(pendingTitleFilterFor[key]) 
+                });
+            }
+            
+            const hasMissingFilter = Object.values(byExe).some(entries => 
+                entries.length > 1 && entries.some(e => !e.titleFilter)
+            );
+            
+            if (hasMissingFilter) {
+                errEl.textContent = 'A window title filter is required when multiple games share the same executable. Add unique filters to distinguish them.';
+            } else {
+                errEl.textContent = 'Conflicted mappings highlighted in red. Each mapping must have a unique executable or title filter combination.';
+            }
+        } else if (errEl.textContent.includes('Conflicted') || errEl.textContent.includes('Window Title Filter')) {
+            errEl.textContent = '';
+        }
+    }
 }
 
 async function onExeBrowse(e) {
@@ -344,43 +382,66 @@ function onTitleFilterBlur(e) {
 }
 
 async function doApply() {
-  const errEl = $('mappingsError');
-  if (errEl) errEl.textContent = '';
-  const allKeys = new Set([
-    ...Object.keys(pendingExeFor),
-    ...Object.keys(savedExeFor),
-  ]);
-  for (const key of allKeys) {
-    const [gameType, idStr] = key.split(':');
-    const gameId = parseInt(idStr, 10);
-    const newExe = norm(pendingExeFor[key]);
-    const oldExe = norm(savedExeFor[key]);
-    const newFilter = norm(pendingTitleFilterFor[key]) || null;
-    const oldFilter = norm(savedTitleFilterFor[key]) || null;
-    if (newExe === oldExe && newFilter === oldFilter) continue;
-    try {
-      if (newExe) {
-        const row = mappingsAllRows.find((r) => mappingKey(r.type, r.id) === key);
-        await invoke('save_process_mapping', {
-          process: newExe,
-          gameType,
-          froglogId: gameId,
-          title: (row && row.title) || undefined,
-          titleFilter: newFilter || undefined,
-        });
-      } else {
-        await invoke('delete_process_mapping', { froglogId: gameId, gameType });
-      }
-      savedExeFor[key] = newExe;
-      savedTitleFilterFor[key] = newFilter || '';
-    } catch (err) {
-      if (errEl) errEl.textContent = String(err);
-      return;
+    const errEl = $('mappingsError');
+    if (errEl) errEl.textContent = '';
+    
+    const allKeys = new Set([
+        ...Object.keys(pendingExeFor),
+        ...Object.keys(savedExeFor),
+    ]);
+    
+    for (const key of allKeys) {
+        const [gameType, idStr] = key.split(':');
+        const gameId = parseInt(idStr, 10);
+        const newExe = norm(pendingExeFor[key]);
+        const oldExe = norm(savedExeFor[key]);
+        const newFilter = norm(pendingTitleFilterFor[key]) || null;
+        const oldFilter = norm(savedTitleFilterFor[key]) || null;
+        
+        if (newExe === oldExe && newFilter === oldFilter) continue;
+        
+        try {
+            if (newExe) {
+                const row = mappingsAllRows.find((r) => mappingKey(r.type, r.id) === key);
+                await invoke('save_process_mapping', {
+                    process: newExe,
+                    gameType,
+                    froglogId: gameId,
+                    title: (row && row.title) || undefined,
+                    titleFilter: newFilter || undefined,
+                });
+            } else {
+                await invoke('delete_process_mapping', { froglogId: gameId, gameType });
+            }
+            savedExeFor[key] = newExe;
+            savedTitleFilterFor[key] = newFilter || '';
+        } catch (err) {
+            if (errEl) {
+                // Provide more specific error messages
+                if (err.includes('Window Title Filter is required')) {
+                    errEl.textContent = 'Filter Required: ' + err;
+                } else if (err.includes('Multiple games are mapped')) {
+                    errEl.textContent = 'Configuration Error: ' + err;
+                } else {
+                    errEl.textContent = String(err);
+                }
+            }
+            return;
+        }
     }
-  }
-  refreshMappingsState();
+    
+    refreshMappingsState();
+    
+    // If successful, show success message briefly
+    if (errEl && !errEl.textContent) {
+        errEl.style.color = 'green';
+        errEl.textContent = 'Mappings saved successfully!';
+        setTimeout(() => {
+            errEl.textContent = '';
+            errEl.style.color = '';
+        }, 3000);
+    }
 }
-
 // Post-play popup (shown when session-ended fires)
 let pendingSession = null;
 

@@ -21,7 +21,7 @@ use tauri_plugin_opener::OpenerExt;
 /// Tray icon (embedded at compile time from icons/icon.ico).
 const TRAY_ICON: tauri::image::Image<'_> = tauri::include_image!("icons/icon.ico");
 
-const DEFAULT_HEIGHT: f64 = 690.0;
+const DEFAULT_HEIGHT: f64 = 740.0;
 const MAIN_ABOUT_HEIGHT: f64 = 335.0;
 const WINDOW_WIDTH: f64 = 642.0;
 const SESSION_WIDTH: f64 = 440.0;
@@ -302,10 +302,60 @@ fn save_process_mapping(
     title_filter: Option<String>,
 ) -> Result<(), String> {
     let mut map = state.process_map_arc.read().unwrap().clone();
-    // Remove any existing mapping for this specific game (by id+type, not exe name,
-    // so multiple games can share the same exe with different title filters).
+    
+    // Check existing mappings for this process
+    let existing_for_process: Vec<&ProcessMapping> = map
+        .mappings
+        .iter()
+        .filter(|m| m.process.eq_ignore_ascii_case(&process))
+        .collect();
+
+    // Check if there are other mappings for this exe (excluding the one we're updating)
+    let has_other_mappings = existing_for_process.iter().any(|m| 
+        !(m.froglog_id == froglog_id && m.r#type == game_type)
+    );
+
+    if has_other_mappings {
+        // Check if all existing mappings for this exe have filters
+        let existing_missing_filter = existing_for_process.iter()
+            .filter(|m| !(m.froglog_id == froglog_id && m.r#type == game_type))
+            .any(|m| m.title_filter.as_ref().map_or(true, |s: &String| s.trim().is_empty()));
+        
+        if existing_missing_filter {
+            return Err(
+                "Multiple games are mapped to this executable. All mappings must have a Window Title Filter to distinguish them. Please add filters to existing mappings first.".to_string()
+            );
+        }
+
+        // Ensure the new/updated mapping also has a filter
+        if title_filter.as_ref().map_or(true, |s: &String| s.trim().is_empty()) {
+            return Err(
+                "Window Title Filter is required when multiple games share the same executable.".to_string()
+            );
+        }
+        
+        // Check for duplicate filters
+        let duplicate_filter = existing_for_process.iter()
+            .filter(|m| !(m.froglog_id == froglog_id && m.r#type == game_type))
+            .any(|m| {
+                if let (Some(existing), Some(new)) = (&m.title_filter, &title_filter) {
+                    existing.trim().to_lowercase() == new.trim().to_lowercase()
+                } else {
+                    false
+                }
+            });
+            
+        if duplicate_filter {
+            return Err(
+                "Window Title Filter must be unique for each game using the same executable.".to_string()
+            );
+        }
+    }
+
+    // Remove any existing mapping for this specific game (by id+type)
     map.mappings
         .retain(|m| !(m.froglog_id == froglog_id && m.r#type == game_type));
+
     map.mappings.push(config::ProcessMapping {
         process,
         r#type: game_type,
@@ -313,6 +363,7 @@ fn save_process_mapping(
         title,
         title_filter,
     });
+
     map.save_to(&process_map_path_for_auth(&state.auth.read().unwrap()))
         .map_err(|e| e.to_string())?;
     *state.process_map_arc.write().unwrap() = map;
