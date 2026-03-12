@@ -56,20 +56,44 @@ pub fn get_window_titles_for_pid(_target_pid: u32) -> Vec<String> {
 }
 
 /// Given candidates (all mappings for an exe) and current window titles, return the best match.
-/// Prefers title_filter matches; falls back to any mapping without a filter.
+/// Priority: 1) Exact match (returns immediately), 2) Longest substring match, 3) Fallback to no-filter mapping.
 fn pick_mapping(candidates: &[ProcessMapping], window_titles: &[String]) -> Option<ProcessMapping> {
+    let mut best_match: Option<&ProcessMapping> = None;
+    let mut best_match_len = 0;
+
     for m in candidates {
         if let Some(filter) = &m.title_filter {
             let filter_lower = filter.to_lowercase();
-            if window_titles.iter().any(|t| t.to_lowercase().contains(&filter_lower)) {
-                return Some(m.clone());
+            
+            for title in window_titles {
+                let title_lower = title.to_lowercase();
+                
+                // Check for exact match first (highest priority - returns immediately)
+                if title_lower == filter_lower {
+                    return Some(m.clone());
+                }
+                
+                // Check for substring match
+                if title_lower.contains(&filter_lower) {
+                    // Only update if this is a longer filter than current best
+                    // (more specific = better match)
+                    if filter.len() > best_match_len {
+                        best_match = Some(m);
+                        best_match_len = filter.len();
+                    }
+                }
             }
         }
     }
+
+    // If we found a substring match, return it
+    if let Some(mapping) = best_match {
+        return Some(mapping.clone());
+    }
+
     // Fall back to the first mapping with no title filter
     candidates.iter().find(|m| m.title_filter.is_none()).cloned()
 }
-
 /// How long to ignore a process after a session ends (prevents brief launcher re-spawns from
 /// starting a phantom second session, e.g. javaw.exe relaunching during Minecraft mod pack close).
 const POST_SESSION_COOLDOWN: Duration = Duration::from_secs(15);
