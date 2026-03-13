@@ -455,6 +455,7 @@ function showPostPlay(data) {
   pendingSession = data;
   const mapping = data.mapping || {};
   const title = mapping.title || `Game #${mapping.froglogId || ''}`;
+  $('sessionHeader').textContent = data.forced ? 'Session Ended (Forced)' : 'Session Ended';
   $('sessionGameTitle').textContent = title;
   $('sessionDuration').textContent = formatDuration(data.durationSecs || 0);
   $('sessionNotes').value = '';
@@ -592,7 +593,7 @@ app.innerHTML = `
     </div>
   </div>
   <div data-view id="sessionView" hidden>
-    <div class="page-header"><h2>Session ended</h2><span class="app-version"></span></div>
+    <div class="page-header"><h2 id="sessionHeader">Session Ended</h2><span class="app-version"></span></div>
     <p><strong id="sessionGameTitle"></strong> – <span id="sessionDuration"></span></p>
     <form id="sessionForm">
       <div id="sessionNotesWrap" hidden>

@@ -20,6 +20,8 @@ use tauri_plugin_opener::OpenerExt;
 
 /// Tray icon (embedded at compile time from icons/icon.ico).
 const TRAY_ICON: tauri::image::Image<'_> = tauri::include_image!("icons/icon.ico");
+/// Tray icon shown while a game session is active.
+const TRAY_ICON_NOWPLAYING: tauri::image::Image<'_> = tauri::include_image!("icons/icon_nowplaying.ico");
 
 const DEFAULT_HEIGHT: f64 = 740.0;
 const MAIN_ABOUT_HEIGHT: f64 = 335.0;
@@ -61,6 +63,9 @@ struct AppState {
     process_map_arc: Arc<RwLock<ProcessMapConfig>>,
     current_session_arc: Arc<RwLock<Option<ActiveSession>>>,
     auth: RwLock<AuthConfig>,
+    /// Set to a process name when the user force-stops tracking. Clears when the process actually exits.
+    /// Prevents the monitor from immediately re-starting a session for the still-running process.
+    force_stopped_process: Arc<RwLock<Option<String>>>,
 }
 
 fn api_client(auth: &AuthConfig) -> Option<FroglogClient> {
@@ -174,26 +179,47 @@ fn handle_session_ended(
     });
 }
 
-fn build_tray_menu(app: &tauri::AppHandle, logged_in: bool) -> Result<Menu<Wry>, Box<dyn std::error::Error + Send + Sync>> {
-    let about_item = MenuItemBuilder::with_id("about", "About").build(app)?;
+fn build_tray_menu(app: &tauri::AppHandle, logged_in: bool, game_title: Option<String>) -> Result<Menu<Wry>, Box<dyn std::error::Error + Send + Sync>> {
     let quit_item = PredefinedMenuItem::quit(app, Some("Quit"))?;
-    if logged_in {
+    if let Some(ref title) = game_title {
+        let status_item = MenuItemBuilder::with_id("tracking_status", format!("Now Tracking: {}", title))
+            .enabled(false)
+            .build(app)?;
+        let force_stop_item = MenuItemBuilder::with_id("force_stop_tracking", "Stop Tracking Current Session").build(app)?;
+        let logout_item = MenuItemBuilder::with_id("logout", "Logout").build(app)?;
+        let menu = Menu::with_items(app, &[&status_item, &force_stop_item, &logout_item, &quit_item])?;
+        Ok(menu)
+    } else if logged_in {
         let assign_exes_item = MenuItemBuilder::with_id("assign_exes", "Configure...").build(app)?;
+        let about_item = MenuItemBuilder::with_id("about", "About").build(app)?;
         let logout_item = MenuItemBuilder::with_id("logout", "Logout").build(app)?;
         let menu = Menu::with_items(app, &[&assign_exes_item, &about_item, &logout_item, &quit_item])?;
         Ok(menu)
     } else {
         let login_item = MenuItemBuilder::with_id("login", "Login").build(app)?;
+        let about_item = MenuItemBuilder::with_id("about", "About").build(app)?;
         let menu = Menu::with_items(app, &[&login_item, &about_item, &quit_item])?;
         Ok(menu)
     }
 }
 
-fn update_tray_menu(app: &tauri::AppHandle) -> Result<(), String> {
-    let logged_in = app.state::<AppState>().auth.read().unwrap().token.is_some();
-    let menu = build_tray_menu(app, logged_in).map_err(|e| e.to_string())?;
+fn update_tray_state(app: &tauri::AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let logged_in = state.auth.read().unwrap().token.is_some();
+    let game_title = {
+        let sess = state.current_session_arc.read().unwrap();
+        sess.as_ref().map(|s| s.mapping.title.clone().unwrap_or_else(|| s.process_name.clone()))
+    };
+    let menu = build_tray_menu(app, logged_in, game_title.clone()).map_err(|e| e.to_string())?;
     if let Some(tray) = app.tray_by_id("main") {
         tray.set_menu(Some(menu)).map_err(|e| e.to_string())?;
+        if let Some(ref title) = game_title {
+            let _ = tray.set_icon(Some(TRAY_ICON_NOWPLAYING.clone()));
+            let _ = tray.set_tooltip(Some(format!("LilyPad - Now Tracking: {}", title)));
+        } else {
+            let _ = tray.set_icon(Some(TRAY_ICON.clone()));
+            let _ = tray.set_tooltip(Some("LilyPad - FrogLog Auto Tracker".to_string()));
+        }
     }
     Ok(())
 }
@@ -237,12 +263,12 @@ fn logout(_app: tauri::AppHandle, state: tauri::State<AppState>) -> Result<(), S
     Ok(())
 }
 
-/// Refresh tray menu from current auth state. Called by frontend after login (delayed) so it runs when main thread is idle.
+/// Refresh tray state from current auth/session state. Called by frontend after login (delayed) so it runs when main thread is idle.
 #[tauri::command]
 fn refresh_tray_menu(app: tauri::AppHandle) -> Result<(), String> {
     let app_clone = app.clone();
     app.run_on_main_thread(move || {
-        let _ = update_tray_menu(&app_clone);
+        let _ = update_tray_state(&app_clone);
     })
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -478,6 +504,7 @@ pub fn run() {
             process_map_arc: Arc::new(RwLock::new(process_map)),
             current_session_arc: Arc::new(RwLock::new(None)),
             auth: RwLock::new(auth),
+            force_stopped_process: Arc::new(RwLock::new(None)),
         })
         .invoke_handler(tauri::generate_handler![
             login,
@@ -510,7 +537,7 @@ pub fn run() {
             let _ = app.autolaunch().enable();
             let handle = app.handle().clone();
             let logged_in = app.state::<AppState>().auth.read().unwrap().token.is_some();
-            let menu = build_tray_menu(&handle, logged_in).map_err(|e| e.to_string())?;
+            let menu = build_tray_menu(&handle, logged_in, None).map_err(|e| e.to_string())?;
 
             let _tray = TrayIconBuilder::with_id("main")
                 .icon(TRAY_ICON.clone())
@@ -545,10 +572,57 @@ pub fn run() {
                         let map_path = process_map_path_for_auth(&empty_auth);
                         let process_map = ProcessMapConfig::load_from(&map_path);
                         *state.process_map_arc.write().unwrap() = process_map;
-                        let _ = update_tray_menu(app);
+                        let _ = update_tray_state(app);
                         if let Some(w) = app.get_webview_window("main") {
                             let _ = w.emit("show-login", ());
                         }
+                    } else if id == "force_stop_tracking" {
+                        let state = app.state::<AppState>();
+                        // Grab session info before clearing so we can submit it
+                        let session_info = {
+                            let sess = state.current_session_arc.read().unwrap();
+                            sess.as_ref().map(|s| (s.process_name.clone(), s.mapping.clone(), s.started_at.elapsed().as_secs_f64()))
+                        };
+                        if let Some((process_name, mapping, duration_secs)) = session_info {
+                            // Block re-tracking until the process actually exits
+                            *state.force_stopped_process.write().unwrap() = Some(process_name.clone());
+                            // Clear in-memory session
+                            *state.current_session_arc.write().unwrap() = None;
+                            // Delete persisted session file
+                            if let Ok(data_dir) = app.path().app_data_dir() {
+                                let _ = std::fs::remove_file(data_dir.join("active-session.json"));
+                            }
+                            // Always show the popup (never auto-submit on force stop —
+                            // user is likely correcting a bad mapping)
+                            let auth = state.auth.read().unwrap().clone();
+                            std::thread::spawn(move || {
+                                if let Some(client) = api_client(&auth) {
+                                    let _ = client.clear_now_playing();
+                                }
+                            });
+                            let _ = app.emit("session-ended", serde_json::json!({
+                                "processName": process_name,
+                                "mapping": {
+                                    "process": mapping.process,
+                                    "type": mapping.r#type,
+                                    "froglogId": mapping.froglog_id,
+                                    "title": mapping.title,
+                                },
+                                "durationSecs": duration_secs,
+                                "forced": true,
+                            }));
+                            if let Some(w) = app.get_webview_window("main") {
+                                let has_notes = mapping.r#type.eq_ignore_ascii_case("live") || mapping.r#type.eq_ignore_ascii_case("session");
+                                let (sh, tb) = if has_notes {
+                                    (SESSION_HEIGHT_LIVE, SESSION_TASKBAR_LIVE)
+                                } else {
+                                    (SESSION_HEIGHT_REGULAR, SESSION_TASKBAR_REGULAR)
+                                };
+                                show_session_window(&w, sh, tb);
+                            }
+                        }
+                        // Reset tray to idle state
+                        let _ = update_tray_state(app);
                     }
                 })
                 .build(app)?;
@@ -565,6 +639,7 @@ pub fn run() {
             let state = app.state::<AppState>();
             let config = Arc::clone(&state.process_map_arc);
             let current_session = Arc::clone(&state.current_session_arc);
+            let force_stopped_process = Arc::clone(&state.force_stopped_process);
 
             // Path used to persist the active session across crashes/restarts.
             let session_path = app_handle.path().app_data_dir()
@@ -638,6 +713,7 @@ pub fn run() {
                 config,
                 current_session,
                 Arc::new(AtomicBool::new(false)),
+                force_stopped_process,
                 2,
                 {
                     let handle = app_handle.clone();
@@ -682,13 +758,37 @@ pub fn run() {
                                 }
                             });
                         }
+                        // Update tray to now-tracking state
+                        let handle_tray = handle.clone();
+                        let _ = handle.run_on_main_thread(move || {
+                            let _ = update_tray_state(&handle_tray);
+                        });
                     }
                 },
                 {
                     let session_path_end = session_path.clone();
+                    let force_stopped_end = Arc::clone(&state.force_stopped_process);
                     move |process_name, mapping, duration_secs| {
                         let _ = std::fs::remove_file(&session_path_end);
-                        handle_session_ended(app_handle.clone(), process_name, mapping, duration_secs);
+                        // If force-stopped, clear the flag but skip handle_session_ended
+                        // (it was already called from the tray handler)
+                        let was_force_stopped = {
+                            let mut fp = force_stopped_end.write().unwrap();
+                            if fp.as_deref().map(|s| s.eq_ignore_ascii_case(&process_name)).unwrap_or(false) {
+                                *fp = None;
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if !was_force_stopped {
+                            handle_session_ended(app_handle.clone(), process_name, mapping, duration_secs);
+                        }
+                        // Reset tray to idle state
+                        let handle_tray = app_handle.clone();
+                        let _ = app_handle.run_on_main_thread(move || {
+                            let _ = update_tray_state(&handle_tray);
+                        });
                     }
                 },
             );

@@ -4,6 +4,7 @@ use crate::config::{ProcessMapConfig, ProcessMapping};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
@@ -143,12 +144,13 @@ fn run_wait_thread(
 /// Returns true if WMI started successfully, false if it should fall back to polling.
 #[cfg(windows)]
 fn try_run_wmi_watch(
-    config: Arc<std::sync::RwLock<ProcessMapConfig>>,
-    current_session: Arc<std::sync::RwLock<Option<ActiveSession>>>,
+    config: Arc<RwLock<ProcessMapConfig>>,
+    current_session: Arc<RwLock<Option<ActiveSession>>>,
     shutdown: Arc<AtomicBool>,
     tx: mpsc::Sender<(String, ProcessMapping, f64)>,
     on_session_started: Arc<dyn Fn(String, ProcessMapping) + Send + Sync + 'static>,
-    last_ended: Arc<std::sync::RwLock<Option<(String, Instant)>>>,
+    last_ended: Arc<RwLock<Option<(String, Instant)>>>,
+    force_stopped_process: Arc<RwLock<Option<String>>>,
 ) -> bool {
     use serde::Deserialize;
     use wmi::{COMLibrary, WMIConnection};
@@ -219,6 +221,15 @@ fn try_run_wmi_watch(
                         }
                     }
                 }
+                // Skip if user force-stopped this process (still running)
+                {
+                    let fs = force_stopped_process.read().unwrap();
+                    if let Some(ref stopped) = *fs {
+                        if stopped.eq_ignore_ascii_case(&event.process_name) {
+                            continue;
+                        }
+                    }
+                }
                 let mut cur = current_session.write().unwrap();
                 if cur.is_some() {
                     continue;
@@ -242,6 +253,7 @@ fn try_run_wmi_watch(
                 let process_name = event.process_name.clone();
                 let process_id = event.process_id;
                 let last_ended_clone = Arc::clone(&last_ended);
+                let force_stopped_clone = Arc::clone(&force_stopped_process);
 
                 std::thread::spawn(move || {
                     let pid = Pid::from(process_id as usize);
@@ -249,6 +261,15 @@ fn try_run_wmi_watch(
                     while Instant::now() < deadline {
                         if current_session.read().unwrap().is_some() {
                             return; // Another session started meanwhile.
+                        }
+                        // Skip if user force-stopped this process
+                        {
+                            let fs = force_stopped_clone.read().unwrap();
+                            if let Some(ref stopped) = *fs {
+                                if stopped.eq_ignore_ascii_case(&process_name) {
+                                    return;
+                                }
+                            }
                         }
                         // Respect cooldown from a recent session end for this process.
                         {
@@ -293,9 +314,10 @@ fn try_run_wmi_watch(
 /// Run the monitor. On Windows, tries WMI event-based start detection first;
 /// falls back to polling if WMI is unavailable. Exit detection always uses process.wait().
 pub fn run_poll_loop(
-    config: Arc<std::sync::RwLock<ProcessMapConfig>>,
-    current_session: Arc<std::sync::RwLock<Option<ActiveSession>>>,
+    config: Arc<RwLock<ProcessMapConfig>>,
+    current_session: Arc<RwLock<Option<ActiveSession>>>,
     shutdown: Arc<AtomicBool>,
+    force_stopped_process: Arc<RwLock<Option<String>>>,
     poll_interval_secs: u64,
     on_session_started: impl Fn(String, ProcessMapping) + Send + Sync + 'static,
     mut on_session_ended: impl FnMut(String, ProcessMapping, f64) + Send + 'static,
@@ -303,8 +325,8 @@ pub fn run_poll_loop(
     let (tx, rx) = mpsc::channel::<(String, ProcessMapping, f64)>();
 
     // Tracks when the last session ended per process name, to suppress phantom re-launches.
-    let last_ended: Arc<std::sync::RwLock<Option<(String, Instant)>>> =
-        Arc::new(std::sync::RwLock::new(None));
+    let last_ended: Arc<RwLock<Option<(String, Instant)>>> =
+        Arc::new(RwLock::new(None));
 
     // Wrap in Arc so it can be shared between WMI path and polling fallback.
     let on_started: Arc<dyn Fn(String, ProcessMapping) + Send + Sync + 'static> =
@@ -318,6 +340,7 @@ pub fn run_poll_loop(
         tx.clone(),
         Arc::clone(&on_started),
         Arc::clone(&last_ended),
+        Arc::clone(&force_stopped_process),
     );
 
     #[cfg(not(windows))]
@@ -330,6 +353,7 @@ pub fn run_poll_loop(
         let shutdown = Arc::clone(&shutdown);
         let tx = tx.clone();
         let last_ended_poll = Arc::clone(&last_ended);
+        let force_stopped_poll = Arc::clone(&force_stopped_process);
 
         std::thread::spawn(move || {
             let mut system = System::new_all();
@@ -364,6 +388,15 @@ pub fn run_poll_loop(
                                     if last_proc.eq_ignore_ascii_case(&name)
                                         && last_time.elapsed() < POST_SESSION_COOLDOWN
                                     {
+                                        continue 'proc_scan;
+                                    }
+                                }
+                            }
+                            // Skip if user force-stopped this process (still running)
+                            {
+                                let fs = force_stopped_poll.read().unwrap();
+                                if let Some(ref stopped) = *fs {
+                                    if stopped.eq_ignore_ascii_case(&name) {
                                         continue 'proc_scan;
                                     }
                                 }
