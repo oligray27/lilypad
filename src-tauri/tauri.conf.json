@@ -1,6 +1,6 @@
 {
   "productName": "LilyPad",
-  "version": "0.4.14",
+  "version": "0.4.15",
   "identifier": "uk.co.froglog.lilypad",
   "build": {
     "beforeDevCommand": "npm run copy-frontend && npx -y serve dist -l 1430",
