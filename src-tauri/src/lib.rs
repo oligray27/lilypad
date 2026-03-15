@@ -149,9 +149,13 @@ fn handle_session_ended(
             let submitted = rx.await.unwrap_or(false);
             if submitted {
                 let title = mapping.title.as_deref().unwrap_or_else(|| mapping.process.as_str());
+                let total_mins = (duration_secs / 60.0).round() as u64;
+                let disp_h = total_mins / 60;
+                let disp_m = total_mins % 60;
+                let time_str = if disp_h > 0 { format!("{}h {}m", disp_h, disp_m) } else { format!("{}m", disp_m) };
                 let _ = app.notification().builder()
-                    .title("LilyPad")
-                    .body(format!("Session auto-submitted: {}", title))
+                    .title("Session Auto-Submitted")
+                    .body(format!("{} ({})", title, time_str))
                     .show();
                 return;
             }
@@ -733,11 +737,10 @@ pub fn run() {
                             }
                             let _ = std::fs::write(&session_path_start, json);
                         }
-                        let title = mapping.title.as_deref().unwrap_or_else(|| process_name.as_str());
-                        let body = format!("Tracking started: {}", title);
+                        let game_name = mapping.title.as_deref().unwrap_or_else(|| process_name.as_str());
                         let _ = handle.notification().builder()
-                            .title("LilyPad")
-                            .body(body)
+                            .title("Tracking Started")
+                            .body(game_name)
                             .show();
                         let started_at_iso = chrono::Utc::now().to_rfc3339();
                         let (auth, share_now_playing) = {
