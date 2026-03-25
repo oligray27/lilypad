@@ -27,8 +27,8 @@ const DEFAULT_HEIGHT: f64 = 740.0;
 const MAIN_ABOUT_HEIGHT: f64 = 335.0;
 const WINDOW_WIDTH: f64 = 642.0;
 const SESSION_WIDTH: f64 = 440.0;
-const SESSION_HEIGHT_REGULAR: f64 = 165.0;
-const SESSION_HEIGHT_LIVE: f64 = 255.0;
+const SESSION_HEIGHT_REGULAR: f64 = 130.0;
+const SESSION_HEIGHT_LIVE: f64 = 240.0;
 const SESSION_TASKBAR_REGULAR: f64 = 94.0;
 const SESSION_TASKBAR_LIVE: f64 = 94.0;
 
@@ -134,9 +134,9 @@ fn handle_session_ended(
                     println!("[LilyPad] handle_session_ended: auto-submitting hours");
                     // clear_now_playing removed from here as it runs above for all cases
                     if mapping2.r#type.eq_ignore_ascii_case("live") {
-                        client.add_live_service_session(mapping2.froglog_id, Some(date), Some(hours), Some("Session auto submitted with LilyPad".to_string())).is_ok()
+                        client.add_live_service_session(mapping2.froglog_id, Some(date), Some(hours), Some("Session auto submitted with LilyPad".to_string()), false, true).is_ok()
                     } else if mapping2.r#type.eq_ignore_ascii_case("session") {
-                        client.add_game_session(mapping2.froglog_id, Some(date), Some(hours), Some("Session auto submitted with LilyPad".to_string())).is_ok()
+                        client.add_game_session(mapping2.froglog_id, Some(date), Some(hours), Some("Session auto submitted with LilyPad".to_string()), false, true).is_ok()
                     } else {
                         client.update_game_hours(mapping2.froglog_id, hours).is_ok()
                     }
@@ -161,6 +161,15 @@ fn handle_session_ended(
             }
         }
 
+        if let Some(w) = app.get_webview_window("main") {
+            let has_notes = mapping.r#type.eq_ignore_ascii_case("live") || mapping.r#type.eq_ignore_ascii_case("session");
+            let (sh, tb) = if has_notes {
+                (SESSION_HEIGHT_LIVE, SESSION_TASKBAR_LIVE)
+            } else {
+                (SESSION_HEIGHT_REGULAR, SESSION_TASKBAR_REGULAR)
+            };
+            show_session_window(&w, sh, tb);
+        }
         let _ = app.emit("session-ended", serde_json::json!({
              "processName": process_name,
              "mapping": {
@@ -171,15 +180,6 @@ fn handle_session_ended(
             },
              "durationSecs": duration_secs,
         }));
-            if let Some(w) = app.get_webview_window("main") {
-            let has_notes = mapping.r#type.eq_ignore_ascii_case("live") || mapping.r#type.eq_ignore_ascii_case("session");
-            let (sh, tb) = if has_notes {
-                (SESSION_HEIGHT_LIVE, SESSION_TASKBAR_LIVE)
-            } else {
-                (SESSION_HEIGHT_REGULAR, SESSION_TASKBAR_REGULAR)
-             };
-            show_session_window(&w, sh, tb);
-        }
     });
 }
 
@@ -299,14 +299,18 @@ fn submit_session(
     game_id: i32,
     hours: f64,
     notes: Option<String>,
+    spoiler: Option<bool>,
+    is_public: Option<bool>,
 ) -> Result<serde_json::Value, String> {
     let auth = state.auth.read().unwrap();
     let client = api_client(&auth).ok_or("Not logged in")?;
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let spoiler = spoiler.unwrap_or(false);
+    let is_public = is_public.unwrap_or(true);
     if game_type.eq_ignore_ascii_case("live") {
-        client.add_live_service_session(game_id, Some(date), Some(hours), notes)
+        client.add_live_service_session(game_id, Some(date), Some(hours), notes, spoiler, is_public)
     } else if game_type.eq_ignore_ascii_case("session") {
-        client.add_game_session(game_id, Some(date), Some(hours), notes)
+        client.add_game_session(game_id, Some(date), Some(hours), notes, spoiler, is_public)
     } else {
         client.update_game_hours(game_id, hours)
     }

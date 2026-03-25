@@ -459,11 +459,13 @@ function showPostPlay(data) {
   $('sessionGameTitle').textContent = title;
   $('sessionDuration').textContent = formatDuration(data.durationSecs || 0);
   $('sessionNotes').value = '';
+  $('sessionSpoiler').checked = false;
+  $('sessionHidePublic').checked = false;
   const hasNotes = mapping.type === 'live' || mapping.type === 'session';
   const notesWrap = $('sessionNotesWrap');
   if (notesWrap) notesWrap.hidden = !hasNotes;
   $('sessionError').textContent = '';
-  showView('sessionView', { height: hasNotes ? 255 : 165 });
+  showView('sessionView', { height: hasNotes ? 240 : 130 });
 }
 
 async function onSubmitSession(e) {
@@ -472,7 +474,10 @@ async function onSubmitSession(e) {
   const mapping = pendingSession.mapping || {};
   const gameId = mapping.froglogId;
   const gameType = mapping.type || 'regular';
-  const notes = (gameType === 'live' || gameType === 'session') ? ($('sessionNotes').value.trim() || null) : null;
+  const hasNotes = gameType === 'live' || gameType === 'session';
+  const notes = hasNotes ? ($('sessionNotes').value.trim() || null) : null;
+  const spoiler = hasNotes ? $('sessionSpoiler').checked : false;
+  const isPublic = hasNotes ? !$('sessionHidePublic').checked : true;
   const errEl = $('sessionError');
   errEl.textContent = '';
   const rawHours = (pendingSession.durationSecs || 0) / 3600;
@@ -483,6 +488,8 @@ async function onSubmitSession(e) {
       gameId,
       hours,
       notes,
+      spoiler,
+      isPublic,
     });
     pendingSession = null;
     invoke('hide_window').catch(() => {});
@@ -599,6 +606,10 @@ app.innerHTML = `
       <div id="sessionNotesWrap" hidden>
         <label>Notes (optional)</label>
         <textarea id="sessionNotes" rows="2"></textarea>
+        <div class="session-checkboxes">
+          <label class="session-check-label"><input type="checkbox" id="sessionSpoiler" /> Contains spoilers</label>
+          <label class="session-check-label"><input type="checkbox" id="sessionHidePublic" /> Hide from public</label>
+        </div>
       </div>
       <p id="sessionError" class="error"></p>
       <div class="session-form-actions" style="display:flex;justify-content:space-between;align-items:center;width:100%;margin-top:0.5rem;">

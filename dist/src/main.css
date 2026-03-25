@@ -89,7 +89,13 @@ a:hover { text-decoration: underline; }
 .mappings-footer { display: flex; justify-content: flex-end; border-top: 1px solid var(--border); padding: 0.5rem 0.35rem 0 0; }
 .mappings-footer button { margin: 0; padding: 0.25rem 0; font-size: 0.85rem; width: 65.75px; }
 #loginView input { width: 98%; box-sizing: border-box; }
+#sessionView p { margin: 0 0 0.3rem; }
 #sessionView #sessionForm { width: 100%; }
-#sessionView .session-form-actions { display: flex; justify-content: space-between; align-items: center; margin-top: 0.5rem; width: 100%; }
+#sessionView label { margin-top: 0.3rem; }
+#sessionView textarea { margin-top: 0.2rem; }
+#sessionView .session-form-actions { display: flex; justify-content: space-between; align-items: center; margin-top: 0.4rem; width: 100%; }
 #sessionView .session-form-actions button { margin: 0; flex-shrink: 0; }
+#sessionView .session-checkboxes { display: flex; gap: 1rem; margin-top: 0.3rem; }
+#sessionView .session-check-label { display: flex; align-items: center; gap: 0.3rem; font-size: 0.8rem; cursor: pointer; user-select: none; white-space: nowrap; }
 #sessionView #skipSession { margin-right: 0; }
+#sessionView .error { margin-top: 0.25rem; min-height: 0; }

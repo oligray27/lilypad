@@ -53,6 +53,8 @@ pub struct AddSessionBody {
     pub date: Option<String>,
     pub hours: Option<f64>,
     pub notes: Option<String>,
+    pub spoiler: bool,
+    pub is_public: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -181,8 +183,10 @@ impl FroglogClient {
         date: Option<String>,
         hours: Option<f64>,
         notes: Option<String>,
+        spoiler: bool,
+        is_public: bool,
     ) -> Result<serde_json::Value, String> {
-        let body = AddSessionBody { date, hours, notes };
+        let body = AddSessionBody { date, hours, notes, spoiler, is_public };
         let res = self
             .client
             .post(self.url(&format!("/games/{}/sessions", game_id)))
@@ -206,8 +210,10 @@ impl FroglogClient {
         date: Option<String>,
         hours: Option<f64>,
         notes: Option<String>,
+        spoiler: bool,
+        is_public: bool,
     ) -> Result<serde_json::Value, String> {
-        let body = AddSessionBody { date, hours, notes };
+        let body = AddSessionBody { date, hours, notes, spoiler, is_public };
         let res = self
             .client
             .post(self.url(&format!("/live-service/{}/sessions", game_id)))
