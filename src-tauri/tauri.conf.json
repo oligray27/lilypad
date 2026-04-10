@@ -40,7 +40,7 @@
     ],
     "linux": {
       "deb": {
-        "depends": ["libwebkit2gtk-4.1-0", "libssl3", "libappindicator3-1"]
+        "depends": ["libwebkit2gtk-4.1-0", "libssl3", "libayatana-appindicator3-1"]
       }
     },
     "windows": {

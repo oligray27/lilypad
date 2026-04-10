@@ -16,7 +16,7 @@ tauri-build = { version = "2", features = [] }
 ico = "0.5"
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon", "protocol-asset", "image-ico"] }
+tauri = { version = "2", features = ["tray-icon", "protocol-asset", "image-ico", "ayatana-tray"] }
 tauri-plugin-autostart = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-dialog = "2"
