@@ -1,7 +1,13 @@
-use std::fs;
-use std::path::Path;
-
 fn main() {
+    #[cfg(windows)]
+    ensure_ico();
+    tauri_build::build()
+}
+
+#[cfg(windows)]
+fn ensure_ico() {
+    use std::fs;
+    use std::path::Path;
     // Ensure icons dir exists and create minimal icon.ico if missing (required for Windows)
     let icons_dir = Path::new("icons");
     let ico_path = icons_dir.join("icon.ico");
@@ -25,5 +31,4 @@ fn main() {
             let _ = icon_dir.write(f);
         }
     }
-    tauri_build::build()
 }

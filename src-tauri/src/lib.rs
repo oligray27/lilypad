@@ -18,10 +18,16 @@ use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
 
-/// Tray icon (embedded at compile time from icons/icon.ico).
+/// Tray icon (embedded at compile time).
+#[cfg(windows)]
 const TRAY_ICON: tauri::image::Image<'_> = tauri::include_image!("icons/icon.ico");
+#[cfg(not(windows))]
+const TRAY_ICON: tauri::image::Image<'_> = tauri::include_image!("icons/icon.png");
 /// Tray icon shown while a game session is active.
+#[cfg(windows)]
 const TRAY_ICON_NOWPLAYING: tauri::image::Image<'_> = tauri::include_image!("icons/icon_nowplaying.ico");
+#[cfg(not(windows))]
+const TRAY_ICON_NOWPLAYING: tauri::image::Image<'_> = tauri::include_image!("icons/icon_nowplaying.png");
 
 const DEFAULT_HEIGHT: f64 = 740.0;
 const MAIN_ABOUT_HEIGHT: f64 = 335.0;
@@ -29,8 +35,14 @@ const WINDOW_WIDTH: f64 = 642.0;
 const SESSION_WIDTH: f64 = 440.0;
 const SESSION_HEIGHT_REGULAR: f64 = 130.0;
 const SESSION_HEIGHT_LIVE: f64 = 240.0;
+#[cfg(windows)]
 const SESSION_TASKBAR_REGULAR: f64 = 94.0;
+#[cfg(windows)]
 const SESSION_TASKBAR_LIVE: f64 = 94.0;
+#[cfg(not(windows))]
+const SESSION_TASKBAR_REGULAR: f64 = 50.0;
+#[cfg(not(windows))]
+const SESSION_TASKBAR_LIVE: f64 = 50.0;
 
 fn show_window_at_height(w: &tauri::WebviewWindow, width: f64, height: f64) {
     let _ = w.set_size(tauri::Size::Logical(tauri::LogicalSize { width, height }));
@@ -491,10 +503,16 @@ fn hide_window(app: tauri::AppHandle) -> Result<(), String> {
 #[tauri::command]
 fn pick_exe_file(app: tauri::AppHandle) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
+    #[cfg(windows)]
     let path = app
         .dialog()
         .file()
         .add_filter("Executables", &["exe"])
+        .blocking_pick_file();
+    #[cfg(not(windows))]
+    let path = app
+        .dialog()
+        .file()
         .blocking_pick_file();
     Ok(path.and_then(|p| p.as_path().map(|path| path.display().to_string())))
 }
