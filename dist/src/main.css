@@ -12,6 +12,9 @@
   --switch-active-text: #fff;
   --subtitle: #888;
   --link: #06c;
+  --titlebar-bg: #ebebeb;
+  --titlebar-text: #444;
+  --titlebar-h: 32px;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -27,11 +30,17 @@
     --switch-active-text: #111;
     --subtitle: #aaa;
     --link: #4db6ff;
+    --titlebar-bg: #252525;
+    --titlebar-text: #aaa;
   }
 }
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
-body { font-family: system-ui, sans-serif; padding: 1rem; margin: 0; background: var(--bg); color: var(--text); }
+body { font-family: system-ui, sans-serif; padding: calc(var(--titlebar-h) + 1rem) 1rem 1rem; margin: 0; background: var(--bg); color: var(--text); }
+#titlebar { position: fixed; top: 0; left: 0; right: 0; height: var(--titlebar-h); background: var(--titlebar-bg); display: flex; align-items: center; z-index: 9999; user-select: none; -webkit-user-select: none; border-bottom: 1px solid var(--border-subtle); }
+.titlebar-title { flex: 1; font-size: 0.82rem; font-weight: 500; color: var(--titlebar-text); padding-left: 0.75rem; cursor: default; }
+.titlebar-close { width: 46px; height: var(--titlebar-h); border: none; background: transparent; color: var(--titlebar-text); font-size: 1rem; line-height: 1; cursor: pointer; display: flex; align-items: center; justify-content: center; margin: 0; padding: 0; flex-shrink: 0; }
+.titlebar-close:hover { background: #e81123; color: #fff; }
 h2 { margin-top: 0; }
 label { display: block; margin-top: 0.5rem; }
 input, textarea { width: 100%; margin-top: 0.25rem; padding: 0.4rem; }
@@ -40,7 +49,7 @@ button { margin-right: 0.5rem; margin-top: 0.5rem; padding: 0.4rem 0.8rem; }
 .muted { color: var(--muted); font-size: 0.9rem; line-height: 1.4; }
 code { font-size: 0.85em; background: var(--code-bg); padding: 0.1em 0.3em; border-radius: 3px; }
 [data-view] { max-width: 520px; }
-#mappingsView { width: 100%; max-width: none; display: flex; flex-direction: column; height: calc(100vh - 2rem); }
+#mappingsView { width: 100%; max-width: none; display: flex; flex-direction: column; height: calc(100vh - var(--titlebar-h) - 2rem); }
 .mappings-scrollable { flex: 1; overflow-y: auto; min-height: 0; }
 .mappings-switch { display: flex; gap: 0; margin-top: 0.5rem; }
 .mappings-switch button { padding: 0.4rem 1rem; border: 1px solid var(--border); background: var(--switch-bg); color: var(--text); cursor: pointer; font-size: 0.9rem; display: inline-flex; align-items: center; justify-content: center; min-height: 2rem; }
@@ -97,5 +106,6 @@ a:hover { text-decoration: underline; }
 #sessionView .session-form-actions button { margin: 0; flex-shrink: 0; }
 #sessionView .session-checkboxes { display: flex; gap: 1rem; margin-top: 0.3rem; }
 #sessionView .session-check-label { display: flex; align-items: center; gap: 0.3rem; font-size: 0.8rem; cursor: pointer; user-select: none; white-space: nowrap; }
+#sessionView .session-check-label input { width: auto; margin: 0; padding: 0; }
 #sessionView #skipSession { margin-right: 0; }
 #sessionView .error { margin-top: 0.25rem; min-height: 0; }

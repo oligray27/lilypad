@@ -6,7 +6,7 @@ System tray app for the Froglog suite: tracks game play time and submits session
 
 - Node.js and npm (for Tauri CLI)
 - Rust (stable)
-- Windows (for process detection; tray works on Windows)
+- Windows or Linux (process detection and tray supported on both)
 
 ## Development
 
@@ -45,8 +45,10 @@ That writes all required sizes into `src-tauri/icons/`. If you only add **`icon.
 
 ## Configuration
 
-- **API URL**: Set at first login (default: `https://api.froglog.co.uk/api`). Stored with token in `%APPDATA%/froglog-lilypad/auth.json`.
-- **Process → Game mapping**: Stored in `%APPDATA%/froglog-lilypad/process-map.json`. Add entries like:
+- **API URL**: Set at first login (default: `https://api.froglog.co.uk/api`). Stored with token in:
+  - Windows: `%APPDATA%/froglog-lilypad/auth.json`
+  - Linux: `~/.config/froglog-lilypad/auth.json`
+- **Process → Game mapping**: Stored in the same directory as `process-map.json`. Add entries like:
   ```json
   {
     "mappings": [
@@ -54,6 +56,8 @@ That writes all required sizes into `src-tauri/icons/`. If you only add **`icon.
     ]
   }
   ```
+  On Linux, native executables have no `.exe` suffix (e.g. `"process": "hl2"`). Wine/Proton games still use `.exe` names as they appear in the process list.
+
   When an unknown process triggers a session, you can submit and then add a mapping (future: "Remember this process" in the UI).
 
 ## How to use
@@ -61,15 +65,17 @@ That writes all required sizes into `src-tauri/icons/`. If you only add **`icon.
 1. **Start the app** – Run `npm run dev` (or the built exe). The app minimizes to the **system tray**; the main window may stay hidden.
 2. **Open the window** – Right‑click the Lilypad icon in the tray → click **Show** or **Settings**. The main window opens.
 3. **First time** – You’ll see the **Login** form. Enter API URL (default `https://api.froglog.co.uk/api`), your Froglog username and password, then **Log in**. Next time you open the window you’ll see the main view.
-4. **Add process mappings** – So Lilypad knows which process = which Froglog game, add entries to `%APPDATA%\froglog-lilypad\process-map.json` (create the file if needed), e.g.:
+4. **Add process mappings** – Right-click the tray icon → **Configure…**, or edit the config file directly:
+   - Windows: `%APPDATA%\froglog-lilypad\process-map.json`
+   - Linux: `~/.config/froglog-lilypad/process-map.json`
    ```json
    { "mappings": [
      { "process": "hl2.exe", "type": "regular", "froglogId": 42, "title": "Half-Life 2" },
      { "process": "WarThunder.exe", "type": "live", "froglogId": 5, "title": "War Thunder" }
    ]}
    ```
-   Use your real Froglog game IDs from the website (backlog = regular, live service = live).
-5. **When you play** – Start a game whose `.exe` is in the mapping. Lilypad detects it and starts timing. When you close the game, the main window opens with **Session ended**: time played, optional note, and **Submit to Froglog** (or **Skip**).
+   On Linux, use the executable name without `.exe` for native games (e.g. `"process": "hl2"`). Use your real Froglog game IDs from the website (backlog = regular, live service = live).
+5. **When you play** – Start a game whose executable is in the mapping. Lilypad detects it and starts timing. When you close the game, the main window opens with **Session ended**: time played, optional note, and **Submit to Froglog** (or **Skip**).
 
 ## How it works
 

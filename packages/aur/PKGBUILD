@@ -1,0 +1,50 @@
+# Maintainer: oligray27
+pkgname=lilypad-bin
+pkgver=0.4.17
+pkgrel=1
+pkgdesc="FrogLog game time tracker - system tray app"
+arch=('x86_64')
+url="https://github.com/oligray27/lilypad"
+license=('MIT')
+# Use system webkit2gtk/gtk so fractional scaling works correctly on Wayland
+depends=('webkit2gtk-4.1' 'openssl' 'libayatana-appindicator' 'libnotify')
+options=('!strip')
+source=("lilypad.AppImage::https://github.com/oligray27/lilypad/releases/download/v${pkgver}/LilyPad_${pkgver}_amd64.AppImage")
+sha256sums=('SKIP')
+
+prepare() {
+    chmod +x "${srcdir}/lilypad.AppImage"
+    cd "${srcdir}"
+    # Extract the AppImage contents - we use the binary directly against system libs
+    # rather than running the AppImage, so fractional scaling works on KDE Wayland
+    APPIMAGE_EXTRACT_AND_RUN=1 ./lilypad.AppImage --appimage-extract
+}
+
+package() {
+    # Install the binary directly (uses system GTK/webkit2gtk, not bundled ones)
+    install -Dm755 "${srcdir}/squashfs-root/usr/bin/lilypad" "${pkgdir}/usr/bin/lilypad"
+
+    # Desktop entry
+    install -Dm644 /dev/stdin "${pkgdir}/usr/share/applications/uk.co.froglog.lilypad.desktop" <<EOF
+[Desktop Entry]
+Name=LilyPad
+Comment=FrogLog game time tracker
+Exec=/usr/bin/lilypad
+Icon=uk.co.froglog.lilypad
+Type=Application
+Categories=Utility;
+StartupNotify=false
+EOF
+
+    # Icons
+    for size in 32x32 128x128; do
+        _src="${srcdir}/squashfs-root/usr/share/icons/hicolor/${size}/apps"
+        if [ -d "$_src" ]; then
+            for icon in "$_src"/*.png; do
+                [ -f "$icon" ] || continue
+                install -Dm644 "$icon" \
+                    "${pkgdir}/usr/share/icons/hicolor/${size}/apps/uk.co.froglog.lilypad.png"
+            done
+        fi
+    done
+}

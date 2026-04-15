@@ -4,11 +4,12 @@ const { listen } = window.__TAURI__.event;
 
 const $ = (id) => document.getElementById(id);
 
+const TITLEBAR_H = 32;
 const VIEW_SIZE = {
-  loginView: { width: 560, height: 315 },
-  mainView: { width: 550, height: 335 },
-  mappingsView: { width: 642, height: 740 },
-  sessionView: { width: 440, height: 165 },
+  loginView: { width: 560, height: 315 + TITLEBAR_H },
+  mainView: { width: 550, height: 335 + TITLEBAR_H },
+  mappingsView: { width: 652, height: 740 + TITLEBAR_H },
+  sessionView: { width: 440, height: 165 + TITLEBAR_H },
 };
 
 function showView(id, heightOrOpts) {
@@ -115,7 +116,7 @@ function renderMappingsTable() {
       const tfEsc = escapeAttr(titleFilter);
       return `<tr data-type="${escapeAttr(row.type)}" data-id="${row.id}" data-title="${escapeAttr(row.title)}">
         <td class="mappings-title">${titleEsc}</td>
-        <td class="mappings-exe-cell"><div class="mappings-exe-cell-inner"><input type="text" class="mappings-exe" value="${exeEsc}" placeholder="e.g. hl2.exe" data-type="${escapeAttr(row.type)}" data-id="${row.id}" data-title="${escapeAttr(row.title)}" /><button type="button" class="mappings-browse">Browse…</button></div></td>
+        <td class="mappings-exe-cell"><div class="mappings-exe-cell-inner"><input type="text" class="mappings-exe" value="${exeEsc}" placeholder="e.g. hl2.exe (Linux: hl2)" data-type="${escapeAttr(row.type)}" data-id="${row.id}" data-title="${escapeAttr(row.title)}" /><button type="button" class="mappings-browse">Browse…</button></div></td>
         <td class="mappings-title-filter-cell"><input type="text" class="mappings-title-filter" value="${tfEsc}" placeholder="optional" data-type="${escapeAttr(row.type)}" data-id="${row.id}" data-title="${escapeAttr(row.title)}" /></td>
       </tr>`;
     })
@@ -160,7 +161,6 @@ async function loadMappingsView() {
       invoke('get_live_service_games'),
       invoke('get_process_mappings'),
     ]);
-    console.log('[LilyPad] loadMappingsView mapConfig:', mapConfig);
     const knownKeys = new Set([
       ...(games || []).map((g) => mappingKey(g.session_tracking ? 'session' : 'regular', g.id)),
       ...(liveService || []).map((g) => mappingKey('live', g.id)),
@@ -194,7 +194,6 @@ async function loadMappingsView() {
     const shareNowEl = $('shareNowPlaying');
     if (shareNowEl) {
       shareNowEl.checked = !!mapConfigAfter.share_now_playing;
-      console.log('[LilyPad] share_now_playing loaded as:', shareNowEl.checked);
     }
     tableWrap.hidden = false;
     renderMappingsTable();
@@ -465,7 +464,7 @@ function showPostPlay(data) {
   const notesWrap = $('sessionNotesWrap');
   if (notesWrap) notesWrap.hidden = !hasNotes;
   $('sessionError').textContent = '';
-  showView('sessionView', { height: hasNotes ? 240 : 130 });
+  showView('sessionView', { height: hasNotes ? 240 + TITLEBAR_H : 130 + TITLEBAR_H });
 }
 
 async function onSubmitSession(e) {
@@ -563,7 +562,7 @@ app.innerHTML = `
     <hr />
     <p class="muted about-steps-heading"><strong>Getting started</strong></p>
     <ol class="about-steps muted">
-      <li>Right-click the tray icon and choose <strong>Configure…</strong> to link each game's <code>.exe</code> to its FrogLog entry.</li>
+      <li>Right-click the tray icon and choose <strong>Configure…</strong> to link each game's executable (<code>.exe</code> on Windows, no extension on Linux) to its FrogLog entry.</li>
       <li>Launch your game as normal — LilyPad will detect it automatically.</li>
       <li>When you close the game, this window will appear so you can submit the session.</li>
     </ol>
@@ -571,7 +570,7 @@ app.innerHTML = `
   <div data-view id="mappingsView" hidden>
     <div class="mappings-scrollable">
       <div class="page-header"><h2>Configuration</h2><span class="app-version"></span></div>
-      <p class="muted">Type the executable name (e.g. <code>game.exe</code>) in the exe column. Once a session ends, LilyPad will prompt you to log the session.</p>
+      <p class="muted">Type the executable name (e.g. <code>game.exe</code> on Windows, <code>game</code> on Linux) in the exe column. Once a session ends, LilyPad will prompt you to log the session.</p>
       <label class="mappings-auto-submit-label"><input type="checkbox" id="mappingsAutoSubmitRegular" /> Auto-submit regular game sessions</label>
       <label class="mappings-auto-submit-label"><input type="checkbox" id="mappingsAutoSubmitSession" /> Auto-submit session-tracked game sessions</label>
       <label class="mappings-auto-submit-label"><input type="checkbox" id="mappingsAutoSubmitLive" /> Auto-submit live service sessions</label>
@@ -585,7 +584,7 @@ app.innerHTML = `
       <p id="mappingsError" class="error"></p>
       <div id="mappingsTableWrap" class="mappings-table-wrap">
         <table class="mappings-table">
-          <thead><tr><th>Game</th><th>exe</th><th class="mappings-th-window-title">Window title filter</th></tr></thead>
+          <thead><tr><th>Game</th><th>executable</th><th class="mappings-th-window-title">Window title filter</th></tr></thead>
           <tbody id="mappingsTableBody"></tbody>
         </table>
       </div>
@@ -627,6 +626,15 @@ document.addEventListener('click', (e) => {
     invoke('open_url', { url: link.dataset.url }).catch(() => {});
   }
 });
+document.getElementById('titlebarClose').addEventListener('click', () => {
+  invoke('hide_window').catch(() => {});
+});
+document.getElementById('titlebar').addEventListener('mousedown', (e) => {
+  if (e.target.closest('.titlebar-close')) return;
+  if (e.button === 0) {
+    invoke('plugin:window|start_dragging').catch(() => {});
+  }
+});
 document.getElementById('loginForm').addEventListener('submit', onLogin);
 document.getElementById('sessionForm').addEventListener('submit', onSubmitSession);
 document.getElementById('skipSession').addEventListener('click', onSkipSession);
@@ -642,10 +650,7 @@ function saveAutoSubmit() {
 }
 function saveShareNowPlaying() {
   const share = !!$('shareNowPlaying').checked;
-  console.log('[LilyPad] saveShareNowPlaying toggled to:', share);
-  invoke('save_now_playing_share', { share }).catch((err) => {
-    console.error('[LilyPad] save_now_playing_share error:', err);
-  });
+  invoke('save_now_playing_share', { share }).catch(() => {});
 }
 $('mappingsAutoSubmitRegular').addEventListener('change', saveAutoSubmit);
 $('mappingsAutoSubmitLive').addEventListener('change', saveAutoSubmit);

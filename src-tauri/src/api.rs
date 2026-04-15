@@ -301,7 +301,6 @@ impl FroglogClient {
         started_at: Option<String>,
     ) -> Result<serde_json::Value, String> {
         let body = NowPlayingBody { game_id, game_type, title, started_at };
-        println!("[LilyPad] set_now_playing request: {:?}", body);
         let res = self
             .client
             .put(self.url("/users/me/now-playing"))
@@ -314,16 +313,13 @@ impl FroglogClient {
         }
         if !res.status().is_success() {
             let err: serde_json::Value = res.json().unwrap_or_default();
-            println!("[LilyPad] set_now_playing failed: {:?}", err);
             return Err(err["error"].as_str().unwrap_or("Request failed").to_string());
         }
         let json = res.json().map_err(|e: reqwest::Error| e.to_string())?;
-        println!("[LilyPad] set_now_playing success: {:?}", json);
         Ok(json)
     }
 
     pub fn clear_now_playing(&self) -> Result<(), String> {
-        println!("[LilyPad] clear_now_playing request");
         let res = self
             .client
             .delete(self.url("/users/me/now-playing"))
@@ -335,16 +331,13 @@ impl FroglogClient {
         }
         if !res.status().is_success() {
             let err: serde_json::Value = res.json().unwrap_or_default();
-            println!("[LilyPad] clear_now_playing failed: {:?}", err);
             return Err(err["error"].as_str().unwrap_or("Request failed").to_string());
         }
-        println!("[LilyPad] clear_now_playing success");
         Ok(())
     }
 
     pub fn set_show_current_session(&self, enabled: bool) -> Result<serde_json::Value, String> {
         let body = serde_json::json!({ "showCurrentSession": enabled });
-        println!("[LilyPad] set_show_current_session request: {:?}", body);
         let res = self
             .client
             .put(self.url("/users/current-session-visibility"))
@@ -357,11 +350,9 @@ impl FroglogClient {
         }
         if !res.status().is_success() {
             let err: serde_json::Value = res.json().unwrap_or_default();
-            println!("[LilyPad] set_show_current_session failed: {:?}", err);
             return Err(err["error"].as_str().unwrap_or("Request failed").to_string());
         }
         let json = res.json().map_err(|e: reqwest::Error| e.to_string())?;
-        println!("[LilyPad] set_show_current_session success: {:?}", json);
         Ok(json)
     }
 }

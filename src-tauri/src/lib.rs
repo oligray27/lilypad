@@ -10,13 +10,42 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::{Duration, Instant, SystemTime};
 use sysinfo::{ProcessesToUpdate, System};
-use tauri::menu::{Menu, MenuItemBuilder, PredefinedMenuItem};
+use tauri::menu::{Menu, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::{Emitter, Manager, WindowEvent};
 use tauri::Wry;
 use tauri_plugin_autostart::ManagerExt;
+#[cfg(not(target_os = "linux"))]
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
+
+/// Send a desktop notification. On Linux we use notify-rust directly so we can
+/// set the correct app name ("LilyPad") and icon; the Tauri plugin inherits the
+/// binary name ("lilypad") and skips the icon on Linux.
+fn send_notification(app: &tauri::AppHandle, title: &str, body: &str) {
+    #[cfg(target_os = "linux")]
+    {
+        // When running from an AppImage, $APPDIR points to the mount root and the
+        // freedesktop icon name won't resolve (not installed in the system theme).
+        // Use the absolute path to the bundled icon instead.
+        let icon = std::env::var("APPDIR")
+            .map(|d| format!("{}/usr/share/icons/hicolor/128x128/apps/lilypad.png", d))
+            .unwrap_or_else(|_| "uk.co.froglog.lilypad".to_string());
+        let _ = notify_rust::Notification::new()
+            .appname("LilyPad")
+            .icon(&icon)
+            .summary(title)
+            .body(body)
+            .show();
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = app.notification().builder().title(title).body(body).show();
+    }
+    // suppress unused warning on non-Linux
+    #[cfg(target_os = "linux")]
+    let _ = app;
+}
 
 /// Tray icon (embedded at compile time).
 #[cfg(windows)]
@@ -29,44 +58,44 @@ const TRAY_ICON_NOWPLAYING: tauri::image::Image<'_> = tauri::include_image!("ico
 #[cfg(not(windows))]
 const TRAY_ICON_NOWPLAYING: tauri::image::Image<'_> = tauri::include_image!("icons/icon_nowplaying.png");
 
-const DEFAULT_HEIGHT: f64 = 740.0;
-const MAIN_ABOUT_HEIGHT: f64 = 335.0;
+const TITLEBAR_H: f64 = 32.0;
+const DEFAULT_HEIGHT: f64 = 740.0 + TITLEBAR_H;
+const MAIN_ABOUT_HEIGHT: f64 = 335.0 + TITLEBAR_H;
 const WINDOW_WIDTH: f64 = 642.0;
+const MAPPINGS_WIDTH: f64 = 652.0;
 const SESSION_WIDTH: f64 = 440.0;
-const SESSION_HEIGHT_REGULAR: f64 = 130.0;
-const SESSION_HEIGHT_LIVE: f64 = 240.0;
-#[cfg(windows)]
-const SESSION_TASKBAR_REGULAR: f64 = 94.0;
-#[cfg(windows)]
-const SESSION_TASKBAR_LIVE: f64 = 94.0;
-#[cfg(not(windows))]
-const SESSION_TASKBAR_REGULAR: f64 = 50.0;
-#[cfg(not(windows))]
-const SESSION_TASKBAR_LIVE: f64 = 50.0;
+const SESSION_HEIGHT_REGULAR: f64 = 130.0 + TITLEBAR_H;
+const SESSION_HEIGHT_LIVE: f64 = 240.0 + TITLEBAR_H;
 
 fn show_window_at_height(w: &tauri::WebviewWindow, width: f64, height: f64) {
     let _ = w.set_size(tauri::Size::Logical(tauri::LogicalSize { width, height }));
     let _ = w.center();
     let _ = w.show();
-    let _ = w.set_focus();
+    focus_window(w);
 }
 
-fn show_session_window(w: &tauri::WebviewWindow, height: f64, taskbar_margin: f64) {
+fn show_session_window(w: &tauri::WebviewWindow, height: f64) {
     let _ = w.set_size(tauri::Size::Logical(tauri::LogicalSize { width: SESSION_WIDTH, height }));
-    if let Ok(Some(monitor)) = w.primary_monitor() {
-        let scale = monitor.scale_factor();
-        let mon_size = monitor.size();
-        let mon_pos = monitor.position();
-        let win_w = (SESSION_WIDTH * scale) as i32;
-        let win_h = (height * scale) as i32;
-        let margin = (12.0 * scale) as i32;
-        let tb = (taskbar_margin * scale) as i32;
-        let x = mon_pos.x + mon_size.width as i32 - win_w - margin;
-        let y = mon_pos.y + mon_size.height as i32 - win_h - tb;
-        let _ = w.set_position(tauri::Position::Physical(tauri::PhysicalPosition { x, y }));
-    }
+    let _ = w.center();
     let _ = w.show();
+    focus_window(w);
+}
+
+/// Focus a window. On Linux, KWin (KDE) doesn't properly activate window decorations when
+/// set_focus() is called synchronously right after show() — give the WM a tick to process
+/// the window map event first, then focus on the main thread.
+fn focus_window(w: &tauri::WebviewWindow) {
+    #[cfg(not(target_os = "linux"))]
     let _ = w.set_focus();
+
+    #[cfg(target_os = "linux")]
+    {
+        let w = w.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let _ = w.set_focus();
+        });
+    }
 }
 
 /// Shared state for the app.
@@ -128,10 +157,7 @@ fn handle_session_ended(
         let auth_clear = auth.clone();
         std::thread::spawn(move || {
             if let Some(client) = api_client(&auth_clear) {
-                println!("[LilyPad] handle_session_ended: clearing now_playing");
                 let _ = client.clear_now_playing();
-            } else {
-                println!("[LilyPad] handle_session_ended: no API client available to clear now_playing");
             }
         });
 
@@ -143,8 +169,6 @@ fn handle_session_ended(
             let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
             std::thread::spawn(move || {
                 let ok = if let Some(client) = api_client(&auth) {
-                    println!("[LilyPad] handle_session_ended: auto-submitting hours");
-                    // clear_now_playing removed from here as it runs above for all cases
                     if mapping2.r#type.eq_ignore_ascii_case("live") {
                         client.add_live_service_session(mapping2.froglog_id, Some(date), Some(hours), Some("Session auto submitted with LilyPad".to_string()), false, true).is_ok()
                     } else if mapping2.r#type.eq_ignore_ascii_case("session") {
@@ -153,7 +177,6 @@ fn handle_session_ended(
                         client.update_game_hours(mapping2.froglog_id, hours).is_ok()
                     }
                 } else {
-                     println!("[LilyPad] handle_session_ended: no API client available");
                     false
                 };
                 let _ = tx.send(ok);
@@ -165,22 +188,15 @@ fn handle_session_ended(
                 let disp_h = total_mins / 60;
                 let disp_m = total_mins % 60;
                 let time_str = if disp_h > 0 { format!("{}h {}m", disp_h, disp_m) } else { format!("{}m", disp_m) };
-                let _ = app.notification().builder()
-                    .title("Session Auto-Submitted")
-                    .body(format!("{} ({})", title, time_str))
-                    .show();
+                send_notification(&app, "Session Auto-Submitted", &format!("{} ({})", title, time_str));
                 return;
             }
         }
 
         if let Some(w) = app.get_webview_window("main") {
             let has_notes = mapping.r#type.eq_ignore_ascii_case("live") || mapping.r#type.eq_ignore_ascii_case("session");
-            let (sh, tb) = if has_notes {
-                (SESSION_HEIGHT_LIVE, SESSION_TASKBAR_LIVE)
-            } else {
-                (SESSION_HEIGHT_REGULAR, SESSION_TASKBAR_REGULAR)
-            };
-            show_session_window(&w, sh, tb);
+            let sh = if has_notes { SESSION_HEIGHT_LIVE } else { SESSION_HEIGHT_REGULAR };
+            show_session_window(&w, sh);
         }
         let _ = app.emit("session-ended", serde_json::json!({
              "processName": process_name,
@@ -196,7 +212,7 @@ fn handle_session_ended(
 }
 
 fn build_tray_menu(app: &tauri::AppHandle, logged_in: bool, game_title: Option<String>) -> Result<Menu<Wry>, Box<dyn std::error::Error + Send + Sync>> {
-    let quit_item = PredefinedMenuItem::quit(app, Some("Quit"))?;
+    let quit_item = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
     if let Some(ref title) = game_title {
         let status_item = MenuItemBuilder::with_id("tracking_status", format!("Now Tracking: {}", title))
             .enabled(false)
@@ -439,10 +455,7 @@ fn save_now_playing_share(state: tauri::State<AppState>, share: bool) -> Result<
     let auth = state.auth.read().unwrap().clone();
     std::thread::spawn(move || {
         if let Some(client) = api_client(&auth) {
-            println!("[LilyPad] save_now_playing_share: updating show_current_session on FrogLog to {}", share);
             let _ = client.set_show_current_session(share);
-        } else {
-            println!("[LilyPad] save_now_playing_share: no API client available to update show_current_session");
         }
     });
 
@@ -579,7 +592,7 @@ pub fn run() {
                         }
                     } else if id == "assign_exes" {
                         if let Some(w) = app.get_webview_window("main") {
-                            show_window_at_height(&w, WINDOW_WIDTH, DEFAULT_HEIGHT);
+                            show_window_at_height(&w, MAPPINGS_WIDTH, DEFAULT_HEIGHT);
                             let _ = w.emit("open-mappings", ());
                         }
                     } else if id == "about" {
@@ -639,16 +652,14 @@ pub fn run() {
                             }));
                             if let Some(w) = app.get_webview_window("main") {
                                 let has_notes = mapping.r#type.eq_ignore_ascii_case("live") || mapping.r#type.eq_ignore_ascii_case("session");
-                                let (sh, tb) = if has_notes {
-                                    (SESSION_HEIGHT_LIVE, SESSION_TASKBAR_LIVE)
-                                } else {
-                                    (SESSION_HEIGHT_REGULAR, SESSION_TASKBAR_REGULAR)
-                                };
-                                show_session_window(&w, sh, tb);
+                                let sh = if has_notes { SESSION_HEIGHT_LIVE } else { SESSION_HEIGHT_REGULAR };
+                                show_session_window(&w, sh);
                             }
                         }
                         // Reset tray to idle state
                         let _ = update_tray_state(app);
+                    } else if id == "quit" {
+                        app.exit(0);
                     }
                 })
                 .build(app)?;
@@ -760,10 +771,7 @@ pub fn run() {
                             let _ = std::fs::write(&session_path_start, json);
                         }
                         let game_name = mapping.title.as_deref().unwrap_or_else(|| process_name.as_str());
-                        let _ = handle.notification().builder()
-                            .title("Tracking Started")
-                            .body(game_name)
-                            .show();
+                        send_notification(&handle, "Tracking Started", game_name);
                         let started_at_iso = chrono::Utc::now().to_rfc3339();
                         let (auth, share_now_playing) = {
                             let state = handle.state::<AppState>();

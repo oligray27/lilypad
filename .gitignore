@@ -1,4 +1,5 @@
 node_modules/
+squashfs-root/
 
 # Tauri build artifacts
 src-tauri/target/

@@ -51,7 +51,93 @@ pub fn get_window_titles_for_pid(target_pid: u32) -> Vec<String> {
     data.titles
 }
 
-#[cfg(not(windows))]
+/// Linux X11 implementation: walks the window tree via _NET_WM_PID and returns window titles.
+/// Returns an empty vec if not running under X11 (pure Wayland, headless, etc.).
+#[cfg(target_os = "linux")]
+pub fn get_window_titles_for_pid(target_pid: u32) -> Vec<String> {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, GetPropertyReply};
+    use x11rb::rust_connection::RustConnection;
+
+    fn get_u32_prop(conn: &RustConnection, window: u32, atom: u32) -> Option<u32> {
+        let reply: GetPropertyReply = conn
+            .get_property(false, window, atom, AtomEnum::CARDINAL, 0, 1)
+            .ok()?
+            .reply()
+            .ok()?;
+        if reply.format == 32 && reply.value.len() == 4 {
+            Some(u32::from_ne_bytes(reply.value[..4].try_into().ok()?))
+        } else {
+            None
+        }
+    }
+
+    fn get_string_prop(conn: &RustConnection, window: u32, atom: u32, type_atom: u32) -> Option<String> {
+        let reply = conn
+            .get_property(false, window, atom, type_atom, 0, u32::MAX)
+            .ok()?
+            .reply()
+            .ok()?;
+        if reply.value.is_empty() { return None; }
+        String::from_utf8(reply.value).ok()
+    }
+
+    fn collect_titles(
+        conn: &RustConnection,
+        window: u32,
+        target_pid: u32,
+        net_wm_pid: u32,
+        net_wm_name: u32,
+        utf8_string: u32,
+        titles: &mut Vec<String>,
+    ) {
+        if let Some(pid) = get_u32_prop(conn, window, net_wm_pid) {
+            if pid == target_pid {
+                let title = get_string_prop(conn, window, net_wm_name, utf8_string)
+                    .or_else(|| get_string_prop(conn, window, u32::from(AtomEnum::WM_NAME), u32::from(AtomEnum::STRING)));
+                if let Some(t) = title {
+                    let t = t.trim().to_owned();
+                    if !t.is_empty() && !titles.contains(&t) {
+                        titles.push(t);
+                    }
+                }
+            }
+        }
+        if let Some(reply) = conn.query_tree(window).ok().and_then(|c| c.reply().ok()) {
+            for child in reply.children {
+                collect_titles(conn, child, target_pid, net_wm_pid, net_wm_name, utf8_string, titles);
+            }
+        }
+    }
+
+    // No DISPLAY set → pure Wayland or headless; return empty without attempting a connection.
+    if std::env::var_os("DISPLAY").is_none() {
+        return vec![];
+    }
+
+    let (conn, screen_num) = match x11rb::connect(None) {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
+
+    let screen = &conn.setup().roots[screen_num];
+    let root = screen.root;
+
+    let intern = |name: &str| -> Option<u32> {
+        conn.intern_atom(false, name.as_bytes()).ok()?.reply().ok().map(|r| r.atom)
+    };
+
+    let net_wm_pid  = match intern("_NET_WM_PID")  { Some(a) => a, None => return vec![] };
+    let net_wm_name = match intern("_NET_WM_NAME") { Some(a) => a, None => return vec![] };
+    let utf8_string = match intern("UTF8_STRING")  { Some(a) => a, None => return vec![] };
+
+    let mut titles = Vec::new();
+    collect_titles(&conn, root, target_pid, net_wm_pid, net_wm_name, utf8_string, &mut titles);
+    titles
+}
+
+/// macOS and any other non-Windows, non-Linux platform: window title detection not implemented.
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn get_window_titles_for_pid(_target_pid: u32) -> Vec<String> {
     vec![]
 }
@@ -102,9 +188,7 @@ const POST_SESSION_COOLDOWN: Duration = Duration::from_secs(15);
 /// Active session: we're currently tracking this process.
 #[derive(Debug, Clone)]
 pub struct ActiveSession {
-    #[allow(dead_code)]
     pub process_name: String,
-    #[allow(dead_code)]
     pub mapping: ProcessMapping,
     pub started_at: Instant,
 }
