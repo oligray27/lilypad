@@ -16,8 +16,7 @@
         "width": 642,
         "height": 515,
         "resizable": true,
-        "visible": false,
-      "decorations": false
+        "visible": false
       }
     ],
     "security": {
@@ -39,11 +38,6 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "linux": {
-      "deb": {
-        "depends": ["libwebkit2gtk-4.1-0", "libssl3", "libayatana-appindicator3-1"]
-      }
-    },
     "windows": {
       "certificateThumbprint": null,
       "digestAlgorithm": "sha256",
