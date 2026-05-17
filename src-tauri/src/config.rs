@@ -60,6 +60,41 @@ impl ProcessMapConfig {
     }
 }
 
+/// A session that failed to submit (auth expired, offline, etc.) and was saved for later retry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingSession {
+    pub id: String,
+    pub game_id: i32,
+    pub game_type: String,
+    pub title: String,
+    pub hours: f64,
+    pub notes: Option<String>,
+    pub spoiler: bool,
+    pub is_public: bool,
+    pub date: String,
+    pub failed_at: String,
+    pub error: String,
+}
+
+pub fn pending_sessions_path() -> PathBuf {
+    app_data_dir().join("pending-sessions.json")
+}
+
+pub fn load_pending_sessions() -> Vec<PendingSession> {
+    match std::fs::read_to_string(pending_sessions_path()) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        _ => vec![],
+    }
+}
+
+pub fn save_pending_sessions(sessions: &[PendingSession]) {
+    let path = pending_sessions_path();
+    if let Some(p) = path.parent() {
+        let _ = std::fs::create_dir_all(p);
+    }
+    let _ = std::fs::write(&path, serde_json::to_string_pretty(sessions).unwrap_or_default());
+}
+
 /// App data directory (e.g. %APPDATA%/froglog-lilypad on Windows).
 pub fn app_data_dir() -> PathBuf {
     dirs::data_local_dir()

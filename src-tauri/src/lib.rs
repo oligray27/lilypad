@@ -3,7 +3,7 @@ mod config;
 mod monitor;
 
 use api::FroglogClient;
-use config::{AuthConfig, ProcessMapConfig, ProcessMapping, auth_config_path, process_map_path_for_auth};
+use config::{AuthConfig, ProcessMapConfig, ProcessMapping, PendingSession, auth_config_path, process_map_path_for_auth, load_pending_sessions, save_pending_sessions};
 use monitor::{run_poll_loop, ActiveSession};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -23,12 +23,12 @@ const TRAY_ICON: tauri::image::Image<'_> = tauri::include_image!("icons/icon.ico
 /// Tray icon shown while a game session is active.
 const TRAY_ICON_NOWPLAYING: tauri::image::Image<'_> = tauri::include_image!("icons/icon_nowplaying.ico");
 
-const DEFAULT_HEIGHT: f64 = 740.0;
+const DEFAULT_HEIGHT: f64 = 760.0;
 const MAIN_ABOUT_HEIGHT: f64 = 335.0;
 const WINDOW_WIDTH: f64 = 642.0;
 const SESSION_WIDTH: f64 = 440.0;
-const SESSION_HEIGHT_REGULAR: f64 = 130.0;
-const SESSION_HEIGHT_LIVE: f64 = 240.0;
+const SESSION_HEIGHT_REGULAR: f64 = 155.0;
+const SESSION_HEIGHT_LIVE: f64 = 284.0;
 const SESSION_TASKBAR_REGULAR: f64 = 94.0;
 const SESSION_TASKBAR_LIVE: f64 = 94.0;
 
@@ -66,6 +66,10 @@ struct AppState {
     /// Set to a process name when the user force-stops tracking. Clears when the process actually exits.
     /// Prevents the monitor from immediately re-starting a session for the still-running process.
     force_stopped_process: Arc<RwLock<Option<String>>>,
+    /// Used to cancel a live/session auto-submit countdown (user clicked "Add Notes").
+    auto_submit_cancel_tx: Arc<RwLock<Option<tokio::sync::oneshot::Sender<()>>>>,
+    /// Holds session data for a live/session auto-submit that is still in the 25-second intercept window.
+    auto_submit_pending_data: Arc<RwLock<Option<serde_json::Value>>>,
 }
 
 fn api_client(auth: &AuthConfig) -> Option<FroglogClient> {
@@ -88,6 +92,91 @@ struct PersistedSession {
     froglog_id: i32,
     title: Option<String>,
     started_at_secs: u64,
+}
+
+/// Send a Windows toast notification with an "Add Notes" action button for live/session auto-submit.
+/// Clicking the notification (body or button) cancels the 25-second timer and shows the session popup.
+#[cfg(windows)]
+fn show_auto_submit_toast(
+    title_str: &str,
+    time_str: &str,
+    cancel_tx_arc: Arc<RwLock<Option<tokio::sync::oneshot::Sender<()>>>>,
+    pending_data_arc: Arc<RwLock<Option<serde_json::Value>>>,
+    app: tauri::AppHandle,
+) {
+    use windows::core::HSTRING;
+    use windows::Data::Xml::Dom::XmlDocument;
+    use windows::Foundation::TypedEventHandler;
+    use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
+
+    let title_owned = title_str.to_string();
+    let time_owned = time_str.to_string();
+    std::thread::spawn(move || {
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(
+                None,
+                windows::Win32::System::Com::COINIT_MULTITHREADED,
+            );
+        }
+        let xml = format!(
+            concat!(
+                r#"<toast><visual><binding template="ToastGeneric">"#,
+                r#"<text>Session Auto-Submitting</text>"#,
+                r#"<text>{} ({})</text>"#,
+                r#"</binding></visual>"#,
+                r#"<actions>"#,
+                r#"<action content="Add Notes" arguments="add-notes"/>"#,
+                r#"</actions></toast>"#,
+            ),
+            title_owned, time_owned
+        );
+        let doc = match XmlDocument::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        if doc.LoadXml(&HSTRING::from(xml.as_str())).is_err() { return; }
+        let toast = match ToastNotification::CreateToastNotification(&doc) {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        let _ = toast.Activated(&TypedEventHandler::<ToastNotification, windows::core::IInspectable>::new(
+            move |_, _| {
+                if let Some(tx) = cancel_tx_arc.write().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                if let Some(session_data) = pending_data_arc.write().unwrap().take() {
+                    let app2 = app.clone();
+                    let _ = app.run_on_main_thread(move || {
+                        if let Some(w) = app2.get_webview_window("main") {
+                            show_session_window(&w, SESSION_HEIGHT_LIVE, SESSION_TASKBAR_LIVE);
+                        }
+                        let _ = app2.emit("session-ended", session_data);
+                    });
+                }
+                Ok(())
+            },
+        ));
+        let aumid = HSTRING::from("uk.co.froglog.lilypad");
+        if let Ok(notifier) = ToastNotificationManager::CreateToastNotifierWithId(&aumid) {
+            let _ = notifier.Show(&toast);
+        }
+        // Keep toast alive so WinRT holds the Activated handler for the intercept window.
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    });
+}
+
+#[cfg(not(windows))]
+fn show_auto_submit_toast(
+    title_str: &str,
+    time_str: &str,
+    _cancel_tx_arc: Arc<RwLock<Option<tokio::sync::oneshot::Sender<()>>>>,
+    _pending_data_arc: Arc<RwLock<Option<serde_json::Value>>>,
+    app: tauri::AppHandle,
+) {
+    let _ = app.notification().builder()
+        .title("Session Auto-Submitting")
+        .body(format!("{} ({}) — open LilyPad tray to add notes", title_str, time_str))
+        .show();
 }
 
 /// Shared session-ended handler used by both the normal monitor path and crash recovery.
@@ -126,39 +215,141 @@ fn handle_session_ended(
         if auto_submit {
             let raw_hours = duration_secs / 3600.0;
             let hours = { let r = (raw_hours * 100.0).round() / 100.0; if r < 0.01 { 0.01 } else { r } };
+            let is_notes_type = mapping.r#type.eq_ignore_ascii_case("live") || mapping.r#type.eq_ignore_ascii_case("session");
+
+            // Live/session: give user 25 seconds to click "Add Notes" before auto-submitting.
+            if is_notes_type {
+                let title_str = mapping.title.as_deref().unwrap_or_else(|| mapping.process.as_str()).to_string();
+                let total_mins = (duration_secs / 60.0).round() as u64;
+                let time_str = if total_mins >= 60 { format!("{}h {}m", total_mins / 60, total_mins % 60) } else { format!("{}m", total_mins) };
+                let session_data = serde_json::json!({
+                    "processName": process_name,
+                    "mapping": {
+                        "process": mapping.process,
+                        "type": mapping.r#type,
+                        "froglogId": mapping.froglog_id,
+                        "title": mapping.title,
+                    },
+                    "durationSecs": duration_secs,
+                });
+                let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+                let (cancel_tx_arc, pending_data_arc) = {
+                    let state = app.state::<AppState>();
+                    *state.auto_submit_cancel_tx.write().unwrap() = Some(cancel_tx);
+                    *state.auto_submit_pending_data.write().unwrap() = Some(session_data);
+                    (Arc::clone(&state.auto_submit_cancel_tx), Arc::clone(&state.auto_submit_pending_data))
+                };
+                show_auto_submit_toast(&title_str, &time_str, cancel_tx_arc, pending_data_arc, app.clone());
+                tokio::select! {
+                    _ = cancel_rx => {
+                        // User clicked "Add Notes" — intercept_auto_submit shows the popup.
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(25)) => {
+                        // Timeout: clear pending data and auto-submit.
+                        {
+                            let state = app.state::<AppState>();
+                            *state.auto_submit_pending_data.write().unwrap() = None;
+                        }
+                        let auth2 = auth.clone();
+                        let game_type2 = mapping.r#type.clone();
+                        let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+                        let (tx2, rx2) = tokio::sync::oneshot::channel::<bool>();
+                        std::thread::spawn(move || {
+                            let ok = if let Some(client) = api_client(&auth2) {
+                                if game_type2.eq_ignore_ascii_case("live") {
+                                    client.add_live_service_session(mapping.froglog_id, Some(date), Some(hours), None, false, true).is_ok()
+                                } else {
+                                    client.add_game_session(mapping.froglog_id, Some(date), Some(hours), None, false, true).is_ok()
+                                }
+                            } else { false };
+                            let _ = tx2.send(ok);
+                        });
+                        let submitted = rx2.await.unwrap_or(false);
+                        if submitted {
+                            let _ = app.notification().builder()
+                                .title("Session Auto-Submitted")
+                                .body(format!("{} ({})", title_str, time_str))
+                                .show();
+                        } else {
+                            let mut sessions = load_pending_sessions();
+                            sessions.push(PendingSession {
+                                id: chrono::Local::now().timestamp_millis().to_string(),
+                                game_id: mapping.froglog_id,
+                                game_type: mapping.r#type.clone(),
+                                title: title_str.clone(),
+                                hours,
+                                notes: None,
+                                spoiler: false,
+                                is_public: true,
+                                date: chrono::Local::now().format("%Y-%m-%d").to_string(),
+                                failed_at: chrono::Local::now().to_rfc3339(),
+                                error: "Auto-submit failed (auth or network issue)".to_string(),
+                            });
+                            save_pending_sessions(&sessions);
+                            let app2 = app.clone();
+                            let _ = app.run_on_main_thread(move || { let _ = update_tray_state(&app2); });
+                            let _ = app.notification().builder()
+                                .title("Session Queued")
+                                .body(format!("{} ({}) — submit failed, open LilyPad to retry", title_str, time_str))
+                                .show();
+                        }
+                    }
+                }
+                return;
+            }
+
+            // Regular games: silent auto-submit (no notes support)
             let date = chrono::Local::now().format("%Y-%m-%d").to_string();
             let mapping2 = mapping.clone();
+            let date2 = date.clone();
+            let game_type2 = mapping2.r#type.clone();
             let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
             std::thread::spawn(move || {
                 let ok = if let Some(client) = api_client(&auth) {
                     println!("[LilyPad] handle_session_ended: auto-submitting hours");
-                    // clear_now_playing removed from here as it runs above for all cases
-                    if mapping2.r#type.eq_ignore_ascii_case("live") {
-                        client.add_live_service_session(mapping2.froglog_id, Some(date), Some(hours), Some("Session auto submitted with LilyPad".to_string()), false, true).is_ok()
-                    } else if mapping2.r#type.eq_ignore_ascii_case("session") {
-                        client.add_game_session(mapping2.froglog_id, Some(date), Some(hours), Some("Session auto submitted with LilyPad".to_string()), false, true).is_ok()
-                    } else {
-                        client.update_game_hours(mapping2.froglog_id, hours).is_ok()
-                    }
+                    client.update_game_hours(mapping2.froglog_id, hours).is_ok()
                 } else {
-                     println!("[LilyPad] handle_session_ended: no API client available");
+                    println!("[LilyPad] handle_session_ended: no API client available");
                     false
                 };
                 let _ = tx.send(ok);
             });
             let submitted = rx.await.unwrap_or(false);
+            let title_str = mapping.title.as_deref().unwrap_or_else(|| mapping.process.as_str()).to_string();
+            let total_mins = (duration_secs / 60.0).round() as u64;
+            let disp_h = total_mins / 60;
+            let disp_m = total_mins % 60;
+            let time_str = if disp_h > 0 { format!("{}h {}m", disp_h, disp_m) } else { format!("{}m", disp_m) };
             if submitted {
-                let title = mapping.title.as_deref().unwrap_or_else(|| mapping.process.as_str());
-                let total_mins = (duration_secs / 60.0).round() as u64;
-                let disp_h = total_mins / 60;
-                let disp_m = total_mins % 60;
-                let time_str = if disp_h > 0 { format!("{}h {}m", disp_h, disp_m) } else { format!("{}m", disp_m) };
                 let _ = app.notification().builder()
                     .title("Session Auto-Submitted")
-                    .body(format!("{} ({})", title, time_str))
+                    .body(format!("{} ({})", title_str, time_str))
                     .show();
                 return;
             }
+            // Auto-submit failed — save to pending queue and notify
+            let mut sessions = load_pending_sessions();
+            sessions.push(PendingSession {
+                id: chrono::Local::now().timestamp_millis().to_string(),
+                game_id: mapping2.froglog_id,
+                game_type: game_type2,
+                title: title_str.clone(),
+                hours,
+                notes: None,
+                spoiler: false,
+                is_public: true,
+                date: date2,
+                failed_at: chrono::Local::now().to_rfc3339(),
+                error: "Auto-submit failed (auth or network issue)".to_string(),
+            });
+            save_pending_sessions(&sessions);
+            let app2 = app.clone();
+            let _ = app.run_on_main_thread(move || { let _ = update_tray_state(&app2); });
+            let _ = app.notification().builder()
+                .title("Session Queued")
+                .body(format!("{} ({}) — submit failed, open LilyPad to retry", title_str, time_str))
+                .show();
+            return;
         }
 
         if let Some(w) = app.get_webview_window("main") {
@@ -197,8 +388,16 @@ fn build_tray_menu(app: &tauri::AppHandle, logged_in: bool, game_title: Option<S
         let assign_exes_item = MenuItemBuilder::with_id("assign_exes", "Configure...").build(app)?;
         let about_item = MenuItemBuilder::with_id("about", "About").build(app)?;
         let logout_item = MenuItemBuilder::with_id("logout", "Logout").build(app)?;
-        let menu = Menu::with_items(app, &[&assign_exes_item, &about_item, &logout_item, &quit_item])?;
-        Ok(menu)
+        let pending_count = config::load_pending_sessions().len();
+        if pending_count > 0 {
+            let pending_item = MenuItemBuilder::with_id("pending_sessions",
+                format!("Pending Submissions ({})", pending_count)).build(app)?;
+            let menu = Menu::with_items(app, &[&assign_exes_item, &pending_item, &about_item, &logout_item, &quit_item])?;
+            Ok(menu)
+        } else {
+            let menu = Menu::with_items(app, &[&assign_exes_item, &about_item, &logout_item, &quit_item])?;
+            Ok(menu)
+        }
     } else {
         let login_item = MenuItemBuilder::with_id("login", "Login").build(app)?;
         let about_item = MenuItemBuilder::with_id("about", "About").build(app)?;
@@ -294,6 +493,7 @@ fn get_live_service_games(state: tauri::State<AppState>) -> Result<Vec<api::Live
 
 #[tauri::command]
 fn submit_session(
+    app: tauri::AppHandle,
     state: tauri::State<AppState>,
     game_type: String, // "regular" | "live" | "session"
     game_id: i32,
@@ -301,19 +501,101 @@ fn submit_session(
     notes: Option<String>,
     spoiler: Option<bool>,
     is_public: Option<bool>,
+    title: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let auth = state.auth.read().unwrap();
-    let client = api_client(&auth).ok_or("Not logged in")?;
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
     let spoiler = spoiler.unwrap_or(false);
     let is_public = is_public.unwrap_or(true);
-    if game_type.eq_ignore_ascii_case("live") {
-        client.add_live_service_session(game_id, Some(date), Some(hours), notes, spoiler, is_public)
-    } else if game_type.eq_ignore_ascii_case("session") {
-        client.add_game_session(game_id, Some(date), Some(hours), notes, spoiler, is_public)
-    } else {
-        client.update_game_hours(game_id, hours)
+    let result = match api_client(&auth) {
+        None => Err("Not logged in".to_string()),
+        Some(client) => if game_type.eq_ignore_ascii_case("live") {
+            client.add_live_service_session(game_id, Some(date.clone()), Some(hours), notes.clone(), spoiler, is_public)
+        } else if game_type.eq_ignore_ascii_case("session") {
+            client.add_game_session(game_id, Some(date.clone()), Some(hours), notes.clone(), spoiler, is_public)
+        } else {
+            client.update_game_hours(game_id, hours)
+        },
+    };
+    match result {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            let mut sessions = load_pending_sessions();
+            sessions.push(PendingSession {
+                id: chrono::Local::now().timestamp_millis().to_string(),
+                game_id,
+                game_type,
+                title: title.unwrap_or_default(),
+                hours,
+                notes,
+                spoiler,
+                is_public,
+                date,
+                failed_at: chrono::Local::now().to_rfc3339(),
+                error: e,
+            });
+            save_pending_sessions(&sessions);
+            let app2 = app.clone();
+            let _ = app.run_on_main_thread(move || { let _ = update_tray_state(&app2); });
+            Ok(serde_json::json!({ "queued": true }))
+        }
     }
+}
+
+#[tauri::command]
+fn get_pending_sessions() -> Vec<PendingSession> {
+    load_pending_sessions()
+}
+
+#[tauri::command]
+fn retry_pending_session(
+    state: tauri::State<AppState>,
+    id: String,
+) -> Result<(), String> {
+    let mut sessions = load_pending_sessions();
+    let idx = sessions.iter().position(|s| s.id == id).ok_or("Not found")?;
+    let s = sessions[idx].clone();
+    let auth = state.auth.read().unwrap().clone();
+    let client = api_client(&auth).ok_or("Not logged in")?;
+    let notes = Some(s.notes.filter(|n| !n.is_empty()).unwrap_or_else(|| "Session submitted from Pending Sessions".to_string()));
+    if s.game_type.eq_ignore_ascii_case("live") {
+        client.add_live_service_session(s.game_id, Some(s.date), Some(s.hours), notes, s.spoiler, s.is_public)?;
+    } else if s.game_type.eq_ignore_ascii_case("session") {
+        client.add_game_session(s.game_id, Some(s.date), Some(s.hours), notes, s.spoiler, s.is_public)?;
+    } else {
+        client.update_game_hours(s.game_id, s.hours)?;
+    }
+    sessions.remove(idx);
+    save_pending_sessions(&sessions);
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_pending_session(id: String) -> Result<(), String> {
+    let mut sessions = load_pending_sessions();
+    sessions.retain(|s| s.id != id);
+    save_pending_sessions(&sessions);
+    Ok(())
+}
+
+/// Cancel the live/session auto-submit countdown and open the session popup so the user can add notes.
+#[tauri::command]
+fn intercept_auto_submit(
+    app: tauri::AppHandle,
+    state: tauri::State<AppState>,
+) -> Result<(), String> {
+    let cancel_tx = state.auto_submit_cancel_tx.write().unwrap().take();
+    if let Some(tx) = cancel_tx {
+        let _ = tx.send(());
+    }
+    let data = state.auto_submit_pending_data.write().unwrap().take();
+    if let Some(session_data) = data {
+        if let Some(w) = app.get_webview_window("main") {
+            show_session_window(&w, SESSION_HEIGHT_LIVE, SESSION_TASKBAR_LIVE);
+        }
+        let _ = app.emit("session-ended", session_data);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -513,6 +795,8 @@ pub fn run() {
             current_session_arc: Arc::new(RwLock::new(None)),
             auth: RwLock::new(auth),
             force_stopped_process: Arc::new(RwLock::new(None)),
+            auto_submit_cancel_tx: Arc::new(RwLock::new(None)),
+            auto_submit_pending_data: Arc::new(RwLock::new(None)),
         })
         .invoke_handler(tauri::generate_handler![
             login,
@@ -521,6 +805,10 @@ pub fn run() {
             get_games,
             get_live_service_games,
             submit_session,
+            get_pending_sessions,
+            retry_pending_session,
+            delete_pending_session,
+            intercept_auto_submit,
             get_auth_config,
             get_process_mappings,
             save_process_mapping,
@@ -583,6 +871,11 @@ pub fn run() {
                         let _ = update_tray_state(app);
                         if let Some(w) = app.get_webview_window("main") {
                             let _ = w.emit("show-login", ());
+                        }
+                    } else if id == "pending_sessions" {
+                        if let Some(w) = app.get_webview_window("main") {
+                            show_window_at_height(&w, WINDOW_WIDTH, 500.0);
+                            let _ = w.emit("show-pending", ());
                         }
                     } else if id == "force_stop_tracking" {
                         let state = app.state::<AppState>();

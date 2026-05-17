@@ -7,8 +7,9 @@ const $ = (id) => document.getElementById(id);
 const VIEW_SIZE = {
   loginView: { width: 560, height: 315 },
   mainView: { width: 550, height: 335 },
-  mappingsView: { width: 642, height: 740 },
+  mappingsView: { width: 642, height: 760 },
   sessionView: { width: 440, height: 165 },
+  pendingView: { width: 550, height: 480 },
 };
 
 function showView(id, heightOrOpts) {
@@ -57,8 +58,89 @@ async function onLogin(e) {
   }
 }
 
-// Main view (about screen)
-function loadMainView() {}
+// Main view (about screen) — shows pending submissions notice if any exist
+async function loadMainView() {
+  const sessions = await invoke('get_pending_sessions').catch(() => []);
+  const notice = $('pendingNotice');
+  if (!notice) return;
+  notice.hidden = false;
+  if (sessions.length) {
+    notice.style.color = 'darkorange';
+    notice.innerHTML = `&#9888; ${sessions.length} pending submission${sessions.length > 1 ? 's' : ''} — <a href="#" id="pendingNoticeLink">View</a>`;
+    const link = $('pendingNoticeLink');
+    if (link) {
+      link.addEventListener('click', (e) => {
+        e.preventDefault();
+        showView('pendingView');
+        loadPendingView();
+      });
+    }
+  } else {
+    notice.innerHTML = '&#10003; No pending submissions';
+    notice.style.color = '';
+  }
+}
+
+async function loadPendingView() {
+  const list = $('pendingList');
+  if (!list) return;
+  list.innerHTML = '<p class="muted" style="padding:1rem;">Loading…</p>';
+  const sessions = await invoke('get_pending_sessions').catch(() => []);
+  if (!sessions.length) {
+    list.innerHTML = '<p class="muted" style="padding:1rem;">No pending submissions.</p>';
+    return;
+  }
+  list.innerHTML = sessions.map((s) => `
+    <div class="pending-item" data-id="${escapeAttr(s.id)}">
+      <div class="pending-title">${escapeHtml(s.title || `${s.game_type} #${s.game_id}`)}</div>
+      <div class="pending-meta">
+        <span><strong>Session Length:</strong> ${s.hours}h</span>
+        <span><strong>Session Date:</strong> ${s.date}</span>
+        ${s.notes ? `<span><strong>Session Notes:</strong> ${escapeHtml(s.notes)}</span>` : ''}
+      </div>
+      <div class="pending-actions">
+        <button type="button" class="pending-retry">Retry</button>
+        <button type="button" class="pending-delete">Delete</button>
+        <span class="pending-status"></span>
+      </div>
+    </div>
+  `).join('');
+
+  list.querySelectorAll('.pending-retry').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const item = btn.closest('[data-id]');
+      const id = item.dataset.id;
+      const status = item.querySelector('.pending-status');
+      btn.disabled = true;
+      status.textContent = 'Submitting…';
+      status.style.color = '';
+      try {
+        await invoke('retry_pending_session', { id });
+        item.remove();
+        invoke('refresh_tray_menu').catch(() => {});
+        if (!$('pendingList').querySelector('.pending-item')) {
+          $('pendingList').innerHTML = '<p class="muted" style="padding:1rem;">No pending submissions.</p>';
+        }
+      } catch (err) {
+        btn.disabled = false;
+        status.textContent = String(err);
+        status.style.color = 'red';
+      }
+    });
+  });
+
+  list.querySelectorAll('.pending-delete').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const item = btn.closest('[data-id]');
+      await invoke('delete_pending_session', { id: item.dataset.id }).catch(() => {});
+      item.remove();
+      invoke('refresh_tray_menu').catch(() => {});
+      if (!$('pendingList').querySelector('.pending-item')) {
+        $('pendingList').innerHTML = '<p class="muted" style="padding:1rem;">No pending submissions.</p>';
+      }
+    });
+  });
+}
 
 function loadVersion() {
   window.__TAURI__.app.getVersion().then((v) => {
@@ -154,6 +236,33 @@ async function loadMappingsView() {
   errEl.textContent = '';
   tableBody.innerHTML = '';
   tableWrap.hidden = true;
+  // Load checkbox states independently — get_process_mappings needs no auth so this
+  // always reflects the correct state even when the game list fetch fails
+  invoke('get_process_mappings').then((mc) => {
+    const asRegEl = $('mappingsAutoSubmitRegular');
+    if (asRegEl) asRegEl.checked = !!mc.auto_submit_regular;
+    const asLiveEl = $('mappingsAutoSubmitLive');
+    if (asLiveEl) asLiveEl.checked = !!mc.auto_submit_live;
+    const asSessionEl = $('mappingsAutoSubmitSession');
+    if (asSessionEl) asSessionEl.checked = !!mc.auto_submit_session;
+    const shareNowEl = $('shareNowPlaying');
+    if (shareNowEl) shareNowEl.checked = !!mc.share_now_playing;
+  }).catch(() => {});
+  // Pending notice — runs independently so it always shows even if game data fetch fails
+  invoke('get_pending_sessions').catch(() => []).then((pendingSessions) => {
+    const mNotice = $('mappingsPendingNotice');
+    if (!mNotice) return;
+    mNotice.hidden = false;
+    if (pendingSessions && pendingSessions.length) {
+      mNotice.style.color = 'darkorange';
+      mNotice.innerHTML = `&#9888; ${pendingSessions.length} pending submission${pendingSessions.length > 1 ? 's' : ''} — <a href="#" id="mappingsPendingLink">View</a>`;
+      const link = $('mappingsPendingLink');
+      if (link) link.addEventListener('click', (e) => { e.preventDefault(); showView('pendingView'); loadPendingView(); });
+    } else {
+      mNotice.style.color = '';
+      mNotice.innerHTML = '&#10003; No pending submissions';
+    }
+  });
   try {
     const [games, liveService, mapConfig] = await Promise.all([
       invoke('get_games'),
@@ -465,7 +574,7 @@ function showPostPlay(data) {
   const notesWrap = $('sessionNotesWrap');
   if (notesWrap) notesWrap.hidden = !hasNotes;
   $('sessionError').textContent = '';
-  showView('sessionView', { height: hasNotes ? 240 : 130 });
+  showView('sessionView', { height: hasNotes ? 284 : 155 });
 }
 
 async function onSubmitSession(e) {
@@ -483,14 +592,22 @@ async function onSubmitSession(e) {
   const rawHours = (pendingSession.durationSecs || 0) / 3600;
   const hours = roundHoursForFroglog(rawHours);
   try {
-    await invoke('submit_session', {
+    const result = await invoke('submit_session', {
       gameType,
       gameId,
       hours,
       notes,
       spoiler,
       isPublic,
+      title: (pendingSession.mapping && pendingSession.mapping.title) || null,
     });
+    if (result && result.queued) {
+      errEl.style.color = 'orange';
+      errEl.textContent = 'Submission failed, session saved to Pending Submissions. Re-login or check your connection, then retry from the tray.';
+      invoke('refresh_tray_menu').catch(() => {});
+      return;
+    }
+    errEl.style.color = '';
     pendingSession = null;
     invoke('hide_window').catch(() => {});
   } catch (err) {
@@ -519,6 +636,13 @@ listen('show-main', () => {
   showView('mainView');
   loadMainView();
 });
+
+// Tray "Pending Submissions" opens pending view
+listen('show-pending', () => {
+  showView('pendingView');
+  loadPendingView();
+});
+
 
 // Tray "Logout" (or after logout) show login view
 listen('show-login', () => {
@@ -559,6 +683,7 @@ app.innerHTML = `
       <h2>LilyPad <small class="about-subtitle">for FrogLog</small></h2>
       <span class="app-version"></span>
     </div>
+    <p id="pendingNotice" class="pending-notice" hidden></p>
     <p>A lightweight system tray companion for <a href="#" class="ext-link" data-url="https://froglog.co.uk/">FrogLog</a>, the personal game tracking app. LilyPad watches for game processes in the background and prompts you to log a session when you stop playing.</p>
     <hr />
     <p class="muted about-steps-heading"><strong>Getting started</strong></p>
@@ -571,6 +696,7 @@ app.innerHTML = `
   <div data-view id="mappingsView" hidden>
     <div class="mappings-scrollable">
       <div class="page-header"><h2>Configuration</h2><span class="app-version"></span></div>
+      <p id="mappingsPendingNotice" class="pending-notice" hidden></p>
       <p class="muted">Type the executable name (e.g. <code>game.exe</code>) in the exe column. Once a session ends, LilyPad will prompt you to log the session.</p>
       <label class="mappings-auto-submit-label"><input type="checkbox" id="mappingsAutoSubmitRegular" /> Auto-submit regular game sessions</label>
       <label class="mappings-auto-submit-label"><input type="checkbox" id="mappingsAutoSubmitSession" /> Auto-submit session-tracked game sessions</label>
@@ -612,11 +738,19 @@ app.innerHTML = `
         </div>
       </div>
       <p id="sessionError" class="error"></p>
-      <div class="session-form-actions" style="display:flex;justify-content:space-between;align-items:center;width:100%;margin-top:0.5rem;">
+      <div class="session-form-actions">
         <button type="submit">Submit to FrogLog</button>
-        <button type="button" id="skipSession" style="margin-right:0;">Do not record session</button>
+        <button type="button" id="skipSession">Do not record session</button>
       </div>
     </form>
+  </div>
+  <div data-view id="pendingView" hidden>
+    <div class="page-header"><h2>Pending Submissions</h2><span class="app-version"></span></div>
+    <p class="muted">These sessions failed to submit. Logout and back in from the system tray to refresh your token, or check your connection, then use the retry button to resubmit them.</p>
+    <div id="pendingList" class="pending-list"></div>
+    <div class="mappings-footer">
+      <button type="button" id="pendingBack">Back</button>
+    </div>
   </div>
 `;
 
@@ -651,4 +785,5 @@ $('mappingsAutoSubmitRegular').addEventListener('change', saveAutoSubmit);
 $('mappingsAutoSubmitLive').addEventListener('change', saveAutoSubmit);
 $('mappingsAutoSubmitSession').addEventListener('change', saveAutoSubmit);
 $('shareNowPlaying').addEventListener('change', saveShareNowPlaying);
+$('pendingBack').addEventListener('click', () => { showView('mainView'); loadMainView(); });
 init();
