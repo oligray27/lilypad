@@ -32,4 +32,8 @@ chrono = "0.4"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Com",
+    "UI_Notifications",
+    "Data_Xml_Dom",
+    "Foundation",
 ] }
