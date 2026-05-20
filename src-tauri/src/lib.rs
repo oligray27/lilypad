@@ -275,9 +275,9 @@ fn handle_session_ended(
                         std::thread::spawn(move || {
                             let ok = if let Some(client) = api_client(&auth2) {
                                 if game_type2.eq_ignore_ascii_case("live") {
-                                    client.add_live_service_session(mapping.froglog_id, Some(date), Some(hours), Some("auto submitted".to_string()), false, true).is_ok()
+                                    client.add_live_service_session(mapping.froglog_id, Some(date), Some(hours), Some("Session auto submitted with LilyPad".to_string()), false, true).is_ok()
                                 } else {
-                                    client.add_game_session(mapping.froglog_id, Some(date), Some(hours), Some("auto submitted".to_string()), false, true).is_ok()
+                                    client.add_game_session(mapping.froglog_id, Some(date), Some(hours), Some("Session auto submitted with LilyPad".to_string()), false, true).is_ok()
                                 }
                             } else { false };
                             let _ = tx2.send(ok);
