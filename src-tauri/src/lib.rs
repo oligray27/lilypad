@@ -95,22 +95,25 @@ struct PersistedSession {
 }
 
 /// Send a Windows toast notification with an "Add Notes" action button for live/session auto-submit.
-/// Clicking the notification (body or button) cancels the 25-second timer and shows the session popup.
+/// Clicking the action button cancels the auto-submit and opens the session popup.
+/// When the toast is dismissed/expires, submit_tx fires to trigger auto-submit.
 #[cfg(windows)]
 fn show_auto_submit_toast(
     title_str: &str,
     time_str: &str,
     cancel_tx_arc: Arc<RwLock<Option<tokio::sync::oneshot::Sender<()>>>>,
     pending_data_arc: Arc<RwLock<Option<serde_json::Value>>>,
+    submit_tx: tokio::sync::oneshot::Sender<()>,
     app: tauri::AppHandle,
 ) {
     use windows::core::HSTRING;
     use windows::Data::Xml::Dom::XmlDocument;
     use windows::Foundation::TypedEventHandler;
-    use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
+    use windows::UI::Notifications::{ToastDismissedEventArgs, ToastNotification, ToastNotificationManager};
 
     let title_owned = title_str.to_string();
     let time_owned = time_str.to_string();
+    let submit_tx_arc = Arc::new(std::sync::Mutex::new(Some(submit_tx)));
     std::thread::spawn(move || {
         unsafe {
             let _ = windows::Win32::System::Com::CoInitializeEx(
@@ -139,8 +142,19 @@ fn show_auto_submit_toast(
             Ok(t) => t,
             Err(_) => return,
         };
+        let submit_tx_arc2 = Arc::clone(&submit_tx_arc);
+        let _ = toast.Dismissed(&TypedEventHandler::<ToastNotification, ToastDismissedEventArgs>::new(
+            move |_, _| {
+                if let Some(tx) = submit_tx_arc2.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                Ok(())
+            },
+        ));
         let _ = toast.Activated(&TypedEventHandler::<ToastNotification, windows::core::IInspectable>::new(
             move |_, _| {
+                // Drop submit_tx so the submit_rx branch never fires.
+                submit_tx_arc.lock().unwrap().take();
                 if let Some(tx) = cancel_tx_arc.write().unwrap().take() {
                     let _ = tx.send(());
                 }
@@ -160,7 +174,7 @@ fn show_auto_submit_toast(
         if let Ok(notifier) = ToastNotificationManager::CreateToastNotifierWithId(&aumid) {
             let _ = notifier.Show(&toast);
         }
-        // Keep toast alive so WinRT holds the Activated handler for the intercept window.
+        // Keep toast alive so WinRT holds event handlers until dismissed.
         std::thread::sleep(std::time::Duration::from_secs(30));
     });
 }
@@ -171,12 +185,15 @@ fn show_auto_submit_toast(
     time_str: &str,
     _cancel_tx_arc: Arc<RwLock<Option<tokio::sync::oneshot::Sender<()>>>>,
     _pending_data_arc: Arc<RwLock<Option<serde_json::Value>>>,
+    submit_tx: tokio::sync::oneshot::Sender<()>,
     app: tauri::AppHandle,
 ) {
     let _ = app.notification().builder()
         .title("Session Auto-Submitting")
         .body(format!("{} ({}) — open LilyPad tray to add notes", title_str, time_str))
         .show();
+    // No action button available on non-Windows — submit immediately.
+    let _ = submit_tx.send(());
 }
 
 /// Shared session-ended handler used by both the normal monitor path and crash recovery.
@@ -217,7 +234,7 @@ fn handle_session_ended(
             let hours = { let r = (raw_hours * 100.0).round() / 100.0; if r < 0.01 { 0.01 } else { r } };
             let is_notes_type = mapping.r#type.eq_ignore_ascii_case("live") || mapping.r#type.eq_ignore_ascii_case("session");
 
-            // Live/session: give user 25 seconds to click "Add Notes" before auto-submitting.
+            // Live/session: show toast with "Add Notes" button; auto-submit when toast is dismissed.
             if is_notes_type {
                 let title_str = mapping.title.as_deref().unwrap_or_else(|| mapping.process.as_str()).to_string();
                 let total_mins = (duration_secs / 60.0).round() as u64;
@@ -233,19 +250,20 @@ fn handle_session_ended(
                     "durationSecs": duration_secs,
                 });
                 let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+                let (submit_tx, submit_rx) = tokio::sync::oneshot::channel::<()>();
                 let (cancel_tx_arc, pending_data_arc) = {
                     let state = app.state::<AppState>();
                     *state.auto_submit_cancel_tx.write().unwrap() = Some(cancel_tx);
                     *state.auto_submit_pending_data.write().unwrap() = Some(session_data);
                     (Arc::clone(&state.auto_submit_cancel_tx), Arc::clone(&state.auto_submit_pending_data))
                 };
-                show_auto_submit_toast(&title_str, &time_str, cancel_tx_arc, pending_data_arc, app.clone());
+                show_auto_submit_toast(&title_str, &time_str, cancel_tx_arc, pending_data_arc, submit_tx, app.clone());
                 tokio::select! {
                     _ = cancel_rx => {
                         // User clicked "Add Notes" — intercept_auto_submit shows the popup.
                     }
-                    _ = tokio::time::sleep(Duration::from_secs(25)) => {
-                        // Timeout: clear pending data and auto-submit.
+                    _ = submit_rx => {
+                        // Toast dismissed — auto-submit now.
                         {
                             let state = app.state::<AppState>();
                             *state.auto_submit_pending_data.write().unwrap() = None;
@@ -257,20 +275,15 @@ fn handle_session_ended(
                         std::thread::spawn(move || {
                             let ok = if let Some(client) = api_client(&auth2) {
                                 if game_type2.eq_ignore_ascii_case("live") {
-                                    client.add_live_service_session(mapping.froglog_id, Some(date), Some(hours), None, false, true).is_ok()
+                                    client.add_live_service_session(mapping.froglog_id, Some(date), Some(hours), Some("auto submitted".to_string()), false, true).is_ok()
                                 } else {
-                                    client.add_game_session(mapping.froglog_id, Some(date), Some(hours), None, false, true).is_ok()
+                                    client.add_game_session(mapping.froglog_id, Some(date), Some(hours), Some("auto submitted".to_string()), false, true).is_ok()
                                 }
                             } else { false };
                             let _ = tx2.send(ok);
                         });
                         let submitted = rx2.await.unwrap_or(false);
-                        if submitted {
-                            let _ = app.notification().builder()
-                                .title("Session Auto-Submitted")
-                                .body(format!("{} ({})", title_str, time_str))
-                                .show();
-                        } else {
+                        if !submitted {
                             let mut sessions = load_pending_sessions();
                             sessions.push(PendingSession {
                                 id: chrono::Local::now().timestamp_millis().to_string(),
