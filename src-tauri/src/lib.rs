@@ -222,10 +222,10 @@ fn handle_session_ended(
         let auth_clear = auth.clone();
         std::thread::spawn(move || {
             if let Some(client) = api_client(&auth_clear) {
-                println!("[LilyPad] handle_session_ended: clearing now_playing");
+                log::info!("[LilyPad] handle_session_ended: clearing now_playing");
                 let _ = client.clear_now_playing();
             } else {
-                println!("[LilyPad] handle_session_ended: no API client available to clear now_playing");
+                log::warn!("[LilyPad] handle_session_ended: no API client available to clear now_playing");
             }
         });
 
@@ -319,10 +319,10 @@ fn handle_session_ended(
             let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
             std::thread::spawn(move || {
                 let ok = if let Some(client) = api_client(&auth) {
-                    println!("[LilyPad] handle_session_ended: auto-submitting hours");
+                    log::info!("[LilyPad] handle_session_ended: auto-submitting hours");
                     client.update_game_hours(mapping2.froglog_id, hours).is_ok()
                 } else {
-                    println!("[LilyPad] handle_session_ended: no API client available");
+                    log::warn!("[LilyPad] handle_session_ended: no API client available");
                     false
                 };
                 let _ = tx.send(ok);
@@ -722,10 +722,10 @@ fn save_now_playing_share(state: tauri::State<AppState>, share: bool) -> Result<
     let auth = state.auth.read().unwrap().clone();
     std::thread::spawn(move || {
         if let Some(client) = api_client(&auth) {
-            println!("[LilyPad] save_now_playing_share: updating show_current_session on FrogLog to {}", share);
+            log::info!("[LilyPad] save_now_playing_share: updating show_current_session on FrogLog to {}", share);
             let _ = client.set_show_current_session(share);
         } else {
-            println!("[LilyPad] save_now_playing_share: no API client available to update show_current_session");
+            log::warn!("[LilyPad] save_now_playing_share: no API client available to update show_current_session");
         }
     });
 
@@ -798,7 +798,17 @@ fn pick_exe_file(app: tauri::AppHandle) -> Result<Option<String>, String> {
 pub fn run() {
     let auth = AuthConfig::load_from(&auth_config_path());
     let process_map = ProcessMapConfig::load_from(&process_map_path_for_auth(&auth));
+    let log_dir = dirs::data_local_dir()
+        .map(|d| d.join("froglog-lilypad"))
+        .unwrap_or_else(|| std::path::PathBuf::from("froglog-lilypad"));
     tauri::Builder::default()
+        .plugin(tauri_plugin_log::Builder::new()
+            .level(log::LevelFilter::Info)
+            .target(tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Folder {
+                path: log_dir,
+                file_name: Some("lilypad".to_string()),
+            }))
+            .build())
         .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, None))
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
