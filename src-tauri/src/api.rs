@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 pub struct LoginRequest {
     pub username: String,
     pub password: String,
+    #[serde(rename = "rememberMe")]
+    pub remember_me: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -112,10 +114,11 @@ impl FroglogClient {
         h
     }
 
-    pub fn login(&self, username: &str, password: &str) -> Result<LoginResponse, String> {
+    pub fn login(&self, username: &str, password: &str, remember_me: bool) -> Result<LoginResponse, String> {
         let body = LoginRequest {
             username: username.to_string(),
             password: password.to_string(),
+            remember_me,
         };
         let res = self
             .client

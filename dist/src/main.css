@@ -52,7 +52,7 @@ a:hover { text-decoration: underline; }
 /* Pending notice — same style everywhere */
 .pending-notice { font-size: 0.9rem; margin: 0 0 0.5rem; }
 /* Login */
-#loginView input { width: 98%; box-sizing: border-box; }
+#loginView input:not([type="checkbox"]) { width: 98%; box-sizing: border-box; }
 /* About / main view */
 #mainView hr { margin: 0.5rem 0; }
 .about-steps-heading { margin-bottom: 0.25rem; }

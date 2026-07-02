@@ -447,9 +447,10 @@ fn login(
     base_url: String,
     username: String,
     password: String,
+    remember_me: bool,
 ) -> Result<serde_json::Value, String> {
     let mut client = FroglogClient::new(base_url.trim_end_matches('/').to_string());
-    let res = client.login(&username, &password)?;
+    let res = client.login(&username, &password, remember_me)?;
     let token = res.token.clone();
     client.set_token(Some(token.clone()));
     // Persist and switch to this account's process map (username = stable key so same user reuses same map after re-login)

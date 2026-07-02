@@ -4,8 +4,12 @@ const { listen } = window.__TAURI__.event;
 
 const $ = (id) => document.getElementById(id);
 
+// No devtools feature is compiled in (see src-tauri/Cargo.toml), so this just
+// suppresses WebView2's default context menu (Back/Forward/Reload/etc).
+document.addEventListener('contextmenu', (e) => e.preventDefault());
+
 const VIEW_SIZE = {
-  loginView: { width: 560, height: 315 },
+  loginView: { width: 560, height: 318 },
   mainView: { width: 550, height: 335 },
   mappingsView: { width: 642, height: 760 },
   sessionView: { width: 440, height: 165 },
@@ -43,10 +47,11 @@ async function onLogin(e) {
   const baseUrl = 'https://api.froglog.co.uk/api';
   const username = $('username').value.trim();
   const password = $('password').value;
+  const rememberMe = $('rememberMe').checked;
   const errEl = $('loginError');
   errEl.textContent = '';
   try {
-    await invoke('login', { baseUrl, username, password });
+    await invoke('login', { baseUrl, username, password, rememberMe });
     showView('mainView');
     loadMainView();
     // Refresh tray menu after a delay so it runs when main thread is idle (avoids lockup).
@@ -674,6 +679,7 @@ app.innerHTML = `
       <input type="text" id="username" required autocomplete="username" />
       <label>Password</label>
       <input type="password" id="password" required autocomplete="current-password" />
+      <label class="mappings-auto-submit-label"><input type="checkbox" id="rememberMe" checked /> Remember me</label>
       <p id="loginError" class="error"></p>
       <button type="submit">Log in</button>
     </form>
