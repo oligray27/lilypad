@@ -62,7 +62,7 @@ pub fn build(on_show_pending: impl Fn() + 'static, on_show_mappings: impl Fn() +
     let steps = gtk4::Label::new(Some(
         "1. Right-click the tray icon and choose Configure... to link each game's process to \
          its FrogLog entry.\n\
-         2. Launch your game as normal — LilyPad detects it automatically.\n\
+         2. Launch your game as normal, LilyPad detects it automatically.\n\
          3. When you close the game, this window appears so you can submit the session.",
     ));
     steps.set_wrap(true);
