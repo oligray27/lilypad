@@ -73,6 +73,35 @@ fn build_window(app: &adw::Application, state: AppState) {
 
     let header_bar = adw::HeaderBar::new();
 
+    // Version + link to the latest release. The Tauri build showed this on every
+    // individual view (each had its own `.app-version` span); here the header bar
+    // is shared across all stack pages, so adding it once covers every screen.
+    // GTK/Adwaita buttons carry their own internal padding regardless of the
+    // containing Box's spacing, so tightening this up needs an actual CSS
+    // override on the button itself, not just spacing/margin properties.
+    let css = gtk4::CssProvider::new();
+    css.load_from_string(".lilypad-version-link { padding: 0; margin: 0; min-height: 0; min-width: 0; }");
+    gtk4::style_context_add_provider_for_display(
+        &gtk4::prelude::WidgetExt::display(&header_bar),
+        &css,
+        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+
+    let version_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 2);
+    let version_label = gtk4::Label::new(Some(&format!("v{}", env!("CARGO_PKG_VERSION"))));
+    version_label.add_css_class("dim-label");
+    version_box.append(&version_label);
+    let releases_link = gtk4::LinkButton::builder()
+        .label("(?)")
+        .uri("https://github.com/oligray27/lilypad/releases/latest")
+        .tooltip_text("View releases")
+        .build();
+    releases_link.add_css_class("flat");
+    releases_link.add_css_class("dim-label");
+    releases_link.add_css_class("lilypad-version-link");
+    version_box.append(&releases_link);
+    header_bar.pack_end(&version_box);
+
     let stack = gtk4::Stack::new();
     stack.set_transition_type(gtk4::StackTransitionType::Crossfade);
     // Without this, Stack sizes itself to its largest child (the mappings page)

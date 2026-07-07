@@ -443,17 +443,32 @@ pub fn run_poll_loop(
                         system.refresh_processes(ProcessesToUpdate::All);
                         let mut found = None;
                         'proc_scan: for (pid, p) in system.processes().iter() {
-                            let name = p
-                                .exe()
-                                .and_then(|path| {
-                                    path.file_name().and_then(|n| n.to_str().map(String::from))
-                                })
-                                .unwrap_or_else(|| p.name().to_string_lossy().into_owned());
-                            let candidates: Vec<ProcessMapping> = cfg
-                                .find_all_by_process(&name)
-                                .into_iter()
-                                .cloned()
-                                .collect();
+                            // Try the resolved binary name first (right for native processes),
+                            // then fall back to the reported process name/"comm" (right for
+                            // Wine/Proton-hosted Windows games: Wine itself stays the real
+                            // /proc/pid/exe target — e.g. wine64/wine-preloader — but renames
+                            // the process's comm to the target .exe, e.g. "Balatro.exe", via
+                            // prctl specifically so tools can identify it that way).
+                            let exe_name = p.exe().and_then(|path| {
+                                path.file_name().and_then(|n| n.to_str().map(String::from))
+                            });
+                            let comm_name = p.name().to_string_lossy().into_owned();
+
+                            let (name, candidates): (String, Vec<ProcessMapping>) = {
+                                let mut result = None;
+                                for candidate in exe_name.iter().chain(std::iter::once(&comm_name)) {
+                                    let matches: Vec<ProcessMapping> =
+                                        cfg.find_all_by_process(candidate).into_iter().cloned().collect();
+                                    if !matches.is_empty() {
+                                        result = Some((candidate.clone(), matches));
+                                        break;
+                                    }
+                                }
+                                match result {
+                                    Some(v) => v,
+                                    None => (exe_name.unwrap_or(comm_name), Vec::new()),
+                                }
+                            };
                             if candidates.is_empty() {
                                 continue 'proc_scan;
                             }
