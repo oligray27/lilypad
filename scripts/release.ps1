@@ -1,6 +1,18 @@
 # Usage: .\scripts\release.ps1 [-NoBump]
 #   -NoBump  Skip version increment and use the current version as-is.
-# Builds for production, commits (unless -NoBump), tags, pushes, and creates a GitHub release.
+#            Use this to add the Windows build to a release already tagged from
+#            another platform (e.g. Linux, via scripts/release.sh) — see below.
+#
+# Builds the Tauri Windows app, commits (unless -NoBump), tags, pushes, and
+# creates (or adds to) the GitHub release for that tag.
+#
+# Multi-platform releases: no single machine builds every platform, so a
+# release is assembled incrementally. Run scripts/release.sh once (bumping the
+# version) on whichever machine you're on first — that tag/release gets that
+# platform's artifacts. Then run this script with -NoBump on Windows: it
+# detects the release already exists and uploads the NSIS installer to it
+# instead of trying to create a duplicate.
+#
 # Requires: node, cargo/tauri, git, gh (GitHub CLI)
 
 param(
@@ -38,10 +50,12 @@ if ($NoBump) {
     $Pkg | ConvertTo-Json -Depth 10 | Set-Content 'package.json' -NoNewline
     Add-Content 'package.json' ''
 
-    # --- Update Cargo.toml (first version = "..." in [package]) ---
-    $Cargo = Get-Content 'src-tauri/Cargo.toml' -Raw
-    $Cargo = $Cargo -replace '^version = "[^"]+"', "version = `"$New`""
-    Set-Content 'src-tauri/Cargo.toml' $Cargo -NoNewline
+    # --- Update Cargo.toml version fields (first `version = "..."` in [package]) ---
+    foreach ($CargoToml in @('src-tauri/Cargo.toml', 'crates/lilypad-core/Cargo.toml', 'crates/lilypad-gtk/Cargo.toml')) {
+        $Cargo = Get-Content $CargoToml -Raw
+        $Cargo = $Cargo -replace '^version = "[^"]+"', "version = `"$New`""
+        Set-Content $CargoToml $Cargo -NoNewline
+    }
 }
 
 # --- Build ---
@@ -50,16 +64,17 @@ npm run build
 
 if (-not $NoBump) {
     # --- Commit version bump ---
-    git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock
+    git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml `
+        crates/lilypad-core/Cargo.toml crates/lilypad-gtk/Cargo.toml Cargo.lock
     git commit -m "chore: release v$New"
+
+    # --- Tag ---
+    git tag "v$New"
+
+    # --- Push ---
+    git push origin main
+    git push origin "v$New"
 }
-
-# --- Tag ---
-git tag "v$New"
-
-# --- Push ---
-git push origin main
-git push origin "v$New"
 
 # --- Collect installer artifacts (latest only) ---
 $Assets = @()
@@ -69,13 +84,29 @@ if (Test-Path $NsisDir) {
     if ($f) { $Assets += $f.FullName }
 }
 
-# --- Create GitHub release ---
-if ($Assets.Count -eq 0) {
-    Write-Host 'Warning: no installer artifacts found, creating release without assets'
-    gh release create "v$New" --title "LilyPad v$New" --generate-notes
+# --- Create GitHub release, or add to it if it already exists (multi-platform workflow) ---
+$ReleaseExists = $true
+try {
+    gh release view "v$New" | Out-Null
+} catch {
+    $ReleaseExists = $false
+}
+
+if ($ReleaseExists) {
+    if ($Assets.Count -eq 0) {
+        Write-Host "Release v$New already exists; nothing to upload from this platform."
+    } else {
+        Write-Host "Release v$New already exists — uploading: $($Assets -join ', ')"
+        gh release upload "v$New" @Assets --clobber
+    }
 } else {
-    Write-Host "Creating release with: $($Assets -join ', ')"
-    gh release create "v$New" @Assets --title "LilyPad v$New" --generate-notes
+    if ($Assets.Count -eq 0) {
+        Write-Host 'Warning: no installer artifacts found, creating release without assets'
+        gh release create "v$New" --title "LilyPad v$New" --generate-notes
+    } else {
+        Write-Host "Creating release v$New with: $($Assets -join ', ')"
+        gh release create "v$New" @Assets --title "LilyPad v$New" --generate-notes
+    }
 }
 
 Write-Host "Done -- v$New released."

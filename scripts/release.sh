@@ -1,8 +1,31 @@
 #!/usr/bin/env bash
 # Usage: bash scripts/release.sh [--no-bump]
 #   --no-bump  Skip version increment and use the current version as-is.
-# Builds for production, commits (unless --no-bump), tags, pushes, and creates a GitHub release.
-# Requires: node, cargo/tauri, git, gh (GitHub CLI)
+#              Use this when adding another platform's build to an already-tagged
+#              release (e.g. this release was tagged from Linux, and you're now
+#              running this script's Windows-flavored steps elsewhere) — see below.
+#
+# Bumps the version everywhere, commits, tags, pushes, builds this platform's
+# installers, and creates (or adds to) the GitHub release for that tag.
+#
+# Platform-specific build step:
+#   - Linux:  builds crates/lilypad-gtk (native GTK4/libadwaita app) and packages
+#             .deb/.rpm/.AppImage via scripts/release-linux-gtk.sh. The old
+#             Tauri/webview Linux build is NOT built here anymore — the native
+#             GTK app replaced it as of the 2026-07-07 rewrite.
+#   - other:  runs `npm run build` (Tauri) and collects the NSIS .exe, same as
+#             before. This is what a Windows machine should still use.
+#
+# Multi-platform releases: this repo has no single machine that can build every
+# platform, so a release is assembled incrementally. Run this once (bumping the
+# version) on whichever machine you're on first; the resulting tag/release gets
+# that platform's artifacts. Then run it again with --no-bump on each other
+# platform (e.g. release.ps1 -NoBump on Windows) — it detects the release
+# already exists and uploads its artifacts to it instead of trying to create a
+# duplicate.
+#
+# Requires: node, cargo, git, gh (GitHub CLI); on Linux also cargo-deb and
+# cargo-generate-rpm (cargo install cargo-deb cargo-generate-rpm).
 
 set -e
 
@@ -45,45 +68,71 @@ else
     fs.writeFileSync(f, JSON.stringify(c, null, 2) + '\n');
   "
 
-  # --- Update Cargo.toml (first version = "..." in [package]) ---
-  node -e "
-    const fs = require('fs');
-    const f = 'src-tauri/Cargo.toml';
-    let content = fs.readFileSync(f, 'utf8');
-    content = content.replace(/^version = \"[^\"]+\"/m, 'version = \"$NEW\"');
-    fs.writeFileSync(f, content);
-  "
+  # --- Update Cargo.toml version fields (first `version = "..."` in [package]) ---
+  for CARGO_TOML in src-tauri/Cargo.toml crates/lilypad-core/Cargo.toml crates/lilypad-gtk/Cargo.toml; do
+    node -e "
+      const fs = require('fs');
+      const f = '$CARGO_TOML';
+      let content = fs.readFileSync(f, 'utf8');
+      content = content.replace(/^version = \"[^\"]+\"/m, 'version = \"$NEW\"');
+      fs.writeFileSync(f, content);
+    "
+  done
 fi
 
-# --- Build ---
-echo "Building..."
-npm run build
+# --- Build (platform-specific) ---
+ASSETS=()
+if [ "$(uname -s)" = "Linux" ]; then
+  echo "Building Linux native GTK app (.deb/.rpm/.AppImage)..."
+  bash scripts/release-linux-gtk.sh
+  BUNDLE_DIR="target/release/bundle"
+  DEB=$(ls -t "$BUNDLE_DIR"/deb/*.deb 2>/dev/null | head -1)
+  RPM=$(ls -t "$BUNDLE_DIR"/rpm/*.rpm 2>/dev/null | head -1)
+  APPIMAGE=$(ls -t "$BUNDLE_DIR"/appimage/*.AppImage 2>/dev/null | head -1)
+  [ -n "$DEB" ] && ASSETS+=("$DEB")
+  [ -n "$RPM" ] && ASSETS+=("$RPM")
+  [ -n "$APPIMAGE" ] && ASSETS+=("$APPIMAGE")
+else
+  echo "Building Tauri Windows app..."
+  npm run build
+  NSIS_EXE=$(ls -t src-tauri/target/release/bundle/nsis/*.exe 2>/dev/null | head -1)
+  [ -n "$NSIS_EXE" ] && ASSETS+=("$NSIS_EXE")
+fi
 
 if [ "$NO_BUMP" -eq 0 ]; then
   # --- Commit version bump ---
-  git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock
+  git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml \
+    crates/lilypad-core/Cargo.toml crates/lilypad-gtk/Cargo.toml Cargo.lock
   git commit -m "chore: release v$NEW"
+
+  # --- Tag ---
+  git tag "v$NEW"
+
+  # --- Push ---
+  git push origin main
+  git push origin "v$NEW"
 fi
 
-# --- Tag ---
-git tag "v$NEW"
-
-# --- Push ---
-git push origin main
-git push origin "v$NEW"
-
-# --- Collect installer artifacts (latest only) ---
-ASSETS=()
-NSIS_EXE=$(ls -t src-tauri/target/release/bundle/nsis/*.exe 2>/dev/null | head -1)
-[ -n "$NSIS_EXE" ] && ASSETS+=("$NSIS_EXE")
-
-# --- Create GitHub release ---
+# --- Create GitHub release, or add to it if it already exists (multi-platform workflow) ---
 if [ ${#ASSETS[@]} -eq 0 ]; then
-  echo "Warning: no installer artifacts found, creating release without assets"
-  gh release create "v$NEW" --title "LilyPad v$NEW" --generate-notes
+  echo "Warning: no installer artifacts found for this platform"
+fi
+
+if gh release view "v$NEW" >/dev/null 2>&1; then
+  if [ ${#ASSETS[@]} -eq 0 ]; then
+    echo "Release v$NEW already exists; nothing to upload from this platform."
+  else
+    echo "Release v$NEW already exists — uploading: ${ASSETS[*]}"
+    gh release upload "v$NEW" "${ASSETS[@]}" --clobber
+  fi
 else
-  echo "Creating release with: ${ASSETS[*]}"
-  gh release create "v$NEW" "${ASSETS[@]}" --title "LilyPad v$NEW" --generate-notes
+  if [ ${#ASSETS[@]} -eq 0 ]; then
+    echo "Creating release v$NEW without assets"
+    gh release create "v$NEW" --title "LilyPad v$NEW" --generate-notes
+  else
+    echo "Creating release v$NEW with: ${ASSETS[*]}"
+    gh release create "v$NEW" "${ASSETS[@]}" --title "LilyPad v$NEW" --generate-notes
+  fi
 fi
 
 echo "Done — v$NEW released."
