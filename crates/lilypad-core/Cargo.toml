@@ -1,6 +1,6 @@
 [package]
 name = "lilypad-core"
-version = "0.1.0"
+version = "0.4.24"
 description = "Shared Froglog API client, config, and process-monitor logic for Lilypad (Windows/Tauri and Linux/GTK)"
 edition = "2021"
 rust-version = "1.70"
