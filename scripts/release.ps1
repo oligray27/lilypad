@@ -61,6 +61,9 @@ if ($NoBump) {
 # --- Build ---
 Write-Host 'Building...'
 npm run build
+if ($LASTEXITCODE -ne 0) {
+    throw "Build failed (exit code $LASTEXITCODE) -- aborting before touching the release."
+}
 
 if (-not $NoBump) {
     # --- Commit version bump ---
@@ -77,10 +80,19 @@ if (-not $NoBump) {
 }
 
 # --- Collect installer artifacts (latest only) ---
+# NSIS/MSI output lands under the Cargo workspace's shared target dir
+# (lilypad/target), not src-tauri/target, since src-tauri is a workspace
+# member (see ../Cargo.toml). Match on the version string being released,
+# not just "most recently modified" -- a stale leftover .exe from a prior
+# version can otherwise look newer than a build that failed to produce
+# a fresh artifact, and get uploaded silently under the wrong version.
 $Assets = @()
-$NsisDir = 'src-tauri/target/release/bundle/nsis'
+$NsisDir = 'target/release/bundle/nsis'
 if (Test-Path $NsisDir) {
-    $f = Get-ChildItem $NsisDir -Filter '*.exe' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    $f = Get-ChildItem $NsisDir -Filter "*${New}*.exe" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if (-not $f) {
+        Write-Host "Warning: no NSIS installer found for version $New in $NsisDir (build may have failed)"
+    }
     if ($f) { $Assets += $f.FullName }
 }
 
