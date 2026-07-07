@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=LilyPad
+Comment=FrogLog game time tracker - runs in the system tray
+Exec=lilypad-gtk
+Icon=uk.co.froglog.lilypad
+Terminal=false
+Categories=Utility;
+StartupNotify=false

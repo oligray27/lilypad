@@ -11,9 +11,12 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+
+[target.'cfg(windows)'.build-dependencies]
 ico = "0.5"
 
 [dependencies]
+lilypad-core = { path = "../crates/lilypad-core" }
 tauri = { version = "2", features = ["tray-icon", "protocol-asset", "image-ico"] }
 tauri-plugin-autostart = "2"
 tauri-plugin-notification = "2"
@@ -24,18 +27,22 @@ log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sysinfo = "0.31"
-wmi = "0.14"
-reqwest = { version = "0.12", features = ["json", "blocking"] }
 tokio = { version = "1", features = ["full"] }
 dirs = "5"
 chrono = "0.4"
 
 [target.'cfg(windows)'.dependencies]
+# Only the WinRT toast-notification bits used directly in lib.rs; monitor.rs's own
+# Win32 window-enumeration windows-crate usage now lives in lilypad-core.
 windows = { version = "0.58", features = [
-    "Win32_Foundation",
-    "Win32_UI_WindowsAndMessaging",
     "Win32_System_Com",
     "UI_Notifications",
     "Data_Xml_Dom",
     "Foundation",
 ] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Used directly here to read the XDG desktop portal's dark-mode setting
+# (GTK3/WebKitGTK don't follow it on their own). Already pulled in transitively
+# via notify-rust too.
+zbus = { version = "5", default-features = false, features = ["blocking"] }

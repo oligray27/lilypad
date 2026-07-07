@@ -1,6 +1,4 @@
-mod api;
-mod config;
-mod monitor;
+use lilypad_core::{api, config, monitor};
 
 use api::FroglogClient;
 use config::{AuthConfig, ProcessMapConfig, ProcessMapping, PendingSession, auth_config_path, process_map_path_for_auth, load_pending_sessions, save_pending_sessions};
@@ -32,14 +30,36 @@ const SESSION_HEIGHT_LIVE: f64 = 284.0;
 const SESSION_TASKBAR_REGULAR: f64 = 94.0;
 const SESSION_TASKBAR_LIVE: f64 = 94.0;
 
+/// GTK/Wayland can map a window with stale title-bar hit-test regions when its size/position
+/// is set before it's shown, leaving the CSD min/max/close buttons unresponsive until something
+/// (e.g. a double-click) forces a relayout. Showing first, then re-requesting focus shortly
+/// after the window is fully mapped, gives GTK a second chance to settle. No-op on other platforms.
+#[cfg(target_os = "linux")]
+fn nudge_focus(w: &tauri::WebviewWindow) {
+    let handle = w.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let handle2 = handle.clone();
+        let _ = handle.app_handle().run_on_main_thread(move || {
+            let _ = handle2.set_focus();
+        });
+    });
+}
+
+#[cfg(not(target_os = "linux"))]
+fn nudge_focus(_w: &tauri::WebviewWindow) {}
+
 fn show_window_at_height(w: &tauri::WebviewWindow, width: f64, height: f64) {
+    let _ = w.show();
     let _ = w.set_size(tauri::Size::Logical(tauri::LogicalSize { width, height }));
     let _ = w.center();
-    let _ = w.show();
     let _ = w.set_focus();
+    nudge_focus(w);
+    apply_theme(w);
 }
 
 fn show_session_window(w: &tauri::WebviewWindow, height: f64, taskbar_margin: f64) {
+    let _ = w.show();
     let _ = w.set_size(tauri::Size::Logical(tauri::LogicalSize { width: SESSION_WIDTH, height }));
     if let Ok(Some(monitor)) = w.primary_monitor() {
         let scale = monitor.scale_factor();
@@ -53,8 +73,58 @@ fn show_session_window(w: &tauri::WebviewWindow, height: f64, taskbar_margin: f6
         let y = mon_pos.y + mon_size.height as i32 - win_h - tb;
         let _ = w.set_position(tauri::Position::Physical(tauri::PhysicalPosition { x, y }));
     }
-    let _ = w.show();
     let _ = w.set_focus();
+    nudge_focus(w);
+    apply_theme(w);
+}
+
+/// Reads the desktop's dark-mode preference from the XDG Desktop Portal Settings API
+/// (`org.freedesktop.appearance` / `color-scheme`, 1 = prefer-dark). GTK3 (and therefore
+/// WebKitGTK, which Tauri uses on Linux) only follows the legacy `gtk-theme` name, not
+/// GNOME's `color-scheme` gsetting, so `WebviewWindow::theme()` reports the wrong thing on
+/// stock GNOME. The portal is the desktop-agnostic source of truth (also used by Firefox/Chromium).
+#[cfg(target_os = "linux")]
+fn linux_prefers_dark() -> Option<bool> {
+    let conn = zbus::blocking::Connection::session().ok()?;
+    let reply = conn
+        .call_method(
+            Some("org.freedesktop.portal.Desktop"),
+            "/org/freedesktop/portal/desktop",
+            Some("org.freedesktop.portal.Settings"),
+            "Read",
+            &("org.freedesktop.appearance", "color-scheme"),
+        )
+        .ok()?;
+    // Read() returns `v` wrapping the setting's own value, which for this key is itself
+    // a variant-wrapped u32 — so we may need to unwrap one or two layers of Value::Value.
+    let body = reply.body();
+    let mut value: zbus::zvariant::Value = body.deserialize().ok()?;
+    loop {
+        match value {
+            zbus::zvariant::Value::U32(n) => return Some(n == 1),
+            zbus::zvariant::Value::Value(inner) => value = *inner,
+            _ => return None,
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_prefers_dark() -> Option<bool> {
+    None
+}
+
+/// Reflects the OS/window theme into the DOM as `<html data-theme="dark|light">`.
+/// WebKitGTK (Linux) doesn't reliably surface the desktop's dark-mode preference via
+/// `prefers-color-scheme` the way WebView2 (Windows) does, so main.css keys off this
+/// attribute instead of relying solely on the media query.
+fn apply_theme(w: &tauri::WebviewWindow) {
+    let is_dark = linux_prefers_dark()
+        .unwrap_or_else(|| w.theme().unwrap_or(tauri::Theme::Light) == tauri::Theme::Dark);
+    let theme_str = if is_dark { "dark" } else { "light" };
+    let _ = w.eval(&format!(
+        "document.documentElement.setAttribute('data-theme', '{}')",
+        theme_str
+    ));
 }
 
 /// Shared state for the app.
@@ -787,11 +857,12 @@ fn hide_window(app: tauri::AppHandle) -> Result<(), String> {
 #[tauri::command]
 fn pick_exe_file(app: tauri::AppHandle) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
-    let path = app
-        .dialog()
-        .file()
-        .add_filter("Executables", &["exe"])
-        .blocking_pick_file();
+    let dialog = app.dialog().file();
+    // Native Linux/macOS binaries conventionally have no file extension, so only
+    // constrain the picker to `.exe` on Windows.
+    #[cfg(windows)]
+    let dialog = dialog.add_filter("Executables", &["exe"]);
+    let path = dialog.blocking_pick_file();
     Ok(path.and_then(|p| p.as_path().map(|path| path.display().to_string())))
 }
 
@@ -845,11 +916,17 @@ pub fn run() {
             pick_exe_file,
         ])
         .on_window_event(|window, event| {
-            // Keep app running in tray: closing the main window hides it instead of exiting
             if window.label() == "main" {
+                // Keep app running in tray: closing the main window hides it instead of exiting
                 if let WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
                     let _ = window.hide();
+                }
+                // Live-update the DOM theme attribute when the OS/desktop theme changes.
+                if let WindowEvent::ThemeChanged(_) = event {
+                    if let Some(w) = window.app_handle().get_webview_window("main") {
+                        apply_theme(&w);
+                    }
                 }
             }
         })

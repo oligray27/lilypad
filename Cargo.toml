@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/lilypad-core",
+    "crates/lilypad-gtk",
+    "src-tauri",
+]

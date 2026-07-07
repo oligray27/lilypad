@@ -1,0 +1,58 @@
+[package]
+name = "lilypad-gtk"
+version = "0.1.0"
+description = "Native GTK4/libadwaita Lilypad app for Linux"
+edition = "2021"
+rust-version = "1.75"
+license = "Proprietary"
+
+[[bin]]
+name = "lilypad-gtk"
+path = "src/main.rs"
+
+[dependencies]
+lilypad-core = { path = "../lilypad-core" }
+gtk4 = { version = "0.11", features = ["v4_12"] }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
+glib = "0.22"
+ksni = { version = "0.3", features = ["blocking"] }
+notify-rust = "4"
+async-channel = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sysinfo = "0.31"
+log = "0.4"
+env_logger = "0.11"
+dirs = "5"
+chrono = "0.4"
+
+[package.metadata.deb]
+maintainer = "Oli Gray <kloat64@icloud.com>"
+copyright = "2026, Oli Gray"
+extended-description = "FrogLog game time tracker - runs in the system tray, detects game processes and logs play time. Native GTK4/libadwaita build for Linux."
+depends = "libgtk-4-1, libadwaita-1-0"
+section = "utils"
+priority = "optional"
+maintainer-scripts = "debian"
+assets = [
+    ["target/release/lilypad-gtk", "usr/bin/", "755"],
+    ["data/uk.co.froglog.lilypad.desktop", "usr/share/applications/", "644"],
+    ["../../src-tauri/icons/128x128.png", "usr/share/icons/hicolor/128x128/apps/uk.co.froglog.lilypad.png", "644"],
+    ["../../src-tauri/icons/128x128_nowplaying.png", "usr/share/icons/hicolor/128x128/apps/uk.co.froglog.lilypad-tracking.png", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "../../target/release/lilypad-gtk", dest = "/usr/bin/lilypad-gtk", mode = "755" },
+    { source = "data/uk.co.froglog.lilypad.desktop", dest = "/usr/share/applications/uk.co.froglog.lilypad.desktop", mode = "644" },
+    { source = "../../src-tauri/icons/128x128.png", dest = "/usr/share/icons/hicolor/128x128/apps/uk.co.froglog.lilypad.png", mode = "644" },
+    { source = "../../src-tauri/icons/128x128_nowplaying.png", dest = "/usr/share/icons/hicolor/128x128/apps/uk.co.froglog.lilypad-tracking.png", mode = "644" },
+]
+# Refresh the icon/desktop-file caches so the taskbar/app-grid icon shows up
+# without requiring a logout — mirrors debian/postinst+postrm for the .deb.
+post_install_script = "update-desktop-database -q /usr/share/applications || true; gtk-update-icon-cache -f -t /usr/share/icons/hicolor || true"
+post_uninstall_script = "update-desktop-database -q /usr/share/applications || true; gtk-update-icon-cache -f -t /usr/share/icons/hicolor || true"
+
+[package.metadata.generate-rpm.requires]
+gtk4 = "*"
+libadwaita = "*"

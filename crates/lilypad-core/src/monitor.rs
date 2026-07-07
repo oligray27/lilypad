@@ -51,7 +51,83 @@ pub fn get_window_titles_for_pid(target_pid: u32) -> Vec<String> {
     data.titles
 }
 
-#[cfg(not(windows))]
+/// Returns window titles belonging to the given PID via X11/XWayland EWMH hints.
+/// Native Wayland windows are invisible to this (no cross-client enumeration API exists
+/// there by design), so this only helps for X11 sessions or XWayland-backed windows
+/// (e.g. most Proton/Wine games) — same limitation every other Linux tray/tracker app has.
+#[cfg(target_os = "linux")]
+pub fn get_window_titles_for_pid(target_pid: u32) -> Vec<String> {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _};
+
+    let mut titles = Vec::new();
+
+    let Ok((conn, screen_num)) = x11rb::connect(None) else {
+        return titles; // No X server reachable (pure Wayland session, headless, etc.)
+    };
+    let Some(screen) = conn.setup().roots.get(screen_num) else {
+        return titles;
+    };
+    let root = screen.root;
+
+    let intern = |name: &str| -> Option<u32> {
+        conn.intern_atom(false, name.as_bytes()).ok()?.reply().ok().map(|r| r.atom)
+    };
+
+    let Some(net_client_list) = intern("_NET_CLIENT_LIST") else {
+        return titles;
+    };
+    let net_wm_pid = intern("_NET_WM_PID");
+    let net_wm_name = intern("_NET_WM_NAME");
+    let utf8_string = intern("UTF8_STRING");
+
+    let Some(client_list) = conn
+        .get_property(false, root, net_client_list, AtomEnum::WINDOW, 0, u32::MAX)
+        .ok()
+        .and_then(|c| c.reply().ok())
+    else {
+        return titles;
+    };
+    let windows: Vec<u32> = client_list.value32().map(|it| it.collect()).unwrap_or_default();
+
+    for win in windows {
+        let Some(pid_atom) = net_wm_pid else { continue };
+        let pid_val = conn
+            .get_property(false, win, pid_atom, AtomEnum::CARDINAL, 0, 1)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| r.value32().and_then(|mut it| it.next()));
+        if pid_val != Some(target_pid) {
+            continue;
+        }
+
+        // Prefer _NET_WM_NAME (UTF8_STRING); fall back to legacy WM_NAME.
+        let title = net_wm_name
+            .zip(utf8_string)
+            .and_then(|(name_atom, type_atom)| {
+                conn.get_property(false, win, name_atom, type_atom, 0, u32::MAX)
+                    .ok()
+                    .and_then(|c| c.reply().ok())
+                    .and_then(|r| String::from_utf8(r.value).ok())
+                    .filter(|s| !s.is_empty())
+            })
+            .or_else(|| {
+                conn.get_property(false, win, AtomEnum::WM_NAME, AtomEnum::STRING, 0, u32::MAX)
+                    .ok()
+                    .and_then(|c| c.reply().ok())
+                    .and_then(|r| String::from_utf8(r.value).ok())
+                    .filter(|s| !s.is_empty())
+            });
+
+        if let Some(t) = title {
+            titles.push(t);
+        }
+    }
+
+    titles
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
 pub fn get_window_titles_for_pid(_target_pid: u32) -> Vec<String> {
     vec![]
 }

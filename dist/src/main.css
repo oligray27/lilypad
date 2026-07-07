@@ -13,8 +13,12 @@
   --subtitle: #888;
   --link: #06c;
 }
+/* Dark palette, applied via the media query where the platform reports it reliably
+   (Windows), and via the explicit data-theme attribute the Rust side sets from the
+   window's actual theme — WebKitGTK (Linux) doesn't reliably reflect the desktop's
+   dark-mode preference through prefers-color-scheme. */
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme="light"]) {
     --bg: #1e1e1e;
     --text: #e8e8e8;
     --muted: #999;
@@ -29,6 +33,20 @@
     --link: #4db6ff;
   }
 }
+:root[data-theme="dark"] {
+  --bg: #1e1e1e;
+  --text: #e8e8e8;
+  --muted: #999;
+  --error: #f77;
+  --border: #555;
+  --border-subtle: #383838;
+  --code-bg: #2a2a2a;
+  --switch-bg: #2a2a2a;
+  --switch-active-bg: #e0e0e0;
+  --switch-active-text: #111;
+  --subtitle: #aaa;
+  --link: #4db6ff;
+}
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
 body { font-family: system-ui, sans-serif; padding: 1rem; margin: 0; background: var(--bg); color: var(--text); }
@@ -37,7 +55,37 @@ h2 { margin-top: 0; }
 [data-view] p { margin: 0 0 0.5rem; }
 label { display: block; margin-top: 0.5rem; }
 input, textarea { width: 100%; margin-top: 0.25rem; padding: 0.4rem; }
-button { margin-right: 0.5rem; margin-top: 0.5rem; padding: 0.4rem 0.8rem; }
+/* WebKitGTK (Linux) draws form controls with the native GTK theme's own colors instead of
+   respecting `color-scheme`/page CSS the way WebView2 (Windows) does, so text inputs stay
+   light even in dark mode unless styled explicitly here. Checkboxes/radios are left native. */
+input:not([type="checkbox"]):not([type="radio"]), textarea, select {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font: inherit;
+  appearance: none;
+  -webkit-appearance: none;
+}
+input:not([type="checkbox"]):not([type="radio"]):focus, textarea:focus, select:focus {
+  outline: 2px solid var(--link);
+  outline-offset: -1px;
+}
+button {
+  margin-right: 0.5rem;
+  margin-top: 0.5rem;
+  padding: 0.4rem 0.8rem;
+  background: var(--switch-bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font: inherit;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+}
+button:hover { filter: brightness(1.12); }
+button:active { filter: brightness(0.95); }
 .error { color: var(--error); font-size: 0.9rem; margin-top: 0.25rem; }
 .muted { color: var(--muted); font-size: 0.9rem; line-height: 1.4; }
 code { font-size: 0.85em; background: var(--code-bg); padding: 0.1em 0.3em; border-radius: 3px; }

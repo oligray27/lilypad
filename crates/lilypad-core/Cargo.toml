@@ -1,0 +1,24 @@
+[package]
+name = "lilypad-core"
+version = "0.1.0"
+description = "Shared Froglog API client, config, and process-monitor logic for Lilypad (Windows/Tauri and Linux/GTK)"
+edition = "2021"
+rust-version = "1.70"
+
+[dependencies]
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sysinfo = "0.31"
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+dirs = "5"
+
+[target.'cfg(windows)'.dependencies]
+wmi = "0.14"
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = "0.13"

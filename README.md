@@ -6,7 +6,18 @@ System tray app for the Froglog suite: tracks game play time and submits session
 
 - Node.js and npm (for Tauri CLI)
 - Rust (stable)
-- Windows (for process detection; tray works on Windows)
+- Windows or Linux (process detection and tray both work on either)
+
+### Linux system packages (Debian/Ubuntu)
+
+```bash
+sudo apt install -y build-essential curl wget file \
+  libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev
+```
+
+On stock GNOME (Wayland or X11), the tray icon needs the [AppIndicator and KStatusNotifierItem Support](https://extensions.gnome.org/extension/615/appindicator-support/) shell extension — GNOME removed native tray support years ago, and this affects every tray-icon app (Discord, Slack, etc.), not just LilyPad.
+
+Window-title disambiguation (used when multiple games share one executable, e.g. `javaw`) uses X11/EWMH and only sees X11 or XWayland-backed windows — it can't see native-Wayland windows, since there's no cross-client window enumeration API on Wayland by design.
 
 ## Development
 
@@ -45,8 +56,15 @@ That writes all required sizes into `src-tauri/icons/`. If you only add **`icon.
 
 ## Configuration
 
-- **API URL**: Set at first login (default: `https://api.froglog.co.uk/api`). Stored with token in `%APPDATA%/froglog-lilypad/auth.json`.
-- **Process → Game mapping**: Stored in `%APPDATA%/froglog-lilypad/process-map.json`. Add entries like:
+Config lives under the OS's local-data directory, in a `froglog-lilypad` folder:
+
+| OS | Path |
+|----|------|
+| Windows | `%LOCALAPPDATA%\froglog-lilypad\` |
+| Linux | `~/.local/share/froglog-lilypad/` |
+
+- **API URL**: Set at first login (default: `https://api.froglog.co.uk/api`). Stored with token in `auth.json`.
+- **Process → Game mapping**: Stored in `process-map.json`. Add entries like:
   ```json
   {
     "mappings": [
@@ -54,14 +72,15 @@ That writes all required sizes into `src-tauri/icons/`. If you only add **`icon.
     ]
   }
   ```
+  On Linux, use the binary's name as it appears in `ps`/`/proc` (no extension), e.g. `"process": "hl2"`.
   When an unknown process triggers a session, you can submit and then add a mapping (future: "Remember this process" in the UI).
 
 ## How to use
 
-1. **Start the app** – Run `npm run dev` (or the built exe). The app minimizes to the **system tray**; the main window may stay hidden.
+1. **Start the app** – Run `npm run dev` (or the built binary). The app minimizes to the **system tray**; the main window may stay hidden.
 2. **Open the window** – Right‑click the Lilypad icon in the tray → click **Show** or **Settings**. The main window opens.
 3. **First time** – You’ll see the **Login** form. Enter API URL (default `https://api.froglog.co.uk/api`), your Froglog username and password, then **Log in**. Next time you open the window you’ll see the main view.
-4. **Add process mappings** – So Lilypad knows which process = which Froglog game, add entries to `%APPDATA%\froglog-lilypad\process-map.json` (create the file if needed), e.g.:
+4. **Add process mappings** – So Lilypad knows which process = which Froglog game, add entries via the tray's **Configure...** menu (or edit `process-map.json` directly, creating it if needed):
    ```json
    { "mappings": [
      { "process": "hl2.exe", "type": "regular", "froglogId": 42, "title": "Half-Life 2" },
@@ -69,7 +88,7 @@ That writes all required sizes into `src-tauri/icons/`. If you only add **`icon.
    ]}
    ```
    Use your real Froglog game IDs from the website (backlog = regular, live service = live).
-5. **When you play** – Start a game whose `.exe` is in the mapping. Lilypad detects it and starts timing. When you close the game, the main window opens with **Session ended**: time played, optional note, and **Submit to Froglog** (or **Skip**).
+5. **When you play** – Start a game whose process is in the mapping. Lilypad detects it and starts timing. When you close the game, the main window opens with **Session ended**: time played, optional note, and **Submit to Froglog** (or **Skip**).
 
 ## How it works
 

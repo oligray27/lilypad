@@ -1,7 +1,7 @@
 node_modules/
 
-# Tauri build artifacts
-src-tauri/target/
+# Rust workspace build artifacts (cargo builds to the workspace root now)
+target/
 src-tauri/gen/
 
 # Logs
