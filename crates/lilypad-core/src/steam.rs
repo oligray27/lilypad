@@ -411,12 +411,17 @@ mod tests {
 
     #[test]
     fn matches_exe_under_install_dir() {
+        // Built via `Path::join` rather than a hardcoded backslash string -- a literal
+        // "C:\Steam\..." path is meaningless on Linux (backslash isn't a separator there), so
+        // this test previously passed on Windows but failed on Linux despite the matching logic
+        // itself being correct on both platforms.
+        let install_dir = PathBuf::from("Steam").join("steamapps").join("common").join("Portal 2");
         let games = vec![InstalledGame {
             appid: "620".to_string(),
             name: "Portal 2".to_string(),
-            install_dir: PathBuf::from("C:\\Steam\\steamapps\\common\\Portal 2"),
+            install_dir: install_dir.clone(),
         }];
-        let exe = PathBuf::from("C:\\Steam\\steamapps\\common\\Portal 2\\portal2.exe");
+        let exe = install_dir.join("portal2.exe");
         let found = find_installed_game_for_exe(&exe, &games);
         assert_eq!(found.unwrap().appid, "620");
     }
