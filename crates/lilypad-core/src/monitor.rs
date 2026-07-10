@@ -117,8 +117,19 @@ fn maybe_start_unmapped_tracking(
     // binary as their resolved `exe_path`).
     let (found, matched_path) = {
         let games = installed_games.read().unwrap();
-        find_installed_game_for_exe_or_cmd(exe_path, cmd, &games).map(|(g, p)| (g.clone(), p))?
+        let result = find_installed_game_for_exe_or_cmd(exe_path, cmd, &games).map(|(g, p)| (g.clone(), p));
+        if result.is_none() {
+            log::debug!(
+                "[LilyPad] no installed-game match for exe_path={:?} cmd={:?} against {} installed games: {:?}",
+                exe_path,
+                cmd,
+                games.len(),
+                games.iter().map(|g| (&g.appid, &g.install_dir)).collect::<Vec<_>>(),
+            );
+        }
+        result?
     };
+    log::debug!("[LilyPad] matched installed game appid={} via path={:?}", found.appid, matched_path);
     let exe_name = matched_path.file_name().and_then(|n| n.to_str())?.to_string();
     let exe_name = exe_name.as_str();
     if is_known_helper_process(exe_name) {
@@ -726,6 +737,14 @@ pub fn run_poll_loop(
                             };
                             if candidates.is_empty() {
                                 if !cfg.disable_unmapped_game_detection {
+                                    if p.cmd().iter().any(|a| a.to_string_lossy().to_lowercase().ends_with(".exe")) {
+                                        log::debug!(
+                                            "[LilyPad] unmapped-detection candidate pid={:?} exe={:?} cmd={:?}",
+                                            pid,
+                                            p.exe(),
+                                            p.cmd(),
+                                        );
+                                    }
                                     if let Some(mapping) = maybe_start_unmapped_tracking(
                                         p.exe(),
                                         p.cmd(),
