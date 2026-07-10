@@ -2,7 +2,7 @@
 
 use crate::config::{ProcessMapConfig, ProcessMapping};
 use crate::library_match::LibraryIndex;
-use crate::steam::{find_installed_game_for_exe, InstalledGame};
+use crate::steam::{find_installed_game_for_exe_or_cmd, InstalledGame};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -101,6 +101,7 @@ fn run_unmapped_wait_thread(
 #[allow(clippy::too_many_arguments)]
 fn maybe_start_unmapped_tracking(
     exe_path: Option<&Path>,
+    cmd: &[std::ffi::OsString],
     pid: Pid,
     installed_games: &Arc<RwLock<Vec<InstalledGame>>>,
     library_index: &Arc<RwLock<LibraryIndex>>,
@@ -109,16 +110,20 @@ fn maybe_start_unmapped_tracking(
     on_unmapped_session_ended: &Arc<dyn Fn(String, String, String, f64) + Send + Sync>,
     on_already_owned_game_needs_link: &Arc<dyn Fn(ProcessMapping) + Send + Sync>,
 ) -> Option<ProcessMapping> {
-    let exe_path = exe_path?;
-    let exe_name = exe_path.file_name().and_then(|n| n.to_str())?;
+    // The matched path may be a translated Proton/Wine command-line argument rather than
+    // `exe_path` itself (see `find_installed_game_for_exe_or_cmd`) -- the exe name recorded from
+    // here on must come from *that* path, not `exe_path`, or every Proton game would get
+    // misattributed to whichever one happened to resolve first (they all share the same Wine
+    // binary as their resolved `exe_path`).
+    let (found, matched_path) = {
+        let games = installed_games.read().unwrap();
+        find_installed_game_for_exe_or_cmd(exe_path, cmd, &games).map(|(g, p)| (g.clone(), p))?
+    };
+    let exe_name = matched_path.file_name().and_then(|n| n.to_str())?.to_string();
+    let exe_name = exe_name.as_str();
     if is_known_helper_process(exe_name) {
         return None;
     }
-    let found = {
-        let games = installed_games.read().unwrap();
-        find_installed_game_for_exe(exe_path, &games).cloned()
-    };
-    let found = found?;
 
     // A companion process not on the `is_known_helper_process` blocklist can still start or
     // exit around the same time as the real game (e.g. right after it closes) and get
@@ -454,6 +459,9 @@ fn try_run_wmi_watch(
                 };
                 if let Some(mapping) = maybe_start_unmapped_tracking(
                     exe_path.as_deref(),
+                    // WMI process-start events are Windows-only, where Proton/Wine doesn't
+                    // exist -- no command-line fallback is needed here.
+                    &[],
                     pid,
                     &installed_games,
                     &library_index,
@@ -720,6 +728,7 @@ pub fn run_poll_loop(
                                 if !cfg.disable_unmapped_game_detection {
                                     if let Some(mapping) = maybe_start_unmapped_tracking(
                                         p.exe(),
+                                        p.cmd(),
                                         *pid,
                                         &installed_games_poll,
                                         &library_index_poll,

@@ -300,6 +300,69 @@ fn path_starts_with(path: &Path, prefix: &Path) -> bool {
     path.starts_with(prefix)
 }
 
+/// Finds the installed game a running process belongs to, trying the resolved exe path first
+/// and falling back to parsing a Proton/Wine command line on Linux.
+///
+/// Steam launches a Proton game roughly as `proton waitforexitandrun "Z:\...\Game.exe"` (native
+/// Wine similarly takes a Windows-style path as an argument) -- the resolved `/proc/pid/exe` for
+/// a process like this stays Wine's/Proton's own binary, nowhere near the game's actual install
+/// directory, so plain `find_installed_game_for_exe` can never match a Proton game (this was the
+/// actual bug behind "New Games" detection silently never firing for Proton titles, even though
+/// exe-name-based `ProcessMapping` matching had already been made Proton-aware separately). The
+/// Windows-style path passed as an argument is the real thing to match against -- Proton's
+/// default prefix maps its `Z:` drive directly onto the Unix filesystem root, so
+/// `Z:\home\user\...\Game.exe` needs only its drive prefix stripped and backslashes flipped to
+/// become the real Linux path.
+///
+/// Returns the matched game together with whichever path actually matched it -- for the Proton
+/// fallback that's the *translated* path (e.g. `.../Portal 2/portal2.exe`), not the resolved
+/// `exe_path` (Wine's own binary, e.g. `wine64`). Callers must derive the exe name to record
+/// from this returned path, never from `exe_path` directly -- every Proton game shares the same
+/// Wine/Proton binary, so naively recording "wine64" as the matched exe would misattribute every
+/// future Proton launch (of any game) to whichever one happened to resolve first.
+pub fn find_installed_game_for_exe_or_cmd<'a>(
+    exe_path: Option<&Path>,
+    cmd: &[std::ffi::OsString],
+    games: &'a [InstalledGame],
+) -> Option<(&'a InstalledGame, PathBuf)> {
+    if let Some(path) = exe_path {
+        if let Some(found) = find_installed_game_for_exe(path, games) {
+            return Some((found, path.to_path_buf()));
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(proton_path) = find_proton_exe_path(cmd) {
+            if let Some(found) = find_installed_game_for_exe(&proton_path, games) {
+                return Some((found, proton_path));
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = cmd;
+    }
+    None
+}
+
+/// Scans a process's command-line arguments for a Windows-style path to a `.exe` (as Proton/Wine
+/// pass through unmodified) and translates it to the real Linux path, assuming the default
+/// Proton/Wine prefix convention of mapping drive `Z:` onto the Unix root `/`. Best-effort: a
+/// non-default prefix (a custom drive mapping) won't resolve, same as it wouldn't for any other
+/// tool relying on this convention -- unverified against a real Proton process, since this can
+/// only be tested on Linux.
+#[cfg(target_os = "linux")]
+fn find_proton_exe_path(cmd: &[std::ffi::OsString]) -> Option<PathBuf> {
+    cmd.iter().find_map(|arg| {
+        let arg = arg.to_str()?;
+        if !arg.to_lowercase().ends_with(".exe") {
+            return None;
+        }
+        let rest = arg.strip_prefix("Z:").or_else(|| arg.strip_prefix("z:"))?;
+        Some(PathBuf::from(rest.replace('\\', "/")))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,6 +434,31 @@ mod tests {
         let exe = PathBuf::from("d:\\7s games\\kill knight-denuvowo [portable]\\KILL KNIGHT.exe");
         let found = find_installed_game_for_exe(&exe, &games);
         assert!(found.is_some());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn matches_proton_game_via_cmdline_path() {
+        let games = vec![InstalledGame {
+            appid: "620".to_string(),
+            name: "Portal 2".to_string(),
+            install_dir: PathBuf::from("/home/user/.steam/steam/steamapps/common/Portal 2"),
+        }];
+        // Wine's own resolved binary, not the game -- this alone must not match.
+        let wine_exe = PathBuf::from("/home/user/.steam/steam/steamapps/common/Proton 9.0/dist/bin/wine64");
+        assert!(find_installed_game_for_exe(&wine_exe, &games).is_none());
+
+        // Steam launches Proton games with the Windows-style path as a command-line argument.
+        let cmd: Vec<std::ffi::OsString> = vec![
+            "/home/user/.steam/steam/steamapps/common/Proton 9.0/proton".into(),
+            "waitforexitandrun".into(),
+            "Z:\\home\\user\\.steam\\steam\\steamapps\\common\\Portal 2\\portal2.exe".into(),
+        ];
+        let (found, matched_path) = find_installed_game_for_exe_or_cmd(Some(&wine_exe), &cmd, &games).unwrap();
+        assert_eq!(found.appid, "620");
+        // The name recorded for this session must come from the translated path (the real
+        // game exe), never from the Wine/Proton binary that actually resolved for the process.
+        assert_eq!(matched_path.file_name().unwrap(), "portal2.exe");
     }
 
     #[test]
