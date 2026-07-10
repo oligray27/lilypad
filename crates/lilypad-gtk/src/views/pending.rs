@@ -90,9 +90,12 @@ fn build_row(state: AppState, session: PendingSession, on_changed: Rc<dyn Fn()>)
     }
     subtitle.push_str(&format!("\n{}", session.error));
 
+    // AdwActionRow's title/subtitle are Pango markup by default -- escape both, since the
+    // title is a game title (can contain "&", e.g. "Ratchet & Clank") and the subtitle
+    // includes a server-provided error message that could contain anything.
     let row = adw::ActionRow::builder()
-        .title(session.title.clone())
-        .subtitle(subtitle)
+        .title(glib::markup_escape_text(&session.title))
+        .subtitle(glib::markup_escape_text(&subtitle))
         .subtitle_lines(2)
         .build();
 

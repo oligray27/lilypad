@@ -72,7 +72,9 @@ pub fn build(state: AppState, window: gtk4::Window) -> (gtk4::Widget, Rc<dyn Fn(
             scroller.set_visible(!is_empty);
 
             for dir in dirs {
-                let row = adw::ActionRow::builder().title(dir.path.clone()).build();
+                // AdwActionRow's title is Pango markup by default -- escape the path so a
+                // folder name containing "&"/"<"/">" doesn't fail to parse and render blank.
+                let row = adw::ActionRow::builder().title(glib::markup_escape_text(&dir.path)).build();
                 let remove_btn = gtk4::Button::with_label("Remove");
                 remove_btn.set_valign(gtk4::Align::Center);
                 row.add_suffix(&remove_btn);

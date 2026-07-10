@@ -259,7 +259,10 @@ pub fn build(
 
             for row in rows {
                 let key = row.key();
-                let action_row = adw::ActionRow::builder().title(row.title.clone()).build();
+                // AdwActionRow's title is interpreted as Pango markup by default, so a raw
+                // title containing "&"/"<"/">" (e.g. "Ratchet & Clank") fails to parse and the
+                // row is left with no title at all -- escape before setting.
+                let action_row = adw::ActionRow::builder().title(glib::markup_escape_text(&row.title)).build();
 
                 let exe_entry = gtk4::Entry::builder()
                     .placeholder_text("e.g. hl2.exe")
