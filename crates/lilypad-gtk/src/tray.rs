@@ -16,6 +16,7 @@ pub enum TrayAction {
     ShowMain,
     ShowMappings,
     ShowPending,
+    ShowNewGames,
     Logout,
     ForceStopTracking,
     Quit,
@@ -105,6 +106,17 @@ impl ksni::Tray for LilypadTray {
                     StandardItem {
                         label: format!("Pending Submissions ({pending_count})"),
                         activate: Box::new(|t: &mut Self| t.send(TrayAction::ShowPending)),
+                        ..Default::default()
+                    }
+                    .into(),
+                );
+            }
+            let new_games_count = lilypad_core::config::load_pending_game_submissions().len();
+            if new_games_count > 0 {
+                items.push(
+                    StandardItem {
+                        label: format!("New Games ({new_games_count})"),
+                        activate: Box::new(|t: &mut Self| t.send(TrayAction::ShowNewGames)),
                         ..Default::default()
                     }
                     .into(),

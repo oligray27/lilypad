@@ -18,6 +18,8 @@ fn view_size(view: &str) -> (i32, i32) {
     match view {
         "mappings" => (780, 800),
         "pending" => (560, 480),
+        "new_games" => (560, 480),
+        "watched_dirs" => (550, 480),
         "main" => (560, 340),
         _ => (560, 420),
     }
@@ -139,8 +141,31 @@ fn build_window(app: &adw::Application, state: AppState) {
             refresh_tray();
         }
     });
-    let (mappings_widget, reload_mappings) = views::mappings::build(state.clone(), window.clone().upcast());
     let (pending_widget, reload_pending) = views::pending::build(state.clone());
+    let (new_games_widget, reload_new_games) = views::new_games::build(state.clone(), refresh_tray.clone());
+    let (watched_dirs_widget, reload_watched_dirs) = views::watched_dirs::build(state.clone(), window.clone().upcast());
+    let (mappings_widget, reload_mappings) = views::mappings::build(
+        state.clone(),
+        window.clone().upcast(),
+        {
+            let stack = stack.clone();
+            let window = window.clone();
+            let reload_watched_dirs = Rc::clone(&reload_watched_dirs);
+            move || {
+                goto_view(&window, &stack, "watched_dirs");
+                reload_watched_dirs();
+            }
+        },
+        {
+            let stack = stack.clone();
+            let window = window.clone();
+            let reload_new_games = Rc::clone(&reload_new_games);
+            move || {
+                goto_view(&window, &stack, "new_games");
+                reload_new_games();
+            }
+        },
+    );
     let (main_widget, refresh_main_notice) = views::main_view::build(
         {
             let stack = stack.clone();
@@ -166,6 +191,8 @@ fn build_window(app: &adw::Application, state: AppState) {
     stack.add_named(&main_widget, Some("main"));
     stack.add_named(&mappings_widget, Some("mappings"));
     stack.add_named(&pending_widget, Some("pending"));
+    stack.add_named(&new_games_widget, Some("new_games"));
+    stack.add_named(&watched_dirs_widget, Some("watched_dirs"));
     let initial_view = if state.logged_in() { "main" } else { "login" };
     stack.set_visible_child_name(initial_view);
     {
@@ -188,6 +215,7 @@ fn build_window(app: &adw::Application, state: AppState) {
         let app_tx = app_tx.clone();
         let reload_mappings = Rc::clone(&reload_mappings);
         let reload_pending = Rc::clone(&reload_pending);
+        let reload_new_games = Rc::clone(&reload_new_games);
         let refresh_main_notice = Rc::clone(&refresh_main_notice);
         async move {
             while let Ok(action) = action_rx.recv().await {
@@ -210,6 +238,11 @@ fn build_window(app: &adw::Application, state: AppState) {
                         goto_view(&window, &stack, "pending");
                         window.present();
                         reload_pending();
+                    }
+                    TrayAction::ShowNewGames => {
+                        goto_view(&window, &stack, "new_games");
+                        window.present();
+                        reload_new_games();
                     }
                     TrayAction::Logout => {
                         {
@@ -259,12 +292,19 @@ fn build_window(app: &adw::Application, state: AppState) {
     glib::spawn_future_local({
         let state = state.clone();
         let window = window.clone();
+        let stack = stack.clone();
         let refresh_tray = refresh_tray.clone();
+        let reload_new_games = Rc::clone(&reload_new_games);
         async move {
             while let Ok(action) = app_rx.recv().await {
                 match action {
                     AppAction::ShowSessionPopup(data) => {
                         views::session::show_popup(state.clone(), window.upcast_ref(), refresh_tray.clone(), data);
+                    }
+                    AppAction::GoToNewGames => {
+                        goto_view(&window, &stack, "new_games");
+                        window.present();
+                        reload_new_games();
                     }
                 }
             }
@@ -275,6 +315,28 @@ fn build_window(app: &adw::Application, state: AppState) {
     // polling (so it sees current_session already populated and doesn't try to
     // start tracking the same still-running process as if it were new).
     persistence::recover_on_startup(state.clone(), refresh_tray.clone(), app_tx.clone());
+
+    // Refresh the installed-Steam-games scan and the FrogLog library index
+    // periodically in the background, so newly installed games or newly logged
+    // games are picked up without restarting LilyPad.
+    {
+        let refresh_state = state.clone();
+        let library_index = state.library_index.clone();
+        let auth = state.auth.clone();
+        std::thread::spawn(move || loop {
+            refresh_state.refresh_installed_games();
+            let auth_snapshot = auth.read().unwrap().clone();
+            if auth_snapshot.token.is_some() {
+                let client = session_flow::client_for(&auth_snapshot);
+                let games = client.get_games().unwrap_or_default();
+                let wishlist = client.get_wishlist().unwrap_or_default();
+                let live_service = client.get_live_service_games().unwrap_or_default();
+                *library_index.write().unwrap() =
+                    lilypad_core::library_match::LibraryIndex::build(&games, &wishlist, &live_service);
+            }
+            std::thread::sleep(std::time::Duration::from_secs(300));
+        });
+    }
 
     // Process monitor: real background threads (lilypad-core, unchanged from the
     // Tauri build) pushing events consumed here on the GTK main loop.
@@ -322,6 +384,30 @@ fn build_window(app: &adw::Application, state: AppState) {
                                 false,
                             );
                         }
+                        refresh_tray();
+                    }
+                    MonitorEvent::UnmappedGameSessionEnded { title, appid, exe_name, duration_secs } => {
+                        let raw_hours = duration_secs / 3600.0;
+                        let hours = {
+                            let r = (raw_hours * 100.0).round() / 100.0;
+                            if r < 0.01 { 0.01 } else { r }
+                        };
+                        lilypad_core::config::record_pending_game_submission(&appid, &title, &exe_name, hours);
+                        let total_mins = (duration_secs / 60.0).round() as u64;
+                        let time_str = if total_mins >= 60 {
+                            format!("{}h {}m", total_mins / 60, total_mins % 60)
+                        } else {
+                            format!("{total_mins}m")
+                        };
+                        let app_tx = app_tx.clone();
+                        notify::show_with_action(
+                            "Session Recorded",
+                            &format!("{title} ({time_str}) isn't in your FrogLog yet."),
+                            "Go to New Games",
+                            move || {
+                                let _ = app_tx.send_blocking(AppAction::GoToNewGames);
+                            },
+                        );
                         refresh_tray();
                     }
                 }

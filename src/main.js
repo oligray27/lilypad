@@ -4,16 +4,23 @@ const { listen } = window.__TAURI__.event;
 
 const $ = (id) => document.getElementById(id);
 
-// No devtools feature is compiled in (see src-tauri/Cargo.toml), so this just
-// suppresses WebView2's default context menu (Back/Forward/Reload/etc).
-document.addEventListener('contextmenu', (e) => e.preventDefault());
+// Release builds don't compile in the devtools feature (see src-tauri/Cargo.toml), so
+// WebView2's default context menu (Back/Forward/Reload/Inspect/etc) would just be dead
+// weight there — suppress it. `tauri dev` serves from devUrl (http://localhost:1430)
+// rather than the production asset protocol, and debug builds have devtools available
+// by default, so leave the context menu (and therefore right-click Inspect) enabled there.
+const isDevServer = window.location.hostname === 'localhost' && window.location.port === '1430';
+if (!isDevServer) {
+  document.addEventListener('contextmenu', (e) => e.preventDefault());
+}
 
 const VIEW_SIZE = {
-  loginView: { width: 560, height: 318 },
-  mainView: { width: 550, height: 335 },
+  loginView: { width: 560, height: 328 },
+  mainView: { width: 550, height: 402 },
   mappingsView: { width: 642, height: 760 },
   sessionView: { width: 440, height: 165 },
   pendingView: { width: 550, height: 480 },
+  watchedDirsView: { width: 550, height: 480 },
 };
 
 function showView(id, heightOrOpts) {
@@ -147,6 +154,284 @@ async function loadPendingView() {
   });
 }
 
+const NEW_GAMES_EMPTY_HTML = '<p class="muted" style="padding:1rem;">No new games detected.</p>';
+
+// Mirrors lilypad-core's library_match::normalize_title (lowercase, strip punctuation, strip
+// common edition suffixes) so a "Map to Existing" pre-selection lines up with the same games
+// the backend already treats as equivalent titles.
+const EDITION_SUFFIXES = [
+  'game of the year edition', 'goty edition', 'definitive edition', 'complete edition',
+  'deluxe edition', 'ultimate edition', 'enhanced edition', 'remastered', 'remake',
+];
+function normalizeTitleForMatch(s) {
+  let normalized = (s || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  for (const suffix of EDITION_SUFFIXES) {
+    if (normalized.endsWith(suffix)) {
+      normalized = normalized.slice(0, normalized.length - suffix.length).trim();
+    }
+  }
+  return normalized;
+}
+// Best-effort pre-selection for the "Map to Existing" dropdown — exact normalized match first,
+// then substring containment either direction (e.g. "Hollow Knight" vs "Hollow Knight:
+// Voidheart Edition"). Just a starting point for the user to confirm, not authoritative.
+function guessBestMatch(pendingTitle, rows) {
+  const target = normalizeTitleForMatch(pendingTitle);
+  if (!target) return null;
+  let best = rows.find((r) => normalizeTitleForMatch(r.title) === target);
+  if (best) return best;
+  best = rows.find((r) => {
+    const rt = normalizeTitleForMatch(r.title);
+    return rt && (rt.includes(target) || target.includes(rt));
+  });
+  return best || null;
+}
+
+async function loadNewGamesView() {
+  const list = $('newGamesList');
+  if (!list) return;
+  list.innerHTML = '<p class="muted" style="padding:1rem;">Loading…</p>';
+  const items = await invoke('get_pending_game_submissions').catch(() => []);
+  if (!items.length) {
+    list.innerHTML = NEW_GAMES_EMPTY_HTML;
+    return;
+  }
+  list.innerHTML = items.map((g) => `
+    <div class="pending-item" data-appid="${escapeAttr(g.appid)}">
+      <div class="pending-title">${escapeHtml(g.title)}</div>
+      <div class="pending-meta">
+        <span><strong>Hours:</strong> ${g.hours}h</span>
+        <span><strong>Sessions:</strong> ${g.session_count}</span>
+      </div>
+      <div class="pending-actions">
+        <button type="button" class="newgame-create">Create New</button>
+        <button type="button" class="newgame-map">Map to Existing</button>
+        <button type="button" class="pending-delete newgame-dismiss">Dismiss</button>
+        <span class="pending-status"></span>
+      </div>
+      <div class="newgame-create-panel" hidden>
+        <p class="newgame-lookup-status muted" hidden></p>
+        <div class="newgame-auto-match" hidden>
+          <p class="newgame-auto-match-text"></p>
+          <div class="newgame-search-row">
+            <button type="button" class="newgame-auto-confirm">Create</button>
+            <button type="button" class="newgame-auto-search-instead">Search Manually Instead</button>
+          </div>
+        </div>
+        <div class="newgame-manual-search" hidden>
+          <div class="newgame-search-row">
+            <input type="text" class="newgame-search-input" placeholder="Search title, or appid:12345 for a Steam appid…" />
+            <button type="button" class="newgame-search-btn">Search</button>
+          </div>
+          <select class="newgame-search-results" size="5" hidden></select>
+          <button type="button" class="newgame-search-confirm" hidden>Use Selected</button>
+        </div>
+      </div>
+      <div class="newgame-map-panel" hidden>
+        <select class="newgame-map-select"></select>
+        <button type="button" class="newgame-map-confirm">Log Hours</button>
+      </div>
+    </div>
+  `).join('');
+
+  function removeCardIfEmpty() {
+    if (!list.querySelector('.pending-item')) list.innerHTML = NEW_GAMES_EMPTY_HTML;
+  }
+
+  list.querySelectorAll('.newgame-dismiss').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const item = btn.closest('[data-appid]');
+      await invoke('dismiss_pending_game_submission', { appid: item.dataset.appid }).catch(() => {});
+      item.remove();
+      invoke('refresh_tray_menu').catch(() => {});
+      removeCardIfEmpty();
+    });
+  });
+
+  list.querySelectorAll('.newgame-create').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const item = btn.closest('[data-appid]');
+      const panel = item.querySelector('.newgame-create-panel');
+      item.querySelector('.newgame-map-panel').hidden = true;
+      const wasHidden = panel.hidden;
+      panel.hidden = !panel.hidden;
+      if (panel.hidden || !wasHidden) return;
+
+      // LilyPad already knows the exact Steam appid — try that before asking the user to
+      // search by title at all. Non-Steam games get a synthetic "local:<path>" id instead of
+      // a real appid, so that shortcut is meaningless for them — go straight to manual search.
+      const statusEl = panel.querySelector('.newgame-lookup-status');
+      const autoMatch = panel.querySelector('.newgame-auto-match');
+      const manualSearch = panel.querySelector('.newgame-manual-search');
+      autoMatch.hidden = true;
+      manualSearch.hidden = true;
+      const isSteamAppid = /^\d+$/.test(item.dataset.appid);
+      if (isSteamAppid) {
+        statusEl.hidden = false;
+        statusEl.textContent = 'Looking up…';
+        try {
+          const results = await invoke('search_igdb_games', { query: `appid:${item.dataset.appid}` });
+          const match = results && results[0];
+          if (match && match.name) {
+            statusEl.hidden = true;
+            autoMatch.hidden = false;
+            autoMatch.dataset.igdbTitle = match.name;
+            autoMatch.querySelector('.newgame-auto-match-text').textContent =
+              `Found: ${match.name}${match.released ? ` (${match.released.slice(0, 4)})` : ''}`;
+            return;
+          }
+        } catch (e) {
+          // fall through to manual search
+        }
+      }
+      statusEl.hidden = true;
+      manualSearch.hidden = false;
+      const input = manualSearch.querySelector('.newgame-search-input');
+      if (!input.value) input.value = item.querySelector('.pending-title').textContent;
+    });
+  });
+
+  list.querySelectorAll('.newgame-auto-search-instead').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const item = btn.closest('[data-appid]');
+      const panel = item.querySelector('.newgame-create-panel');
+      panel.querySelector('.newgame-auto-match').hidden = true;
+      const manualSearch = panel.querySelector('.newgame-manual-search');
+      manualSearch.hidden = false;
+      const input = manualSearch.querySelector('.newgame-search-input');
+      if (!input.value) input.value = item.querySelector('.pending-title').textContent;
+    });
+  });
+
+  list.querySelectorAll('.newgame-auto-confirm').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const item = btn.closest('[data-appid]');
+      const autoMatch = item.querySelector('.newgame-auto-match');
+      const status = item.querySelector('.pending-status');
+      const igdbTitle = autoMatch.dataset.igdbTitle;
+      if (!igdbTitle) return;
+      btn.disabled = true;
+      status.textContent = 'Creating…';
+      status.style.color = '';
+      try {
+        await invoke('resolve_pending_game_as_new', { appid: item.dataset.appid, igdbTitle });
+        item.remove();
+        invoke('refresh_tray_menu').catch(() => {});
+        removeCardIfEmpty();
+      } catch (err) {
+        btn.disabled = false;
+        status.textContent = String(err);
+        status.style.color = 'red';
+      }
+    });
+  });
+
+  list.querySelectorAll('.newgame-map').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const item = btn.closest('[data-appid]');
+      const panel = item.querySelector('.newgame-map-panel');
+      item.querySelector('.newgame-create-panel').hidden = true;
+      panel.hidden = !panel.hidden;
+      if (panel.hidden) return;
+      const select = panel.querySelector('.newgame-map-select');
+      if (select.options.length) return;
+      select.innerHTML = '<option value="">Loading…</option>';
+      try {
+        const [games, liveService] = await Promise.all([
+          invoke('get_games'),
+          invoke('get_live_service_games'),
+        ]);
+        const rows = [
+          ...(games || []).map((r) => ({ id: r.id, title: r.title || `#${r.id}`, type: r.session_tracking ? 'session' : 'regular' })),
+          ...(liveService || []).map((r) => ({ id: r.id, title: r.title || `#${r.id}`, type: 'live' })),
+        ];
+        const pendingTitle = item.querySelector('.pending-title').textContent;
+        const guess = guessBestMatch(pendingTitle, rows);
+        select.innerHTML = rows.length
+          ? rows.map((r) => {
+              const isGuess = !!guess && guess.type === r.type && guess.id === r.id;
+              return `<option value="${r.type}:${r.id}"${isGuess ? ' selected' : ''}>${escapeHtml(r.title)}</option>`;
+            }).join('')
+          : '<option value="">No games in your library yet</option>';
+      } catch (e) {
+        select.innerHTML = `<option value="">${escapeHtml(String(e))}</option>`;
+      }
+    });
+  });
+
+  list.querySelectorAll('.newgame-map-confirm').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const item = btn.closest('[data-appid]');
+      const select = item.querySelector('.newgame-map-select');
+      const status = item.querySelector('.pending-status');
+      const val = select.value;
+      if (!val) return;
+      const [gameType, gameIdStr] = val.split(':');
+      const gameTitle = select.options[select.selectedIndex].textContent;
+      btn.disabled = true;
+      status.textContent = 'Logging…';
+      status.style.color = '';
+      try {
+        await invoke('resolve_pending_game_as_existing', { appid: item.dataset.appid, gameType, gameId: parseInt(gameIdStr, 10), gameTitle });
+        item.remove();
+        invoke('refresh_tray_menu').catch(() => {});
+        removeCardIfEmpty();
+      } catch (err) {
+        btn.disabled = false;
+        status.textContent = String(err);
+        status.style.color = 'red';
+      }
+    });
+  });
+
+  list.querySelectorAll('.newgame-search-btn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const item = btn.closest('[data-appid]');
+      const panel = item.querySelector('.newgame-create-panel');
+      const input = panel.querySelector('.newgame-search-input');
+      const select = panel.querySelector('.newgame-search-results');
+      const confirmBtn = panel.querySelector('.newgame-search-confirm');
+      const query = input.value.trim();
+      if (!query) return;
+      select.hidden = false;
+      select.innerHTML = '<option value="">Searching…</option>';
+      try {
+        const results = await invoke('search_igdb_games', { query });
+        select.innerHTML = (results && results.length)
+          ? results.map((r) => `<option value="${escapeAttr(r.name)}">${escapeHtml(r.name)}${r.released ? ' (' + r.released.slice(0, 4) + ')' : ''}</option>`).join('')
+          : '<option value="">No results</option>';
+        confirmBtn.hidden = false;
+      } catch (e) {
+        select.innerHTML = `<option value="">${escapeHtml(String(e))}</option>`;
+      }
+    });
+  });
+
+  list.querySelectorAll('.newgame-search-confirm').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const item = btn.closest('[data-appid]');
+      const panel = item.querySelector('.newgame-create-panel');
+      const select = panel.querySelector('.newgame-search-results');
+      const status = item.querySelector('.pending-status');
+      const igdbTitle = select.value;
+      if (!igdbTitle) return;
+      btn.disabled = true;
+      status.textContent = 'Creating…';
+      status.style.color = '';
+      try {
+        await invoke('resolve_pending_game_as_new', { appid: item.dataset.appid, igdbTitle });
+        item.remove();
+        invoke('refresh_tray_menu').catch(() => {});
+        removeCardIfEmpty();
+      } catch (err) {
+        btn.disabled = false;
+        status.textContent = String(err);
+        status.style.color = 'red';
+      }
+    });
+  });
+}
+
 function loadVersion() {
   window.__TAURI__.app.getVersion().then((v) => {
     document.querySelectorAll('.app-version').forEach((el) => {
@@ -233,6 +518,29 @@ function renderMappingsTable() {
   refreshMappingsState();
 }
 
+async function loadWatchedDirectories() {
+  const list = $('watchedDirsList');
+  if (!list) return;
+  const dirs = await invoke('get_watched_directories').catch(() => []);
+  if (!dirs || !dirs.length) {
+    list.innerHTML = '<p class="muted watched-dirs-empty">No folders added yet.</p>';
+    return;
+  }
+  list.innerHTML = dirs.map((d) => `
+    <div class="watched-dir-item" data-path="${escapeAttr(d.path)}">
+      <span class="watched-dir-path">${escapeHtml(d.path)}</span>
+      <button type="button" class="watched-dir-remove">Remove</button>
+    </div>
+  `).join('');
+  list.querySelectorAll('.watched-dir-remove').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const item = btn.closest('[data-path]');
+      await invoke('remove_watched_directory', { path: item.dataset.path }).catch(() => {});
+      loadWatchedDirectories();
+    });
+  });
+}
+
 async function loadMappingsView() {
   const errEl = $('mappingsError');
   const tableWrap = $('mappingsTableWrap');
@@ -252,6 +560,8 @@ async function loadMappingsView() {
     if (asSessionEl) asSessionEl.checked = !!mc.auto_submit_session;
     const shareNowEl = $('shareNowPlaying');
     if (shareNowEl) shareNowEl.checked = !!mc.share_now_playing;
+    const detectUnmappedEl = $('detectUnmappedGames');
+    if (detectUnmappedEl) detectUnmappedEl.checked = !mc.disable_unmapped_game_detection;
   }).catch(() => {});
   // Pending notice — runs independently so it always shows even if game data fetch fails
   invoke('get_pending_sessions').catch(() => []).then((pendingSessions) => {
@@ -266,6 +576,21 @@ async function loadMappingsView() {
     } else {
       mNotice.style.color = '';
       mNotice.innerHTML = '&#10003; No pending submissions';
+    }
+  });
+  // New games notice — same pattern, independent of the game data fetch below
+  invoke('get_pending_game_submissions').catch(() => []).then((newGames) => {
+    const nNotice = $('mappingsNewGamesNotice');
+    if (!nNotice) return;
+    nNotice.hidden = false;
+    if (newGames && newGames.length) {
+      nNotice.style.color = 'darkorange';
+      nNotice.innerHTML = `&#9888; ${newGames.length} game${newGames.length > 1 ? 's' : ''} detected that ${newGames.length > 1 ? "aren't" : "isn't"} in FrogLog yet. <a href="#" id="mappingsNewGamesLink">View</a>`;
+      const link = $('mappingsNewGamesLink');
+      if (link) link.addEventListener('click', (e) => { e.preventDefault(); showView('newGamesView'); loadNewGamesView(); });
+    } else {
+      nNotice.style.color = '';
+      nNotice.innerHTML = '&#10003; No games detected outside FrogLog';
     }
   });
   try {
@@ -310,6 +635,8 @@ async function loadMappingsView() {
       shareNowEl.checked = !!mapConfigAfter.share_now_playing;
       console.log('[LilyPad] share_now_playing loaded as:', shareNowEl.checked);
     }
+    const detectUnmappedEl = $('detectUnmappedGames');
+    if (detectUnmappedEl) detectUnmappedEl.checked = !mapConfigAfter.disable_unmapped_game_detection;
     tableWrap.hidden = false;
     renderMappingsTable();
   } catch (e) {
@@ -648,6 +975,12 @@ listen('show-pending', () => {
   loadPendingView();
 });
 
+// Tray "New Games" (or the "Session Recorded" notification button) opens the New Games view
+listen('show-new-games', () => {
+  showView('newGamesView');
+  loadNewGamesView();
+});
+
 
 // Tray "Logout" (or after logout) show login view
 listen('show-login', () => {
@@ -690,28 +1023,33 @@ app.innerHTML = `
       <span class="app-version"></span>
     </div>
     <p id="pendingNotice" class="pending-notice" hidden></p>
-    <p>A lightweight system tray companion for <a href="#" class="ext-link" data-url="https://froglog.co.uk/">FrogLog</a>, the personal game tracking app. LilyPad watches for game processes in the background and prompts you to log a session when you stop playing.</p>
+    <p>A lightweight system tray companion for <a href="#" class="ext-link" data-url="https://froglog.co.uk/">FrogLog</a>, the personal game tracking app. LilyPad watches for game processes in the background and prompts you to log a session when you stop playing, including automatically noticing games you haven't linked yet.</p>
     <hr />
     <p class="muted about-steps-heading"><strong>Getting started</strong></p>
     <ol class="about-steps muted">
-      <li>Right-click the tray icon and choose <strong>Configure…</strong> to link each game's <code>.exe</code> to its FrogLog entry.</li>
-      <li>Launch your game as normal — LilyPad will detect it automatically.</li>
-      <li>When you close the game, this window will appear so you can submit the session.</li>
+      <li>Right-click the tray icon and choose <strong>Configure…</strong> to link a game's <code>.exe</code> to its FrogLog entry, or add folders of non-Steam games for LilyPad to watch.</li>
+      <li>Launch your game as normal. Linked games are tracked automatically, and LilyPad also detects Steam or watched-folder games you haven't linked yet.</li>
+      <li>When you close a linked game, this window (or a notification) appears so you can submit the session. For a newly detected game, resolve it under <strong>New Games</strong> in Configure.</li>
     </ol>
   </div>
   <div data-view id="mappingsView" hidden>
     <div class="mappings-scrollable">
       <div class="page-header"><h2>Configuration</h2><span class="app-version"></span></div>
       <p id="mappingsPendingNotice" class="pending-notice" hidden></p>
+      <p id="mappingsNewGamesNotice" class="pending-notice" hidden></p>
       <p class="muted">Type the executable name (e.g. <code>game.exe</code>) in the exe column. Once a session ends, LilyPad will prompt you to log the session.</p>
       <label class="mappings-auto-submit-label"><input type="checkbox" id="mappingsAutoSubmitRegular" /> Auto-submit regular game sessions</label>
       <label class="mappings-auto-submit-label"><input type="checkbox" id="mappingsAutoSubmitSession" /> Auto-submit session-tracked game sessions</label>
       <label class="mappings-auto-submit-label"><input type="checkbox" id="mappingsAutoSubmitLive" /> Auto-submit live service sessions</label>
       <label class="mappings-auto-submit-label"><input type="checkbox" id="shareNowPlaying" /> Enable online presence on FrogLog</label>
-      <div class="mappings-switch">
-        <button type="button" id="mappingsSwitchGames" class="active">Games</button>
-        <button type="button" id="mappingsSwitchSession">Session tracked</button>
-        <button type="button" id="mappingsSwitchLive">Live service</button>
+      <label class="mappings-auto-submit-label"><input type="checkbox" id="detectUnmappedGames" /> Detect games not in your FrogLog library</label>
+      <div class="mappings-switch-row">
+        <div class="mappings-switch">
+          <button type="button" id="mappingsSwitchGames" class="active">Games</button>
+          <button type="button" id="mappingsSwitchSession">Session tracked</button>
+          <button type="button" id="mappingsSwitchLive">Live service</button>
+        </div>
+        <button type="button" id="mappingsOpenWatchedDirs" class="mappings-watched-dirs-btn">Non-Steam Games…</button>
       </div>
       <div class="mappings-search-wrap"><input type="search" id="mappingsSearch" class="mappings-search" placeholder="Search…" /></div>
       <p id="mappingsError" class="error"></p>
@@ -758,6 +1096,23 @@ app.innerHTML = `
       <button type="button" id="pendingBack">Back</button>
     </div>
   </div>
+  <div data-view id="newGamesView" hidden>
+    <div class="page-header"><h2>New Games</h2><span class="app-version"></span></div>
+    <p class="muted">LilyPad noticed you playing these but they're not in your FrogLog library yet. Create a new entry for one, or log the hours against a game you already have.</p>
+    <div id="newGamesList" class="pending-list"></div>
+    <div class="mappings-footer">
+      <button type="button" id="newGamesBack">Back</button>
+    </div>
+  </div>
+  <div data-view id="watchedDirsView" hidden>
+    <div class="page-header"><h2>Non-Steam Games</h2><span class="app-version"></span></div>
+    <p class="muted">LilyPad scans these folders for games (each subfolder counts as one game) and adds new ones to New Games.</p>
+    <div id="watchedDirsList" class="watched-dirs-list"></div>
+    <button type="button" id="watchedDirsAdd">Add Folder…</button>
+    <div class="mappings-footer">
+      <button type="button" id="watchedDirsBack">Back</button>
+    </div>
+  </div>
 `;
 
 document.addEventListener('click', (e) => {
@@ -787,9 +1142,30 @@ function saveShareNowPlaying() {
     console.error('[LilyPad] save_now_playing_share error:', err);
   });
 }
+function saveUnmappedDetection() {
+  const enabled = !!$('detectUnmappedGames').checked;
+  invoke('save_unmapped_detection', { disabled: !enabled }).catch((err) => {
+    console.error('[LilyPad] save_unmapped_detection error:', err);
+  });
+}
 $('mappingsAutoSubmitRegular').addEventListener('change', saveAutoSubmit);
 $('mappingsAutoSubmitLive').addEventListener('change', saveAutoSubmit);
 $('mappingsAutoSubmitSession').addEventListener('change', saveAutoSubmit);
 $('shareNowPlaying').addEventListener('change', saveShareNowPlaying);
+$('detectUnmappedGames').addEventListener('change', saveUnmappedDetection);
+$('watchedDirsAdd').addEventListener('click', async () => {
+  const path = await invoke('pick_directory').catch(() => null);
+  if (!path) return;
+  await invoke('add_watched_directory', { path }).catch((err) => {
+    console.error('[LilyPad] add_watched_directory error:', err);
+  });
+  loadWatchedDirectories();
+});
 $('pendingBack').addEventListener('click', () => { showView('mainView'); loadMainView(); });
+$('newGamesBack').addEventListener('click', () => { showView('mappingsView'); loadMappingsView(); });
+$('mappingsOpenWatchedDirs').addEventListener('click', () => {
+  showView('watchedDirsView');
+  loadWatchedDirectories();
+});
+$('watchedDirsBack').addEventListener('click', () => { showView('mappingsView'); loadMappingsView(); });
 init();

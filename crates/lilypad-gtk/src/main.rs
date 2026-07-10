@@ -4,6 +4,7 @@ mod mappings_model;
 mod monitor_glue;
 mod notify;
 mod persistence;
+mod resolve;
 mod session_flow;
 mod state;
 mod tray;

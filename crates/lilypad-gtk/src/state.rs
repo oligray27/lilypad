@@ -1,5 +1,7 @@
 use lilypad_core::config::{AuthConfig, ProcessMapConfig};
+use lilypad_core::library_match::LibraryIndex;
 use lilypad_core::monitor::ActiveSession;
+use lilypad_core::steam::InstalledGame;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
 
@@ -15,6 +17,11 @@ pub struct AppState {
     pub current_session: Arc<RwLock<Option<ActiveSession>>>,
     pub force_stopped_process: Arc<RwLock<Option<String>>>,
     pub shutdown: Arc<AtomicBool>,
+    /// Installed games — Steam (manifest scan) + non-Steam (watched directories) — refreshed
+    /// periodically in the background.
+    pub installed_games: Arc<RwLock<Vec<InstalledGame>>>,
+    /// Titles/appids already in the user's FrogLog library, refreshed periodically in the background.
+    pub library_index: Arc<RwLock<LibraryIndex>>,
 }
 
 impl AppState {
@@ -25,6 +32,8 @@ impl AppState {
             current_session: Arc::new(RwLock::new(None)),
             force_stopped_process: Arc::new(RwLock::new(None)),
             shutdown: Arc::new(AtomicBool::new(false)),
+            installed_games: Arc::new(RwLock::new(Vec::new())),
+            library_index: Arc::new(RwLock::new(LibraryIndex::default())),
         }
     }
 
@@ -38,5 +47,26 @@ impl AppState {
             .unwrap()
             .as_ref()
             .map(|s| s.mapping.title.clone().unwrap_or_else(|| s.process_name.clone()))
+    }
+
+    /// Re-scans Steam's installed games and every configured watched directory, replacing
+    /// `installed_games` in one go. Called both by the periodic background refresh in
+    /// `app.rs` and immediately after adding/removing a watched directory (Non-Steam Games
+    /// view), so a newly added folder is picked up right away instead of waiting for the
+    /// next scheduled scan — mirrors the Tauri build's `refresh_installed_games`.
+    pub fn refresh_installed_games(&self) {
+        let mut games = lilypad_core::steam::find_steam_root()
+            .map(|root| lilypad_core::steam::scan_installed_games(&root))
+            .unwrap_or_default();
+        let watched_dirs: Vec<String> = self
+            .process_map
+            .read()
+            .unwrap()
+            .watched_directories
+            .iter()
+            .map(|w| w.path.clone())
+            .collect();
+        games.extend(lilypad_core::local_games::scan_watched_directories(&watched_dirs));
+        *self.installed_games.write().unwrap() = games;
     }
 }

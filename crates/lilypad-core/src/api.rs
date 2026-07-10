@@ -38,6 +38,19 @@ pub struct Game {
     pub status: Option<String>,
     pub forklift_certified: Option<bool>,
     pub session_tracking: Option<bool>,
+    /// Steam appid, when this game was added via Steam sync or otherwise linked to a Steam
+    /// store page. Arrives as a JSON number or numeric string depending on the pg column path.
+    pub steam_app_id: Option<serde_json::Value>,
+}
+
+/// Lighter "want to play" entry — same identity fields as `Game`, used to check whether a
+/// detected game is already on the user's Up Next / wishlist rather than fully tracked.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct WishlistItem {
+    pub id: i32,
+    pub title: Option<String>,
+    pub steam_app_id: Option<serde_json::Value>,
 }
 
 // Backend returns snake_case. total_hours is SUM(DECIMAL) → string; session_count is COUNT() → bigint string.
@@ -48,6 +61,7 @@ pub struct LiveServiceGame {
     pub total_hours: Option<serde_json::Value>,
     pub session_count: Option<serde_json::Value>,
     pub last_session_date: Option<String>,
+    pub steam_app_id: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -57,6 +71,10 @@ pub struct AddSessionBody {
     pub notes: Option<String>,
     pub spoiler: bool,
     pub is_public: bool,
+    /// Opaque source identifier (e.g. "lilypad-mobile:{system}|{path}") a syncing
+    /// client can stamp on a session to recognize it again later, without
+    /// polluting the user-visible `notes` field. Unused by desktop LilyPad.
+    pub sync_ref: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -180,6 +198,23 @@ impl FroglogClient {
         res.json().map_err(|e: reqwest::Error| e.to_string())
     }
 
+    pub fn get_wishlist(&self) -> Result<Vec<WishlistItem>, String> {
+        let res = self
+            .client
+            .get(self.url("/wishlist"))
+            .headers(self.headers())
+            .send()
+            .map_err(|e: reqwest::Error| e.to_string())?;
+        if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err("Unauthorized".to_string());
+        }
+        if !res.status().is_success() {
+            let err: serde_json::Value = res.json().unwrap_or_default();
+            return Err(err["error"].as_str().unwrap_or("Request failed").to_string());
+        }
+        res.json().map_err(|e: reqwest::Error| e.to_string())
+    }
+
     pub fn add_game_session(
         &self,
         game_id: i32,
@@ -188,8 +223,9 @@ impl FroglogClient {
         notes: Option<String>,
         spoiler: bool,
         is_public: bool,
+        sync_ref: Option<String>,
     ) -> Result<serde_json::Value, String> {
-        let body = AddSessionBody { date, hours, notes, spoiler, is_public };
+        let body = AddSessionBody { date, hours, notes, spoiler, is_public, sync_ref };
         let res = self
             .client
             .post(self.url(&format!("/games/{}/sessions", game_id)))
@@ -215,8 +251,9 @@ impl FroglogClient {
         notes: Option<String>,
         spoiler: bool,
         is_public: bool,
+        sync_ref: Option<String>,
     ) -> Result<serde_json::Value, String> {
-        let body = AddSessionBody { date, hours, notes, spoiler, is_public };
+        let body = AddSessionBody { date, hours, notes, spoiler, is_public, sync_ref };
         let res = self
             .client
             .post(self.url(&format!("/live-service/{}/sessions", game_id)))
@@ -234,41 +271,34 @@ impl FroglogClient {
         res.json().map_err(|e: reqwest::Error| e.to_string())
     }
 
-    /// Update a regular game's hours via PUT /games/{id} with body (snake_case).
-    /// Builds payload from existing game so backend receives exactly the fields it expects.
-    pub fn update_game_hours(&self, game_id: i32, add_hours: f64) -> Result<serde_json::Value, String> {
+    /// Fetch a single game (raw JSON) from GET /games by id.
+    pub fn get_game_raw(&self, game_id: i32) -> Result<serde_json::Value, String> {
         let games = self.get_games_raw()?;
-        let existing = games
+        games
             .into_iter()
             .find(|v| v.get("id").and_then(|i| i.as_i64()) == Some(game_id as i64))
-            .ok_or("Game not found")?;
-        let obj = existing.as_object().ok_or("Game object expected")?;
-        let num_from = |v: &serde_json::Value| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok()));
-        let current = obj
+            .ok_or_else(|| "Game not found".to_string())
+    }
+
+    /// Parse a numeric field that pg may serialize as a JSON string (DECIMAL columns).
+    pub fn num_from_value(v: &serde_json::Value) -> Option<f64> {
+        v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+    }
+
+    /// Add hours to a regular game (read current total, PUT current + add_hours).
+    pub fn update_game_hours(&self, game_id: i32, add_hours: f64) -> Result<serde_json::Value, String> {
+        let existing = self.get_game_raw(game_id)?;
+        let current = existing
             .get("hours_played")
-            .or_else(|| obj.get("hoursPlayed"))
-            .and_then(num_from)
+            .and_then(Self::num_from_value)
             .unwrap_or(0.0);
-        let new_hours = ((current + add_hours) * 100.0).round() / 100.0;
-        let new_hours = if new_hours < 0.01 { 0.01 } else { new_hours };
-        // Backend PUT expects these keys (snake_case). Send only these to avoid type/serialization issues.
-        let payload = serde_json::json!({
-            "title": obj.get("title").unwrap_or(&serde_json::Value::Null),
-            "description": obj.get("description").unwrap_or(&serde_json::Value::Null),
-            "img": obj.get("img").unwrap_or(&serde_json::Value::Null),
-            "platform": obj.get("platform").unwrap_or(&serde_json::Value::Null),
-            "genre": obj.get("genre").unwrap_or(&serde_json::Value::Null),
-            "dev": obj.get("dev").unwrap_or(&serde_json::Value::Null),
-            "studio_country": obj.get("studio_country").unwrap_or(&serde_json::Value::Null),
-            "hours_played": new_hours,
-            "start_date": obj.get("start_date").unwrap_or(&serde_json::Value::Null),
-            "end_date": obj.get("end_date").unwrap_or(&serde_json::Value::Null),
-            "rating": obj.get("rating").unwrap_or(&serde_json::Value::Null),
-            "dnf": obj.get("dnf").and_then(|v| v.as_bool()).unwrap_or(false),
-            "is_public": obj.get("is_public").and_then(|v| v.as_bool()).unwrap_or(true),
-            "rel_date": obj.get("rel_date").unwrap_or(&serde_json::Value::Null),
-            "forklift_certified": obj.get("forklift_certified").and_then(|v| v.as_bool()).unwrap_or(false),
-        });
+        self.set_game_hours_total(game_id, current + add_hours)
+    }
+
+    /// PUT /games/{id} with a full games-object payload. Shared by every path that
+    /// needs to echo GET's object back (set_game_hours_total, enable_session_tracking)
+    /// so the backend's full-overwrite UPDATE never silently drops fields.
+    fn put_game(&self, game_id: i32, payload: serde_json::Value) -> Result<serde_json::Value, String> {
         let res = self
             .client
             .put(self.url(&format!("/games/{}", game_id)))
@@ -294,6 +324,151 @@ impl FroglogClient {
             return Ok(serde_json::json!({}));
         }
         Ok(serde_json::from_str(&body).unwrap_or(serde_json::json!({})))
+    }
+
+    /// Fetch a game and strip the GET-only aggregate fields, ready to be re-sent on a PUT.
+    fn game_payload_base(&self, game_id: i32) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+        let existing = self.get_game_raw(game_id)?;
+        let mut obj = existing.as_object().cloned().ok_or("Game object expected")?;
+        // Aggregates from the GET's session JOIN — not games columns, don't send them back.
+        for k in ["total_hours", "session_count", "last_session_date"] {
+            obj.remove(k);
+        }
+        obj.remove("initial_session_hours");
+        Ok(obj)
+    }
+
+    /// Set a regular game's absolute hours_played total via PUT /games/{id}.
+    /// Echoes back every field from GET so the backend's full-overwrite UPDATE preserves
+    /// metadata (steam_app_id, igdb_slug, status_override, ...) and session_tracking —
+    /// a PUT with session_tracking falsy deletes the game's sessions server-side.
+    pub fn set_game_hours_total(&self, game_id: i32, new_total_hours: f64) -> Result<serde_json::Value, String> {
+        let mut obj = self.game_payload_base(game_id)?;
+        let new_hours = (new_total_hours * 100.0).round() / 100.0;
+        let new_hours = if new_hours < 0.01 { 0.01 } else { new_hours };
+        obj.insert("hours_played".to_string(), serde_json::json!(new_hours));
+        self.put_game(game_id, serde_json::Value::Object(obj))
+    }
+
+    /// Turn on session_tracking for a game via PUT /games/{id}, leaving hours_played
+    /// untouched. When `initial_session_hours` is given, the backend seeds a one-off
+    /// "Pre-tracked hours" session so the game's session-aggregate total doesn't
+    /// visibly drop to zero the moment session tracking is enabled.
+    pub fn enable_session_tracking(
+        &self,
+        game_id: i32,
+        initial_session_hours: Option<f64>,
+    ) -> Result<serde_json::Value, String> {
+        let mut obj = self.game_payload_base(game_id)?;
+        obj.insert("session_tracking".to_string(), serde_json::json!(true));
+        if let Some(h) = initial_session_hours {
+            if h > 0.0 {
+                obj.insert("initial_session_hours".to_string(), serde_json::json!(h));
+            }
+        }
+        self.put_game(game_id, serde_json::Value::Object(obj))
+    }
+
+    /// GET /games/{id}/sessions — raw session rows (id, date, hours, notes, ...).
+    pub fn get_game_sessions(&self, game_id: i32) -> Result<Vec<serde_json::Value>, String> {
+        let res = self
+            .client
+            .get(self.url(&format!("/games/{}/sessions", game_id)))
+            .headers(self.headers())
+            .send()
+            .map_err(|e: reqwest::Error| e.to_string())?;
+        if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err("Unauthorized".to_string());
+        }
+        if !res.status().is_success() {
+            let err: serde_json::Value = res.json().unwrap_or_default();
+            return Err(err["error"].as_str().unwrap_or("Request failed").to_string());
+        }
+        res.json().map_err(|e: reqwest::Error| e.to_string())
+    }
+
+    /// GET /live-service/{id}/sessions — raw session rows.
+    pub fn get_live_service_sessions(&self, game_id: i32) -> Result<Vec<serde_json::Value>, String> {
+        let res = self
+            .client
+            .get(self.url(&format!("/live-service/{}/sessions", game_id)))
+            .headers(self.headers())
+            .send()
+            .map_err(|e: reqwest::Error| e.to_string())?;
+        if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err("Unauthorized".to_string());
+        }
+        if !res.status().is_success() {
+            let err: serde_json::Value = res.json().unwrap_or_default();
+            return Err(err["error"].as_str().unwrap_or("Request failed").to_string());
+        }
+        res.json().map_err(|e: reqwest::Error| e.to_string())
+    }
+
+    /// GET /search/fetch?title= — IGDB-enriched details for a single title.
+    /// Returns Err("not_found") when IGDB has no match (backend 404).
+    pub fn fetch_game_details(&self, title: &str) -> Result<serde_json::Value, String> {
+        let res = self
+            .client
+            .get(self.url("/search/fetch"))
+            .query(&[("title", title)])
+            .headers(self.headers())
+            .send()
+            .map_err(|e: reqwest::Error| e.to_string())?;
+        if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err("Unauthorized".to_string());
+        }
+        if res.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err("not_found".to_string());
+        }
+        if !res.status().is_success() {
+            let err: serde_json::Value = res.json().unwrap_or_default();
+            return Err(err["error"].as_str().unwrap_or("Request failed").to_string());
+        }
+        res.json().map_err(|e: reqwest::Error| e.to_string())
+    }
+
+    /// GET /search?q= — multi-result IGDB search (title, cover_image, released, etc.). Each
+    /// result's `name` field can be passed to `fetch_game_details` to get the richer,
+    /// create-ready object for that specific title.
+    pub fn search_igdb(&self, query: &str) -> Result<Vec<serde_json::Value>, String> {
+        let res = self
+            .client
+            .get(self.url("/search"))
+            .query(&[("q", query)])
+            .headers(self.headers())
+            .send()
+            .map_err(|e: reqwest::Error| e.to_string())?;
+        if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err("Unauthorized".to_string());
+        }
+        if !res.status().is_success() {
+            let err: serde_json::Value = res.json().unwrap_or_default();
+            return Err(err["error"].as_str().unwrap_or("Request failed").to_string());
+        }
+        res.json().map_err(|e: reqwest::Error| e.to_string())
+    }
+
+    /// POST /games — create a game; returns the created row (includes id).
+    pub fn create_game(&self, payload: serde_json::Value) -> Result<serde_json::Value, String> {
+        let res = self
+            .client
+            .post(self.url("/games"))
+            .headers(self.headers())
+            .json(&payload)
+            .send()
+            .map_err(|e: reqwest::Error| e.to_string())?;
+        if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err("Unauthorized".to_string());
+        }
+        if res.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err("Rate limited: too many games created this hour".to_string());
+        }
+        if !res.status().is_success() {
+            let err: serde_json::Value = res.json().unwrap_or_default();
+            return Err(err["error"].as_str().unwrap_or("Request failed").to_string());
+        }
+        res.json().map_err(|e: reqwest::Error| e.to_string())
     }
 
     pub fn set_now_playing(

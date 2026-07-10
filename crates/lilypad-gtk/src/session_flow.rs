@@ -21,6 +21,7 @@ pub struct SessionEndedData {
 
 pub enum AppAction {
     ShowSessionPopup(SessionEndedData),
+    GoToNewGames,
 }
 
 /// Hours for FrogLog: 2 decimal places, minimum 0.01 (matches the Tauri build).
@@ -43,7 +44,7 @@ pub fn format_duration(duration_secs: f64) -> String {
     }
 }
 
-fn client_for(auth: &AuthConfig) -> FroglogClient {
+pub(crate) fn client_for(auth: &AuthConfig) -> FroglogClient {
     let base = auth
         .base_url
         .clone()

@@ -1,12 +1,169 @@
 //! Process monitor: WMI event-based start detection (Windows), poll-based fallback.
 
 use crate::config::{ProcessMapConfig, ProcessMapping};
+use crate::library_match::LibraryIndex;
+use crate::steam::{find_installed_game_for_exe, InstalledGame};
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, ProcessesToUpdate, System};
+
+/// Filters out companion processes that live inside a game's own install directory but aren't
+/// the game itself — crash reporters, anti-cheat services, prerequisite installers. These would
+/// otherwise be misattributed as "the game" by install-dir matching (`find_installed_game_for_exe`
+/// only checks the folder, not which specific binary in it), and since they can start or exit
+/// independently of (and sometimes outlive) the real game process, treating them as a session
+/// causes duplicate/garbage session records and can even overwrite a correct auto-created
+/// `ProcessMapping` with the helper's own exe name. Not exhaustive — a cooldown (see
+/// `POST_SESSION_COOLDOWN` usage in `maybe_start_unmapped_tracking`) is the general-purpose
+/// backstop for helpers not on this list.
+fn is_known_helper_process(exe_name: &str) -> bool {
+    const HELPER_EXE_NAMES: &[&str] = &[
+        "unitycrashhandler64.exe",
+        "unitycrashhandler32.exe",
+        "crashpad_handler.exe",
+        "crashreporter.exe",
+        "easyanticheat.exe",
+        "easyanticheat_launcher.exe",
+        "easyanticheat_eos_setup.exe",
+        "battleye.exe",
+        "beservice.exe",
+        "beservice_x64.exe",
+        "vc_redist.x64.exe",
+        "vc_redist.x86.exe",
+        "dxsetup.exe",
+        "dxwebsetup.exe",
+        "ue4prereqsetup_x64.exe",
+        "ue5prereqsetup_x64.exe",
+        "directx_setup.exe",
+    ];
+    HELPER_EXE_NAMES.contains(&exe_name.to_lowercase().as_str())
+}
+
+/// Blocks until the given PID exits, then fires `on_unmapped_session_ended(title, appid,
+/// exe_name, duration_secs)`, releases the appid from `currently_tracking` so a later relaunch
+/// of the same game starts a fresh tracked session, and records the appid's end time in
+/// `last_ended_unmapped` so a trailing companion process (e.g. a crash reporter that outlives
+/// the game briefly) doesn't get misattributed as a second session. Mirrors `run_wait_thread`'s
+/// exit-detection logic, but for an unmapped (no `ProcessMapping`) installed game rather than
+/// a tracked one.
+#[allow(clippy::too_many_arguments)]
+fn run_unmapped_wait_thread(
+    pid: Pid,
+    title: String,
+    appid: String,
+    exe_name: String,
+    started_at: Instant,
+    currently_tracking: Arc<RwLock<HashSet<String>>>,
+    last_ended_unmapped: Arc<RwLock<HashMap<String, Instant>>>,
+    on_unmapped_session_ended: Arc<dyn Fn(String, String, String, f64) + Send + Sync>,
+) {
+    std::thread::spawn(move || {
+        let mut system = System::new_all();
+        let wait_start = Instant::now();
+        const DISCOVER_TIMEOUT: Duration = Duration::from_secs(5);
+
+        loop {
+            system.refresh_processes(ProcessesToUpdate::All);
+            if let Some(process) = system.process(pid) {
+                process.wait();
+                break;
+            }
+            if wait_start.elapsed() > DISCOVER_TIMEOUT {
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        let duration_secs = started_at.elapsed().as_secs_f64();
+        currently_tracking.write().unwrap().remove(&appid);
+        last_ended_unmapped.write().unwrap().insert(appid.clone(), Instant::now());
+        on_unmapped_session_ended(title, appid, exe_name, duration_secs);
+    });
+}
+
+/// Handles a process that doesn't match any `ProcessMapping`, but does match an installed
+/// Steam game. Two outcomes:
+/// - The game is already in the FrogLog library under a known Steam appid (`resolve_by_appid`)
+///   but has no `ProcessMapping` yet (e.g. resolved from a "New Games" entry, or added to
+///   FrogLog directly on the website). `on_already_owned_game_needs_link` fires so the caller
+///   can persist the new mapping, and the mapping is also returned so the caller can start
+///   tracking *this* launch immediately — deferring to "the next poll tick / launch will pick
+///   it up" would silently drop the current session entirely on the WMI path, since a process-
+///   start event never refires just because a mapping appeared afterward.
+/// - Otherwise, starts a background wait-thread (see `run_unmapped_wait_thread`) so the full
+///   play session gets recorded once the game exits, guarded by `currently_tracking` so this is
+///   safe to call on every poll tick / WMI event without spawning duplicate wait-threads for a
+///   game that's still running.
+#[allow(clippy::too_many_arguments)]
+fn maybe_start_unmapped_tracking(
+    exe_path: Option<&Path>,
+    pid: Pid,
+    installed_games: &Arc<RwLock<Vec<InstalledGame>>>,
+    library_index: &Arc<RwLock<LibraryIndex>>,
+    currently_tracking: &Arc<RwLock<HashSet<String>>>,
+    last_ended_unmapped: &Arc<RwLock<HashMap<String, Instant>>>,
+    on_unmapped_session_ended: &Arc<dyn Fn(String, String, String, f64) + Send + Sync>,
+    on_already_owned_game_needs_link: &Arc<dyn Fn(ProcessMapping) + Send + Sync>,
+) -> Option<ProcessMapping> {
+    let exe_path = exe_path?;
+    let exe_name = exe_path.file_name().and_then(|n| n.to_str())?;
+    if is_known_helper_process(exe_name) {
+        return None;
+    }
+    let found = {
+        let games = installed_games.read().unwrap();
+        find_installed_game_for_exe(exe_path, &games).cloned()
+    };
+    let found = found?;
+
+    // A companion process not on the `is_known_helper_process` blocklist can still start or
+    // exit around the same time as the real game (e.g. right after it closes) and get
+    // misattributed as a new instance of the same appid. Skip it if we very recently finished
+    // (or auto-linked) a session for this exact appid.
+    {
+        let le = last_ended_unmapped.read().unwrap();
+        if let Some(last_time) = le.get(&found.appid) {
+            if last_time.elapsed() < POST_SESSION_COOLDOWN {
+                return None;
+            }
+        }
+    }
+
+    if let Some(resolved) = library_index.read().unwrap().resolve_by_appid(&found.appid) {
+        last_ended_unmapped.write().unwrap().insert(found.appid.clone(), Instant::now());
+        let mapping = ProcessMapping {
+            process: exe_name.to_string(),
+            r#type: resolved.game_type.clone(),
+            froglog_id: resolved.id,
+            title: Some(resolved.title.clone()),
+            title_filter: None,
+        };
+        on_already_owned_game_needs_link(mapping.clone());
+        return Some(mapping);
+    }
+    {
+        let mut tracking = currently_tracking.write().unwrap();
+        if tracking.contains(&found.appid) {
+            return None;
+        }
+        tracking.insert(found.appid.clone());
+    }
+    run_unmapped_wait_thread(
+        pid,
+        found.name,
+        found.appid,
+        exe_name.to_string(),
+        Instant::now(),
+        Arc::clone(currently_tracking),
+        Arc::clone(last_ended_unmapped),
+        Arc::clone(on_unmapped_session_ended),
+    );
+    None
+}
 
 /// Returns window titles belonging to the given PID (Windows only).
 /// Used to disambiguate processes that share an exe name (e.g. javaw.exe).
@@ -218,6 +375,7 @@ fn run_wait_thread(
 
 /// Attempt to start a WMI-based process start monitor.
 /// Returns true if WMI started successfully, false if it should fall back to polling.
+#[allow(clippy::too_many_arguments)]
 #[cfg(windows)]
 fn try_run_wmi_watch(
     config: Arc<RwLock<ProcessMapConfig>>,
@@ -227,6 +385,12 @@ fn try_run_wmi_watch(
     on_session_started: Arc<dyn Fn(String, ProcessMapping) + Send + Sync + 'static>,
     last_ended: Arc<RwLock<Option<(String, Instant)>>>,
     force_stopped_process: Arc<RwLock<Option<String>>>,
+    installed_games: Arc<RwLock<Vec<InstalledGame>>>,
+    library_index: Arc<RwLock<LibraryIndex>>,
+    currently_tracking_unmapped: Arc<RwLock<HashSet<String>>>,
+    last_ended_unmapped: Arc<RwLock<HashMap<String, Instant>>>,
+    on_unmapped_session_ended: Arc<dyn Fn(String, String, String, f64) + Send + Sync + 'static>,
+    on_already_owned_game_needs_link: Arc<dyn Fn(ProcessMapping) + Send + Sync + 'static>,
 ) -> bool {
     use serde::Deserialize;
     use wmi::{COMLibrary, WMIConnection};
@@ -270,15 +434,50 @@ fn try_run_wmi_watch(
             };
 
             // Collect all candidate mappings for this exe (may be multiple for javaw.exe etc.)
-            let candidates: Vec<ProcessMapping> = {
+            let (candidates, unmapped_detection_disabled): (Vec<ProcessMapping>, bool) = {
                 let cfg = config.read().unwrap();
-                cfg.find_all_by_process(&event.process_name)
-                    .into_iter()
-                    .cloned()
-                    .collect()
+                (
+                    cfg.find_all_by_process(&event.process_name).into_iter().cloned().collect(),
+                    cfg.disable_unmapped_game_detection,
+                )
             };
 
             if candidates.is_empty() {
+                if unmapped_detection_disabled {
+                    continue;
+                }
+                let pid = Pid::from(event.process_id as usize);
+                let exe_path = {
+                    let mut sys = System::new();
+                    sys.refresh_processes(ProcessesToUpdate::Some(&[pid]));
+                    sys.process(pid).and_then(|p| p.exe().map(|p| p.to_path_buf()))
+                };
+                if let Some(mapping) = maybe_start_unmapped_tracking(
+                    exe_path.as_deref(),
+                    pid,
+                    &installed_games,
+                    &library_index,
+                    &currently_tracking_unmapped,
+                    &last_ended_unmapped,
+                    &on_unmapped_session_ended,
+                    &on_already_owned_game_needs_link,
+                ) {
+                    // Already-owned game just got auto-linked — start tracking this exact
+                    // launch now rather than waiting for a later one, since this WMI process-
+                    // start event won't fire again for it.
+                    let mut cur = current_session.write().unwrap();
+                    if cur.is_none() {
+                        let started_at = Instant::now();
+                        *cur = Some(ActiveSession {
+                            process_name: event.process_name.clone(),
+                            mapping: mapping.clone(),
+                            started_at,
+                        });
+                        drop(cur);
+                        on_session_started(event.process_name.clone(), mapping.clone());
+                        run_wait_thread(pid, event.process_name.clone(), mapping, started_at, tx.clone());
+                    }
+                }
                 continue;
             }
 
@@ -389,6 +588,20 @@ fn try_run_wmi_watch(
 
 /// Run the monitor. On Windows, tries WMI event-based start detection first;
 /// falls back to polling if WMI is unavailable. Exit detection always uses process.wait().
+///
+/// `installed_games` and `library_index` are refreshed by the caller (Steam library scan +
+/// FrogLog games/wishlist fetch, respectively) and read live here, the same way `config` is.
+/// `on_unmapped_session_ended(title, appid, exe_name, duration_secs)` fires once per full play
+/// session (launch to close) of a process that doesn't match any `ProcessMapping` but does
+/// match an installed Steam game that isn't already in the user's FrogLog library — the whole
+/// session's duration is tracked in the background the same way a mapped session would be, so
+/// the caller finds out (and can notify) only once the game has actually closed.
+/// `on_already_owned_game_needs_link(mapping)` fires instead when the installed game turns out
+/// to already be in the library (by exact Steam appid) but just has no `ProcessMapping` yet —
+/// the caller should persist it. The *current* launch is tracked immediately using that same
+/// mapping (via the normal `on_session_started`/`on_session_ended` callbacks) rather than
+/// waiting for a later one, since e.g. a WMI process-start event never refires on its own.
+#[allow(clippy::too_many_arguments)]
 pub fn run_poll_loop(
     config: Arc<RwLock<ProcessMapConfig>>,
     current_session: Arc<RwLock<Option<ActiveSession>>>,
@@ -397,6 +610,10 @@ pub fn run_poll_loop(
     poll_interval_secs: u64,
     on_session_started: impl Fn(String, ProcessMapping) + Send + Sync + 'static,
     mut on_session_ended: impl FnMut(String, ProcessMapping, f64) + Send + 'static,
+    installed_games: Arc<RwLock<Vec<InstalledGame>>>,
+    library_index: Arc<RwLock<LibraryIndex>>,
+    on_unmapped_session_ended: impl Fn(String, String, String, f64) + Send + Sync + 'static,
+    on_already_owned_game_needs_link: impl Fn(ProcessMapping) + Send + Sync + 'static,
 ) {
     let (tx, rx) = mpsc::channel::<(String, ProcessMapping, f64)>();
 
@@ -404,9 +621,23 @@ pub fn run_poll_loop(
     let last_ended: Arc<RwLock<Option<(String, Instant)>>> =
         Arc::new(RwLock::new(None));
 
+    // Appids currently being tracked as an active unmapped session, so a still-running game
+    // doesn't spawn a second wait-thread on every poll tick / WMI event. Cleared as soon as
+    // that game's session ends, so relaunching it later starts a fresh tracked session.
+    let currently_tracking_unmapped: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
+
+    // When an unmapped/already-owned appid's session most recently ended (or was auto-linked),
+    // so a companion process (e.g. a crash reporter that outlives the real game briefly) isn't
+    // misattributed as a second session of the same appid within POST_SESSION_COOLDOWN.
+    let last_ended_unmapped: Arc<RwLock<HashMap<String, Instant>>> = Arc::new(RwLock::new(HashMap::new()));
+
     // Wrap in Arc so it can be shared between WMI path and polling fallback.
     let on_started: Arc<dyn Fn(String, ProcessMapping) + Send + Sync + 'static> =
         Arc::new(on_session_started);
+    let on_unmapped_ended: Arc<dyn Fn(String, String, String, f64) + Send + Sync + 'static> =
+        Arc::new(on_unmapped_session_ended);
+    let on_already_owned: Arc<dyn Fn(ProcessMapping) + Send + Sync + 'static> =
+        Arc::new(on_already_owned_game_needs_link);
 
     #[cfg(windows)]
     let wmi_ok = try_run_wmi_watch(
@@ -417,6 +648,12 @@ pub fn run_poll_loop(
         Arc::clone(&on_started),
         Arc::clone(&last_ended),
         Arc::clone(&force_stopped_process),
+        Arc::clone(&installed_games),
+        Arc::clone(&library_index),
+        Arc::clone(&currently_tracking_unmapped),
+        Arc::clone(&last_ended_unmapped),
+        Arc::clone(&on_unmapped_ended),
+        Arc::clone(&on_already_owned),
     );
 
     #[cfg(not(windows))]
@@ -430,12 +667,22 @@ pub fn run_poll_loop(
         let tx = tx.clone();
         let last_ended_poll = Arc::clone(&last_ended);
         let force_stopped_poll = Arc::clone(&force_stopped_process);
+        let installed_games_poll = Arc::clone(&installed_games);
+        let library_index_poll = Arc::clone(&library_index);
+        let currently_tracking_unmapped_poll = Arc::clone(&currently_tracking_unmapped);
+        let last_ended_unmapped_poll = Arc::clone(&last_ended_unmapped);
+        let on_unmapped_ended_poll = Arc::clone(&on_unmapped_ended);
+        let on_already_owned_poll = Arc::clone(&on_already_owned);
 
         std::thread::spawn(move || {
             let mut system = System::new_all();
             while !shutdown.load(Ordering::SeqCst) {
                 let session_started = {
-                    let cfg = config.read().unwrap();
+                    // Cloned rather than held as a live read guard: the unmapped-detection path
+                    // below can synchronously call back into code that write-locks this same
+                    // `config` Arc (e.g. auto-linking an already-owned game's exe) — holding a
+                    // read guard across that call would deadlock the thread against itself.
+                    let cfg = config.read().unwrap().clone();
                     let mut cur = current_session.write().unwrap();
                     if cur.is_some() {
                         None
@@ -470,6 +717,29 @@ pub fn run_poll_loop(
                                 }
                             };
                             if candidates.is_empty() {
+                                if !cfg.disable_unmapped_game_detection {
+                                    if let Some(mapping) = maybe_start_unmapped_tracking(
+                                        p.exe(),
+                                        *pid,
+                                        &installed_games_poll,
+                                        &library_index_poll,
+                                        &currently_tracking_unmapped_poll,
+                                        &last_ended_unmapped_poll,
+                                        &on_unmapped_ended_poll,
+                                        &on_already_owned_poll,
+                                    ) {
+                                        // Already-owned game just got auto-linked — track this
+                                        // launch now via the normal path below instead of
+                                        // waiting for the next poll tick to notice the mapping.
+                                        *cur = Some(ActiveSession {
+                                            process_name: name.clone(),
+                                            mapping: mapping.clone(),
+                                            started_at: Instant::now(),
+                                        });
+                                        found = Some((*pid, name, mapping));
+                                        break 'proc_scan;
+                                    }
+                                }
                                 continue 'proc_scan;
                             }
                             // Skip if this process is in its post-session cooldown window.
@@ -555,4 +825,18 @@ pub fn run_poll_loop(
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filters_known_helper_processes() {
+        assert!(is_known_helper_process("UnityCrashHandler64.exe"));
+        assert!(is_known_helper_process("unitycrashhandler64.exe"));
+        assert!(is_known_helper_process("EasyAntiCheat_Launcher.exe"));
+        assert!(!is_known_helper_process("Among Us.exe"));
+        assert!(!is_known_helper_process("Celeste.exe"));
+    }
 }

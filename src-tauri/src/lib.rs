@@ -1,14 +1,16 @@
-use lilypad_core::{api, config, monitor};
+use lilypad_core::{api, config, library_match, local_games, monitor, steam};
 
 use api::FroglogClient;
-use config::{AuthConfig, ProcessMapConfig, ProcessMapping, PendingSession, auth_config_path, process_map_path_for_auth, load_pending_sessions, save_pending_sessions};
+use config::{AuthConfig, ProcessMapConfig, ProcessMapping, PendingSession, WatchedDirectory, auth_config_path, process_map_path_for_auth, load_pending_sessions, save_pending_sessions};
+use library_match::LibraryIndex;
 use monitor::{run_poll_loop, ActiveSession};
+use steam::InstalledGame;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::{Duration, Instant, SystemTime};
 use sysinfo::{ProcessesToUpdate, System};
-use tauri::menu::{Menu, MenuItemBuilder, PredefinedMenuItem};
+use tauri::menu::{IsMenuItem, Menu, MenuItemBuilder, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{Emitter, Manager, WindowEvent};
 use tauri::Wry;
@@ -140,6 +142,11 @@ struct AppState {
     auto_submit_cancel_tx: Arc<RwLock<Option<tokio::sync::oneshot::Sender<()>>>>,
     /// Holds session data for a live/session auto-submit that is still in the 25-second intercept window.
     auto_submit_pending_data: Arc<RwLock<Option<serde_json::Value>>>,
+    /// Installed games — Steam (manifest scan) + non-Steam (watched directories) — refreshed
+    /// periodically in the background.
+    installed_games_arc: Arc<RwLock<Vec<InstalledGame>>>,
+    /// Titles/appids already in the user's FrogLog library, refreshed periodically in the background.
+    library_index_arc: Arc<RwLock<LibraryIndex>>,
 }
 
 fn api_client(auth: &AuthConfig) -> Option<FroglogClient> {
@@ -151,6 +158,26 @@ fn api_client(auth: &AuthConfig) -> Option<FroglogClient> {
     let mut c = FroglogClient::new(base.to_string());
     c.set_token(auth.token.clone());
     Some(c)
+}
+
+/// Re-scans Steam's installed games and every configured watched directory, replacing
+/// `state.installed_games_arc` in one go. Called both by the periodic background refresh and
+/// immediately after adding/removing a watched directory, so a newly added folder is picked up
+/// right away instead of waiting for the next scheduled scan.
+fn refresh_installed_games(state: &AppState) {
+    let mut games = steam::find_steam_root()
+        .map(|root| steam::scan_installed_games(&root))
+        .unwrap_or_default();
+    let watched_dirs: Vec<String> = state
+        .process_map_arc
+        .read()
+        .unwrap()
+        .watched_directories
+        .iter()
+        .map(|w| w.path.clone())
+        .collect();
+    games.extend(local_games::scan_watched_directories(&watched_dirs));
+    *state.installed_games_arc.write().unwrap() = games;
 }
 
 /// Persisted to disk when a session starts; cleared when it ends normally.
@@ -249,6 +276,74 @@ fn show_auto_submit_toast(
     });
 }
 
+/// Send a Windows toast with a "View New Games" action button for a completed session of a
+/// game that isn't in the FrogLog library. Clicking the button (or the toast body) opens the
+/// main window on the New Games view, where the session can be resolved into a real entry.
+#[cfg(windows)]
+fn show_pending_game_toast(body: &str, app: tauri::AppHandle) {
+    use windows::core::HSTRING;
+    use windows::Data::Xml::Dom::XmlDocument;
+    use windows::Foundation::TypedEventHandler;
+    use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
+
+    let body_owned = body.to_string();
+    std::thread::spawn(move || {
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(
+                None,
+                windows::Win32::System::Com::COINIT_MULTITHREADED,
+            );
+        }
+        let xml = format!(
+            concat!(
+                r#"<toast><visual><binding template="ToastGeneric">"#,
+                r#"<text>Session Recorded</text>"#,
+                r#"<text>{}</text>"#,
+                r#"</binding></visual>"#,
+                r#"<actions>"#,
+                r#"<action content="Go to New Games" arguments="view-new-games"/>"#,
+                r#"</actions></toast>"#,
+            ),
+            body_owned
+        );
+        let doc = match XmlDocument::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        if doc.LoadXml(&HSTRING::from(xml.as_str())).is_err() { return; }
+        let toast = match ToastNotification::CreateToastNotification(&doc) {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        let _ = toast.Activated(&TypedEventHandler::<ToastNotification, windows::core::IInspectable>::new(
+            move |_, _| {
+                let app2 = app.clone();
+                let _ = app.run_on_main_thread(move || {
+                    if let Some(w) = app2.get_webview_window("main") {
+                        show_window_at_height(&w, WINDOW_WIDTH, 500.0);
+                        let _ = w.emit("show-new-games", ());
+                    }
+                });
+                Ok(())
+            },
+        ));
+        let aumid = HSTRING::from("uk.co.froglog.lilypad");
+        if let Ok(notifier) = ToastNotificationManager::CreateToastNotifierWithId(&aumid) {
+            let _ = notifier.Show(&toast);
+        }
+        // Keep toast alive so WinRT holds event handlers until dismissed.
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    });
+}
+
+#[cfg(not(windows))]
+fn show_pending_game_toast(body: &str, app: tauri::AppHandle) {
+    let _ = app.notification().builder()
+        .title("Session Recorded")
+        .body(body)
+        .show();
+}
+
 #[cfg(not(windows))]
 fn show_auto_submit_toast(
     title_str: &str,
@@ -345,9 +440,9 @@ fn handle_session_ended(
                         std::thread::spawn(move || {
                             let ok = if let Some(client) = api_client(&auth2) {
                                 if game_type2.eq_ignore_ascii_case("live") {
-                                    client.add_live_service_session(mapping.froglog_id, Some(date), Some(hours), Some("Session auto submitted with LilyPad".to_string()), false, true).is_ok()
+                                    client.add_live_service_session(mapping.froglog_id, Some(date), Some(hours), Some("Session auto submitted with LilyPad".to_string()), false, true, None).is_ok()
                                 } else {
-                                    client.add_game_session(mapping.froglog_id, Some(date), Some(hours), Some("Session auto submitted with LilyPad".to_string()), false, true).is_ok()
+                                    client.add_game_session(mapping.froglog_id, Some(date), Some(hours), Some("Session auto submitted with LilyPad".to_string()), false, true, None).is_ok()
                                 }
                             } else { false };
                             let _ = tx2.send(ok);
@@ -472,15 +567,29 @@ fn build_tray_menu(app: &tauri::AppHandle, logged_in: bool, game_title: Option<S
         let about_item = MenuItemBuilder::with_id("about", "About").build(app)?;
         let logout_item = MenuItemBuilder::with_id("logout", "Logout").build(app)?;
         let pending_count = config::load_pending_sessions().len();
-        if pending_count > 0 {
-            let pending_item = MenuItemBuilder::with_id("pending_sessions",
-                format!("Pending Submissions ({})", pending_count)).build(app)?;
-            let menu = Menu::with_items(app, &[&assign_exes_item, &pending_item, &about_item, &logout_item, &quit_item])?;
-            Ok(menu)
+        let new_games_count = config::load_pending_game_submissions().len();
+        let pending_item = if pending_count > 0 {
+            Some(MenuItemBuilder::with_id("pending_sessions", format!("Pending Submissions ({})", pending_count)).build(app)?)
         } else {
-            let menu = Menu::with_items(app, &[&assign_exes_item, &about_item, &logout_item, &quit_item])?;
-            Ok(menu)
+            None
+        };
+        let new_games_item = if new_games_count > 0 {
+            Some(MenuItemBuilder::with_id("new_games", format!("New Games ({})", new_games_count)).build(app)?)
+        } else {
+            None
+        };
+        let mut items: Vec<&dyn IsMenuItem<Wry>> = vec![&assign_exes_item];
+        if let Some(ref item) = new_games_item {
+            items.push(item);
         }
+        if let Some(ref item) = pending_item {
+            items.push(item);
+        }
+        items.push(&about_item);
+        items.push(&logout_item);
+        items.push(&quit_item);
+        let menu = Menu::with_items(app, &items)?;
+        Ok(menu)
     } else {
         let login_item = MenuItemBuilder::with_id("login", "Login").build(app)?;
         let about_item = MenuItemBuilder::with_id("about", "About").build(app)?;
@@ -594,9 +703,9 @@ fn submit_session(
     let result = match api_client(&auth) {
         None => Err("Not logged in".to_string()),
         Some(client) => if game_type.eq_ignore_ascii_case("live") {
-            client.add_live_service_session(game_id, Some(date.clone()), Some(hours), notes.clone(), spoiler, is_public)
+            client.add_live_service_session(game_id, Some(date.clone()), Some(hours), notes.clone(), spoiler, is_public, None)
         } else if game_type.eq_ignore_ascii_case("session") {
-            client.add_game_session(game_id, Some(date.clone()), Some(hours), notes.clone(), spoiler, is_public)
+            client.add_game_session(game_id, Some(date.clone()), Some(hours), notes.clone(), spoiler, is_public, None)
         } else {
             client.update_game_hours(game_id, hours)
         },
@@ -643,9 +752,9 @@ fn retry_pending_session(
     let client = api_client(&auth).ok_or("Not logged in")?;
     let notes = Some(s.notes.filter(|n| !n.is_empty()).unwrap_or_else(|| "Session submitted from Pending Sessions".to_string()));
     if s.game_type.eq_ignore_ascii_case("live") {
-        client.add_live_service_session(s.game_id, Some(s.date), Some(s.hours), notes, s.spoiler, s.is_public)?;
+        client.add_live_service_session(s.game_id, Some(s.date), Some(s.hours), notes, s.spoiler, s.is_public, None)?;
     } else if s.game_type.eq_ignore_ascii_case("session") {
-        client.add_game_session(s.game_id, Some(s.date), Some(s.hours), notes, s.spoiler, s.is_public)?;
+        client.add_game_session(s.game_id, Some(s.date), Some(s.hours), notes, s.spoiler, s.is_public, None)?;
     } else {
         client.update_game_hours(s.game_id, s.hours)?;
     }
@@ -659,6 +768,166 @@ fn delete_pending_session(id: String) -> Result<(), String> {
     let mut sessions = load_pending_sessions();
     sessions.retain(|s| s.id != id);
     save_pending_sessions(&sessions);
+    Ok(())
+}
+
+#[tauri::command]
+fn get_pending_game_submissions() -> Vec<config::PendingGameSubmission> {
+    config::load_pending_game_submissions()
+}
+
+#[tauri::command]
+fn dismiss_pending_game_submission(appid: String) -> Result<(), String> {
+    config::remove_pending_game_submission(&appid);
+    Ok(())
+}
+
+#[tauri::command]
+fn search_igdb_games(state: tauri::State<AppState>, query: String) -> Result<Vec<serde_json::Value>, String> {
+    let auth = state.auth.read().unwrap();
+    let client = api_client(&auth).ok_or("Not logged in")?;
+    client.search_igdb(&query)
+}
+
+/// Resolves a pending game submission by creating a brand-new FrogLog game entry for it.
+/// `igdb_title` is the exact title of the IGDB search result the user picked; enriched details
+/// for it are fetched fresh (via `fetch_game_details`) rather than trusting the lightweight
+/// search result, since `/search/fetch` returns the richer, create-ready field set.
+#[tauri::command]
+fn resolve_pending_game_as_new(
+    state: tauri::State<AppState>,
+    appid: String,
+    igdb_title: String,
+) -> Result<serde_json::Value, String> {
+    let pending = config::load_pending_game_submissions();
+    let entry = pending
+        .iter()
+        .find(|p| p.appid == appid)
+        .ok_or("Pending submission not found")?
+        .clone();
+
+    let auth = state.auth.read().unwrap();
+    let client = api_client(&auth).ok_or("Not logged in")?;
+
+    // If IGDB has no exact match for the confirmed title (`/search/fetch` can fail even when
+    // `/search` just found it, for a handful of titles), fall back to `igdb_title` itself — the
+    // title the user actually confirmed — never `entry.title`, which is only LilyPad's original
+    // guess (literally the exe's folder name for a non-Steam game, often full of release-group
+    // junk like "-DenuvOwO [PORTABLE]").
+    let mut payload = client
+        .fetch_game_details(&igdb_title)
+        .unwrap_or_else(|_| serde_json::json!({ "title": igdb_title.clone() }));
+    let obj = payload.as_object_mut().ok_or("Unexpected response shape")?;
+    // /search/fetch names this field "dev_country"; POST /games expects "studio_country".
+    if let Some(country) = obj.remove("dev_country") {
+        obj.insert("studio_country".to_string(), country);
+    }
+    obj.insert("platform".to_string(), serde_json::json!("PC"));
+    obj.insert("is_public".to_string(), serde_json::json!(true));
+    // Session-tracked, matching how LilyPad actually recorded this play time (discrete
+    // sessions, not a single running total) — hours go in via add_game_session below rather
+    // than hours_played, same as a session-tracked game's aggregate is always computed.
+    obj.insert("session_tracking".to_string(), serde_json::json!(true));
+    // Start date is when LilyPad first saw this game being played, not today (when the user
+    // finally got around to resolving it) — first_seen_secs is exactly that.
+    if let Some(start_date) = chrono::DateTime::from_timestamp(entry.first_seen_secs as i64, 0)
+        .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
+    {
+        obj.insert("start_date".to_string(), serde_json::json!(start_date));
+    }
+    // Prefer our own detected Steam appid over whatever (possibly null) match IGDB found —
+    // ours is known-accurate since it's literally how this session was detected. The backend
+    // column is numeric, so parse it rather than sending the string appid as-is.
+    if let Ok(appid_num) = entry.appid.parse::<i64>() {
+        obj.insert("steam_app_id".to_string(), serde_json::json!(appid_num));
+    }
+
+    let created = client.create_game(payload)?;
+    let created_id = created.get("id").and_then(|v| v.as_i64()).ok_or("Created game missing id")?;
+    // The confirmed/matched title, not `entry.title` (LilyPad's original guess — literally the
+    // exe's folder name for a non-Steam game) — that's what should show up in the tray/session
+    // popup/notifications going forward.
+    let created_title = created.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    client.add_game_session(
+        created_id as i32,
+        Some(date),
+        Some(entry.hours),
+        Some("Session logged from LilyPad".to_string()),
+        false,
+        true,
+        None,
+    )?;
+
+    config::remove_pending_game_submission(&appid);
+
+    // Link the exe to the newly-created game so future sessions are tracked normally instead
+    // of falling through detection again. Best-effort: a failure here shouldn't fail the
+    // resolve itself, and older pending entries (persisted before exe_name existed) have
+    // nothing to link.
+    if !entry.exe_name.is_empty() {
+        if let Err(e) = config::link_process_mapping(
+            &state.process_map_arc,
+            &auth,
+            entry.exe_name.clone(),
+            "session".to_string(),
+            created_id as i32,
+            created_title.or_else(|| Some(entry.title.clone())),
+        ) {
+            log::warn!("[LilyPad] failed to link newly-created game's exe: {e}");
+        }
+    }
+
+    Ok(created)
+}
+
+/// Resolves a pending game submission by logging its accumulated hours against a game/live
+/// service entry the user already has in their FrogLog library.
+#[tauri::command]
+fn resolve_pending_game_as_existing(
+    state: tauri::State<AppState>,
+    appid: String,
+    game_type: String, // "regular" | "session" | "live"
+    game_id: i32,
+    game_title: String,
+) -> Result<(), String> {
+    let pending = config::load_pending_game_submissions();
+    let entry = pending
+        .iter()
+        .find(|p| p.appid == appid)
+        .ok_or("Pending submission not found")?
+        .clone();
+
+    let auth = state.auth.read().unwrap();
+    let client = api_client(&auth).ok_or("Not logged in")?;
+    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let notes = Some("Logged from LilyPad's untracked-session detection".to_string());
+    if game_type.eq_ignore_ascii_case("live") {
+        client.add_live_service_session(game_id, Some(date), Some(entry.hours), notes, false, true, None)?;
+    } else if game_type.eq_ignore_ascii_case("session") {
+        client.add_game_session(game_id, Some(date), Some(entry.hours), notes, false, true, None)?;
+    } else {
+        client.update_game_hours(game_id, entry.hours)?;
+    }
+    config::remove_pending_game_submission(&appid);
+
+    // Link the exe to this game so future sessions are tracked normally instead of falling
+    // through detection again. Uses the existing game's own confirmed title (from the caller),
+    // not `entry.title` (LilyPad's original guess). Best-effort, same as resolve_pending_game_as_new.
+    if !entry.exe_name.is_empty() {
+        if let Err(e) = config::link_process_mapping(
+            &state.process_map_arc,
+            &auth,
+            entry.exe_name.clone(),
+            game_type,
+            game_id,
+            Some(game_title),
+        ) {
+            log::warn!("[LilyPad] failed to link exe to existing game: {e}");
+        }
+    }
+
     Ok(())
 }
 
@@ -783,6 +1052,16 @@ fn save_auto_submit(state: tauri::State<AppState>, regular: bool, live: bool, se
 }
 
 #[tauri::command]
+fn save_unmapped_detection(state: tauri::State<AppState>, disabled: bool) -> Result<(), String> {
+    let mut map = state.process_map_arc.read().unwrap().clone();
+    map.disable_unmapped_game_detection = disabled;
+    map.save_to(&process_map_path_for_auth(&state.auth.read().unwrap()))
+        .map_err(|e| e.to_string())?;
+    *state.process_map_arc.write().unwrap() = map;
+    Ok(())
+}
+
+#[tauri::command]
 fn save_now_playing_share(state: tauri::State<AppState>, share: bool) -> Result<(), String> {
     let mut map = state.process_map_arc.read().unwrap().clone();
     map.share_now_playing = share;
@@ -866,6 +1145,44 @@ fn pick_exe_file(app: tauri::AppHandle) -> Result<Option<String>, String> {
     Ok(path.and_then(|p| p.as_path().map(|path| path.display().to_string())))
 }
 
+#[tauri::command]
+fn pick_directory(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let path = app.dialog().file().blocking_pick_folder();
+    Ok(path.and_then(|p| p.as_path().map(|path| path.display().to_string())))
+}
+
+#[tauri::command]
+fn get_watched_directories(state: tauri::State<AppState>) -> Vec<WatchedDirectory> {
+    state.process_map_arc.read().unwrap().watched_directories.clone()
+}
+
+#[tauri::command]
+fn add_watched_directory(state: tauri::State<AppState>, path: String) -> Result<(), String> {
+    let mut map = state.process_map_arc.read().unwrap().clone();
+    if !map.watched_directories.iter().any(|w| w.path == path) {
+        map.watched_directories.push(WatchedDirectory { path });
+    }
+    map.save_to(&process_map_path_for_auth(&state.auth.read().unwrap()))
+        .map_err(|e| e.to_string())?;
+    *state.process_map_arc.write().unwrap() = map;
+    // Scan immediately rather than waiting for the next 300s background refresh, so a newly
+    // added folder's games show up right away.
+    refresh_installed_games(&state);
+    Ok(())
+}
+
+#[tauri::command]
+fn remove_watched_directory(state: tauri::State<AppState>, path: String) -> Result<(), String> {
+    let mut map = state.process_map_arc.read().unwrap().clone();
+    map.watched_directories.retain(|w| w.path != path);
+    map.save_to(&process_map_path_for_auth(&state.auth.read().unwrap()))
+        .map_err(|e| e.to_string())?;
+    *state.process_map_arc.write().unwrap() = map;
+    refresh_installed_games(&state);
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let auth = AuthConfig::load_from(&auth_config_path());
@@ -892,6 +1209,8 @@ pub fn run() {
             force_stopped_process: Arc::new(RwLock::new(None)),
             auto_submit_cancel_tx: Arc::new(RwLock::new(None)),
             auto_submit_pending_data: Arc::new(RwLock::new(None)),
+            installed_games_arc: Arc::new(RwLock::new(Vec::new())),
+            library_index_arc: Arc::new(RwLock::new(LibraryIndex::default())),
         })
         .invoke_handler(tauri::generate_handler![
             login,
@@ -903,6 +1222,11 @@ pub fn run() {
             get_pending_sessions,
             retry_pending_session,
             delete_pending_session,
+            get_pending_game_submissions,
+            dismiss_pending_game_submission,
+            search_igdb_games,
+            resolve_pending_game_as_new,
+            resolve_pending_game_as_existing,
             intercept_auto_submit,
             get_auth_config,
             get_process_mappings,
@@ -910,10 +1234,15 @@ pub fn run() {
             delete_process_mapping,
             save_auto_submit,
             save_now_playing_share,
+            save_unmapped_detection,
             hide_window,
             set_window_size,
             open_url,
             pick_exe_file,
+            pick_directory,
+            get_watched_directories,
+            add_watched_directory,
+            remove_watched_directory,
         ])
         .on_window_event(|window, event| {
             if window.label() == "main" {
@@ -978,6 +1307,11 @@ pub fn run() {
                             show_window_at_height(&w, WINDOW_WIDTH, 500.0);
                             let _ = w.emit("show-pending", ());
                         }
+                    } else if id == "new_games" {
+                        if let Some(w) = app.get_webview_window("main") {
+                            show_window_at_height(&w, WINDOW_WIDTH, 500.0);
+                            let _ = w.emit("show-new-games", ());
+                        }
                     } else if id == "force_stop_tracking" {
                         let state = app.state::<AppState>();
                         // Grab session info before clearing so we can submit it
@@ -1038,10 +1372,37 @@ pub fn run() {
 
             // Start process monitor in background (share process_map with AppState)
             let app_handle = app.handle().clone();
+            let app_handle_for_unmapped = app_handle.clone();
+            let app_handle_for_already_owned = app_handle.clone();
             let state = app.state::<AppState>();
             let config = Arc::clone(&state.process_map_arc);
             let current_session = Arc::clone(&state.current_session_arc);
             let force_stopped_process = Arc::clone(&state.force_stopped_process);
+            let installed_games_arc = Arc::clone(&state.installed_games_arc);
+            let library_index_arc = Arc::clone(&state.library_index_arc);
+
+            // Refresh the installed-Steam-games scan and the FrogLog library index
+            // periodically in the background, so newly installed games or newly logged
+            // games are picked up without restarting LilyPad.
+            {
+                let library_index_arc = Arc::clone(&library_index_arc);
+                let app_handle_refresh = app_handle.clone();
+                std::thread::spawn(move || loop {
+                    let auth = {
+                        let state = app_handle_refresh.state::<AppState>();
+                        refresh_installed_games(&state);
+                        let auth = state.auth.read().unwrap().clone();
+                        auth
+                    };
+                    if let Some(client) = api_client(&auth) {
+                        let games = client.get_games().unwrap_or_default();
+                        let wishlist = client.get_wishlist().unwrap_or_default();
+                        let live_service = client.get_live_service_games().unwrap_or_default();
+                        *library_index_arc.write().unwrap() = LibraryIndex::build(&games, &wishlist, &live_service);
+                    }
+                    std::thread::sleep(Duration::from_secs(300));
+                });
+            }
 
             // Path used to persist the active session across crashes/restarts.
             let session_path = app_handle.path().app_data_dir()
@@ -1190,6 +1551,46 @@ pub fn run() {
                         let _ = app_handle.run_on_main_thread(move || {
                             let _ = update_tray_state(&handle_tray);
                         });
+                    }
+                },
+                installed_games_arc,
+                library_index_arc,
+                {
+                    let handle = app_handle_for_unmapped;
+                    move |title: String, appid: String, exe_name: String, duration_secs: f64| {
+                        let raw_hours = duration_secs / 3600.0;
+                        let hours = { let r = (raw_hours * 100.0).round() / 100.0; if r < 0.01 { 0.01 } else { r } };
+                        config::record_pending_game_submission(&appid, &title, &exe_name, hours);
+                        let total_mins = (duration_secs / 60.0).round() as u64;
+                        let time_str = if total_mins >= 60 { format!("{}h {}m", total_mins / 60, total_mins % 60) } else { format!("{}m", total_mins) };
+                        let body = format!("{title} ({time_str}) isn't in your FrogLog yet.");
+                        show_pending_game_toast(&body, handle.clone());
+                        let handle_tray = handle.clone();
+                        let _ = handle.run_on_main_thread(move || {
+                            let _ = update_tray_state(&handle_tray);
+                        });
+                    }
+                },
+                {
+                    let handle = app_handle_for_already_owned;
+                    move |mapping: ProcessMapping| {
+                        let state = handle.state::<AppState>();
+                        let auth = state.auth.read().unwrap().clone();
+                        if let Err(e) = config::link_process_mapping(
+                            &state.process_map_arc,
+                            &auth,
+                            mapping.process,
+                            mapping.r#type,
+                            mapping.froglog_id,
+                            mapping.title,
+                        ) {
+                            log::warn!("[LilyPad] failed to auto-link already-owned game: {e}");
+                        } else {
+                            let handle2 = handle.clone();
+                            let _ = handle.run_on_main_thread(move || {
+                                let _ = update_tray_state(&handle2);
+                            });
+                        }
                     }
                 },
             );

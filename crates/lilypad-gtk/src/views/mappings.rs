@@ -35,7 +35,12 @@ impl Default for ViewState {
 /// Builds the mappings view. Returns the widget and a `reload` closure the
 /// caller should invoke each time the view is shown (mirrors the Tauri
 /// frontend's `loadMappingsView()` running on every `open-mappings` event).
-pub fn build(state: AppState, window: gtk4::Window) -> (gtk4::Widget, Rc<dyn Fn()>) {
+pub fn build(
+    state: AppState,
+    window: gtk4::Window,
+    on_show_watched_dirs: impl Fn() + 'static,
+    on_show_new_games: impl Fn() + 'static,
+) -> (gtk4::Widget, Rc<dyn Fn()>) {
     let view_state = Rc::new(RefCell::new(ViewState::default()));
 
     let container = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
@@ -58,16 +63,34 @@ pub fn build(state: AppState, window: gtk4::Window) -> (gtk4::Widget, Rc<dyn Fn(
     desc.add_css_class("dim-label");
     container.append(&desc);
 
+    // --- New Games notice (permanent, mirrors the pending-submissions notice on the About
+    // page) — games LilyPad has detected being played that aren't in the FrogLog library yet. ---
+    let new_games_notice_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    let new_games_notice_label = gtk4::Label::new(None);
+    new_games_notice_label.set_halign(gtk4::Align::Start);
+    let new_games_notice_link = gtk4::LinkButton::builder().label("View").uri("#").build();
+    new_games_notice_link.set_visible(false);
+    new_games_notice_box.append(&new_games_notice_label);
+    new_games_notice_box.append(&new_games_notice_link);
+    container.append(&new_games_notice_box);
+
+    new_games_notice_link.connect_activate_link(move |_| {
+        on_show_new_games();
+        glib::Propagation::Stop
+    });
+
     // --- Auto-submit / presence toggles ---
     let toggles_group = adw::PreferencesGroup::new();
     let auto_regular = adw::SwitchRow::builder().title("Auto-submit regular game sessions").build();
     let auto_session = adw::SwitchRow::builder().title("Auto-submit session-tracked game sessions").build();
     let auto_live = adw::SwitchRow::builder().title("Auto-submit live service sessions").build();
     let share_now_playing = adw::SwitchRow::builder().title("Enable online presence on FrogLog").build();
+    let detect_unmapped = adw::SwitchRow::builder().title("Detect games not in your FrogLog library").build();
     toggles_group.add(&auto_regular);
     toggles_group.add(&auto_session);
     toggles_group.add(&auto_live);
     toggles_group.add(&share_now_playing);
+    toggles_group.add(&detect_unmapped);
     container.append(&toggles_group);
 
     {
@@ -76,15 +99,17 @@ pub fn build(state: AppState, window: gtk4::Window) -> (gtk4::Widget, Rc<dyn Fn(
         auto_session.set_active(cfg.auto_submit_session);
         auto_live.set_active(cfg.auto_submit_live);
         share_now_playing.set_active(cfg.share_now_playing);
+        detect_unmapped.set_active(!cfg.disable_unmapped_game_detection);
     }
 
     // Auto-submit / presence toggles persist immediately (not staged), same as the Tauri build.
     type Setter = fn(&mut lilypad_core::config::ProcessMapConfig, bool);
-    let toggle_setters: [(&adw::SwitchRow, Setter); 4] = [
+    let toggle_setters: [(&adw::SwitchRow, Setter); 5] = [
         (&auto_regular, |c, v| c.auto_submit_regular = v),
         (&auto_session, |c, v| c.auto_submit_session = v),
         (&auto_live, |c, v| c.auto_submit_live = v),
         (&share_now_playing, |c, v| c.share_now_playing = v),
+        (&detect_unmapped, |c, v| c.disable_unmapped_game_detection = !v),
     ];
     for (row, setter) in toggle_setters {
         let state = state.clone();
@@ -122,7 +147,14 @@ pub fn build(state: AppState, window: gtk4::Window) -> (gtk4::Widget, Rc<dyn Fn(
     mode_box.append(&btn_regular);
     mode_box.append(&btn_session);
     mode_box.append(&btn_live);
-    container.append(&mode_box);
+
+    let watched_dirs_btn = gtk4::Button::with_label("Non-Steam Games…");
+    watched_dirs_btn.connect_clicked(move |_| on_show_watched_dirs());
+
+    let mode_row = gtk4::CenterBox::new();
+    mode_row.set_start_widget(Some(&mode_box));
+    mode_row.set_end_widget(Some(&watched_dirs_btn));
+    container.append(&mode_row);
 
     // --- Search ---
     let search_entry = gtk4::SearchEntry::new();
@@ -366,6 +398,9 @@ pub fn build(state: AppState, window: gtk4::Window) -> (gtk4::Widget, Rc<dyn Fn(
         let auto_session = auto_session.clone();
         let auto_live = auto_live.clone();
         let share_now_playing = share_now_playing.clone();
+        let detect_unmapped = detect_unmapped.clone();
+        let new_games_notice_label = new_games_notice_label.clone();
+        let new_games_notice_link = new_games_notice_link.clone();
         Rc::new(move || {
             {
                 let cfg = state.process_map.read().unwrap();
@@ -373,6 +408,20 @@ pub fn build(state: AppState, window: gtk4::Window) -> (gtk4::Widget, Rc<dyn Fn(
                 auto_session.set_active(cfg.auto_submit_session);
                 auto_live.set_active(cfg.auto_submit_live);
                 share_now_playing.set_active(cfg.share_now_playing);
+                detect_unmapped.set_active(!cfg.disable_unmapped_game_detection);
+            }
+
+            let new_games_count = lilypad_core::config::load_pending_game_submissions().len();
+            if new_games_count > 0 {
+                new_games_notice_label.set_text(&format!(
+                    "⚠ {new_games_count} game{} detected that {} not in FrogLog yet.",
+                    if new_games_count > 1 { "s" } else { "" },
+                    if new_games_count > 1 { "are" } else { "is" },
+                ));
+                new_games_notice_link.set_visible(true);
+            } else {
+                new_games_notice_label.set_text("✓ No games detected outside FrogLog");
+                new_games_notice_link.set_visible(false);
             }
 
             let auth = state.auth.read().unwrap().clone();
