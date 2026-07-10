@@ -53,7 +53,7 @@ if ($NoBump) {
     # --- Update Cargo.toml version fields (first `version = "..."` in [package]) ---
     foreach ($CargoToml in @('src-tauri/Cargo.toml', 'crates/lilypad-core/Cargo.toml', 'crates/lilypad-gtk/Cargo.toml')) {
         $Cargo = Get-Content $CargoToml -Raw
-        $Cargo = $Cargo -replace '^version = "[^"]+"', "version = `"$New`""
+        $Cargo = $Cargo -replace '(?m)^version = "[^"]+"', "version = `"$New`""
         Set-Content $CargoToml $Cargo -NoNewline
     }
 }
@@ -97,12 +97,15 @@ if (Test-Path $NsisDir) {
 }
 
 # --- Create GitHub release, or add to it if it already exists (multi-platform workflow) ---
-$ReleaseExists = $true
-try {
-    gh release view "v$New" | Out-Null
-} catch {
-    $ReleaseExists = $false
-}
+# Native command exit codes don't reliably raise catchable exceptions in PowerShell (behavior
+# varies by version / $PSNativeCommandUseErrorActionPreference), so check $LASTEXITCODE directly
+# rather than try/catch -- a silent false-positive here previously caused this script to report
+# success while never actually creating the GitHub release (v0.5.1/v0.5.2 both hit this).
+$PrevEAP = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+gh release view "v$New" *> $null
+$ErrorActionPreference = $PrevEAP
+$ReleaseExists = ($LASTEXITCODE -eq 0)
 
 if ($ReleaseExists) {
     if ($Assets.Count -eq 0) {
