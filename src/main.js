@@ -1024,7 +1024,7 @@ app.innerHTML = `
     </div>
     <p id="pendingNotice" class="pending-notice" hidden></p>
     <p>A lightweight system tray companion for <a href="#" class="ext-link" data-url="https://froglog.co.uk/">FrogLog</a>, the personal game tracking app. LilyPad watches for game processes in the background and prompts you to log a session when you stop playing, including automatically noticing games you haven't linked yet.</p>
-    <button type="button" id="mainOpenConfigure">Configure Games…</button>
+    <button type="button" id="mainOpenConfigure" class="main-configure-btn">Configure Games…</button>
     <hr />
     <p class="muted about-steps-heading"><strong>Getting started</strong></p>
     <ol class="about-steps muted">
