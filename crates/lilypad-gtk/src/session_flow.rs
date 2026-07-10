@@ -196,6 +196,7 @@ fn submit_now(auth: &AuthConfig, mapping: &ProcessMapping, hours: f64, duration_
             Some("Session auto submitted with LilyPad".to_string()),
             false,
             true,
+            None,
         )
     } else if mapping.r#type.eq_ignore_ascii_case("session") {
         client.add_game_session(
@@ -205,6 +206,7 @@ fn submit_now(auth: &AuthConfig, mapping: &ProcessMapping, hours: f64, duration_
             Some("Session auto submitted with LilyPad".to_string()),
             false,
             true,
+            None,
         )
     } else {
         client.update_game_hours(mapping.froglog_id, hours)

@@ -120,9 +120,9 @@ pub fn show_popup(state: AppState, parent: &gtk4::Window, refresh_tray: RefreshT
                 client.set_token(auth.token.clone());
                 let date = chrono::Local::now().format("%Y-%m-%d").to_string();
                 let result = if mapping.r#type.eq_ignore_ascii_case("live") {
-                    client.add_live_service_session(mapping.froglog_id, Some(date), Some(hours), notes.clone(), spoiler, is_public)
+                    client.add_live_service_session(mapping.froglog_id, Some(date), Some(hours), notes.clone(), spoiler, is_public, None)
                 } else if mapping.r#type.eq_ignore_ascii_case("session") {
-                    client.add_game_session(mapping.froglog_id, Some(date), Some(hours), notes.clone(), spoiler, is_public)
+                    client.add_game_session(mapping.froglog_id, Some(date), Some(hours), notes.clone(), spoiler, is_public, None)
                 } else {
                     client.update_game_hours(mapping.froglog_id, hours)
                 };

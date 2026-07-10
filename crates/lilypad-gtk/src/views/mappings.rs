@@ -40,6 +40,7 @@ pub fn build(
     window: gtk4::Window,
     on_show_watched_dirs: impl Fn() + 'static,
     on_show_new_games: impl Fn() + 'static,
+    on_show_pending: impl Fn() + 'static,
 ) -> (gtk4::Widget, Rc<dyn Fn()>) {
     let view_state = Rc::new(RefCell::new(ViewState::default()));
 
@@ -63,6 +64,22 @@ pub fn build(
     desc.add_css_class("dim-label");
     container.append(&desc);
 
+    // --- Pending submissions notice — sessions that failed to auto-submit and are waiting
+    // to be retried. Mirrors the Tauri build's `mappingsPendingNotice`. ---
+    let pending_notice_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    let pending_notice_label = gtk4::Label::new(None);
+    pending_notice_label.set_halign(gtk4::Align::Start);
+    let pending_notice_link = gtk4::LinkButton::builder().label("View").uri("#").build();
+    pending_notice_link.set_visible(false);
+    pending_notice_box.append(&pending_notice_label);
+    pending_notice_box.append(&pending_notice_link);
+    container.append(&pending_notice_box);
+
+    pending_notice_link.connect_activate_link(move |_| {
+        on_show_pending();
+        glib::Propagation::Stop
+    });
+
     // --- New Games notice (permanent, mirrors the pending-submissions notice on the About
     // page) — games LilyPad has detected being played that aren't in the FrogLog library yet. ---
     let new_games_notice_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
@@ -80,18 +97,23 @@ pub fn build(
     });
 
     // --- Auto-submit / presence toggles ---
-    let toggles_group = adw::PreferencesGroup::new();
-    let auto_regular = adw::SwitchRow::builder().title("Auto-submit regular game sessions").build();
-    let auto_session = adw::SwitchRow::builder().title("Auto-submit session-tracked game sessions").build();
-    let auto_live = adw::SwitchRow::builder().title("Auto-submit live service sessions").build();
-    let share_now_playing = adw::SwitchRow::builder().title("Enable online presence on FrogLog").build();
-    let detect_unmapped = adw::SwitchRow::builder().title("Detect games not in your FrogLog library").build();
-    toggles_group.add(&auto_regular);
-    toggles_group.add(&auto_session);
-    toggles_group.add(&auto_live);
-    toggles_group.add(&share_now_playing);
-    toggles_group.add(&detect_unmapped);
-    container.append(&toggles_group);
+    // Laid out as a 2-column grid of checkboxes (rather than one full-width switch row per
+    // toggle) so this section doesn't dominate the view's vertical space.
+    let toggles_grid = gtk4::Grid::new();
+    toggles_grid.set_column_spacing(24);
+    toggles_grid.set_row_spacing(8);
+    toggles_grid.set_column_homogeneous(true);
+    let auto_regular = gtk4::CheckButton::with_label("Auto-submit regular game sessions");
+    let auto_session = gtk4::CheckButton::with_label("Auto-submit session-tracked game sessions");
+    let auto_live = gtk4::CheckButton::with_label("Auto-submit live service sessions");
+    let share_now_playing = gtk4::CheckButton::with_label("Enable online presence on FrogLog");
+    let detect_unmapped = gtk4::CheckButton::with_label("Detect games not in your FrogLog library");
+    toggles_grid.attach(&auto_regular, 0, 0, 1, 1);
+    toggles_grid.attach(&auto_session, 1, 0, 1, 1);
+    toggles_grid.attach(&auto_live, 0, 1, 1, 1);
+    toggles_grid.attach(&share_now_playing, 1, 1, 1, 1);
+    toggles_grid.attach(&detect_unmapped, 0, 2, 1, 1);
+    container.append(&toggles_grid);
 
     {
         let cfg = state.process_map.read().unwrap();
@@ -104,17 +126,17 @@ pub fn build(
 
     // Auto-submit / presence toggles persist immediately (not staged), same as the Tauri build.
     type Setter = fn(&mut lilypad_core::config::ProcessMapConfig, bool);
-    let toggle_setters: [(&adw::SwitchRow, Setter); 5] = [
+    let toggle_setters: [(&gtk4::CheckButton, Setter); 5] = [
         (&auto_regular, |c, v| c.auto_submit_regular = v),
         (&auto_session, |c, v| c.auto_submit_session = v),
         (&auto_live, |c, v| c.auto_submit_live = v),
         (&share_now_playing, |c, v| c.share_now_playing = v),
         (&detect_unmapped, |c, v| c.disable_unmapped_game_detection = !v),
     ];
-    for (row, setter) in toggle_setters {
+    for (check, setter) in toggle_setters {
         let state = state.clone();
-        row.connect_active_notify(move |row| {
-            let active = row.is_active();
+        check.connect_toggled(move |check| {
+            let active = check.is_active();
             let mut cfg = state.process_map.write().unwrap();
             setter(&mut cfg, active);
             let _ = cfg.save_to(&process_map_path_for_auth(&state.auth.read().unwrap()));
@@ -124,8 +146,8 @@ pub fn build(
     // share_now_playing additionally needs to notify the FrogLog API (fire-and-forget).
     {
         let state = state.clone();
-        share_now_playing.connect_active_notify(move |row| {
-            let active = row.is_active();
+        share_now_playing.connect_toggled(move |check| {
+            let active = check.is_active();
             let auth = state.auth.read().unwrap().clone();
             std::thread::spawn(move || {
                 let base = auth.base_url.clone().unwrap_or_else(|| DEFAULT_API_URL.to_string());
@@ -401,6 +423,8 @@ pub fn build(
         let detect_unmapped = detect_unmapped.clone();
         let new_games_notice_label = new_games_notice_label.clone();
         let new_games_notice_link = new_games_notice_link.clone();
+        let pending_notice_label = pending_notice_label.clone();
+        let pending_notice_link = pending_notice_link.clone();
         Rc::new(move || {
             {
                 let cfg = state.process_map.read().unwrap();
@@ -409,6 +433,18 @@ pub fn build(
                 auto_live.set_active(cfg.auto_submit_live);
                 share_now_playing.set_active(cfg.share_now_playing);
                 detect_unmapped.set_active(!cfg.disable_unmapped_game_detection);
+            }
+
+            let pending_count = lilypad_core::config::load_pending_sessions().len();
+            if pending_count > 0 {
+                pending_notice_label.set_text(&format!(
+                    "⚠ {pending_count} pending submission{}",
+                    if pending_count > 1 { "s" } else { "" },
+                ));
+                pending_notice_link.set_visible(true);
+            } else {
+                pending_notice_label.set_text("✓ No pending submissions");
+                pending_notice_link.set_visible(false);
             }
 
             let new_games_count = lilypad_core::config::load_pending_game_submissions().len();

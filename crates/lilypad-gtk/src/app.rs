@@ -44,6 +44,19 @@ fn goto_view(window: &adw::ApplicationWindow, stack: &gtk4::Stack, view: &'stati
     window.set_default_size(w, h);
 }
 
+/// Where the shared header bar's Back button should navigate to from a given view, mirroring
+/// the Tauri build's per-view Back buttons (`pendingBack`, `newGamesBack`, `watchedDirsBack`
+/// in `main.js`). Views not listed here (e.g. `main`, `mappings`, reachable directly from the
+/// tray) get no Back button.
+fn back_target(view: &str) -> Option<&'static str> {
+    match view {
+        "pending" => Some("main"),
+        "new_games" => Some("mappings"),
+        "watched_dirs" => Some("mappings"),
+        _ => None,
+    }
+}
+
 pub fn run(state: AppState) -> glib::ExitCode {
     let app = adw::Application::builder().application_id(APP_ID).build();
 
@@ -74,6 +87,13 @@ fn build_window(app: &adw::Application, state: AppState) {
     let refresh_tray = tray::make_refresh_tray(tray_handle);
 
     let header_bar = adw::HeaderBar::new();
+
+    // Shared across every stack page (see the header-bar comment below); shown/hidden per
+    // page by the `visible-child-name` handler wired up after the stack is built.
+    let back_button = gtk4::Button::from_icon_name("go-previous-symbolic");
+    back_button.set_tooltip_text(Some("Back"));
+    back_button.set_visible(false);
+    header_bar.pack_start(&back_button);
 
     // Version + link to the latest release. The Tauri build showed this on every
     // individual view (each had its own `.app-version` span); here the header bar
@@ -165,8 +185,6 @@ fn build_window(app: &adw::Application, state: AppState) {
                 reload_new_games();
             }
         },
-    );
-    let (main_widget, refresh_main_notice) = views::main_view::build(
         {
             let stack = stack.clone();
             let window = window.clone();
@@ -176,16 +194,16 @@ fn build_window(app: &adw::Application, state: AppState) {
                 reload_pending();
             }
         },
-        {
-            let stack = stack.clone();
-            let window = window.clone();
-            let reload_mappings = Rc::clone(&reload_mappings);
-            move || {
-                goto_view(&window, &stack, "mappings");
-                reload_mappings();
-            }
-        },
     );
+    let (main_widget, refresh_main_notice) = views::main_view::build({
+        let stack = stack.clone();
+        let window = window.clone();
+        let reload_mappings = Rc::clone(&reload_mappings);
+        move || {
+            goto_view(&window, &stack, "mappings");
+            reload_mappings();
+        }
+    });
 
     stack.add_named(&login_widget, Some("login"));
     stack.add_named(&main_widget, Some("main"));
@@ -203,6 +221,34 @@ fn build_window(app: &adw::Application, state: AppState) {
     if !state.logged_in() {
         window.present();
     }
+
+    // Back button: visibility tracks whatever page is current (covers navigation from the
+    // tray too, not just in-window Back/Next flows), click handler jumps to that page's
+    // configured parent and reloads it the same way the tray actions do.
+    stack.connect_visible_child_name_notify({
+        let back_button = back_button.clone();
+        move |stack| {
+            let visible = stack.visible_child_name().unwrap_or_default();
+            back_button.set_visible(back_target(&visible).is_some());
+        }
+    });
+    back_button.connect_clicked({
+        let window = window.clone();
+        let stack = stack.clone();
+        let reload_mappings = Rc::clone(&reload_mappings);
+        let refresh_main_notice = Rc::clone(&refresh_main_notice);
+        move |_| {
+            let current = stack.visible_child_name().unwrap_or_default();
+            if let Some(target) = back_target(&current) {
+                goto_view(&window, &stack, target);
+                match target {
+                    "main" => refresh_main_notice(),
+                    "mappings" => reload_mappings(),
+                    _ => {}
+                }
+            }
+        }
+    });
 
     // Tray menu actions.
     let (app_tx, app_rx) = async_channel::unbounded::<AppAction>();

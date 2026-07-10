@@ -135,9 +135,9 @@ fn build_row(state: AppState, session: PendingSession, on_changed: Rc<dyn Fn()>)
                         .unwrap_or_else(|| "Session submitted from Pending Sessions".to_string()),
                 );
                 let result = if session.game_type.eq_ignore_ascii_case("live") {
-                    client.add_live_service_session(session.game_id, Some(session.date.clone()), Some(session.hours), notes, session.spoiler, session.is_public)
+                    client.add_live_service_session(session.game_id, Some(session.date.clone()), Some(session.hours), notes, session.spoiler, session.is_public, None)
                 } else if session.game_type.eq_ignore_ascii_case("session") {
-                    client.add_game_session(session.game_id, Some(session.date.clone()), Some(session.hours), notes, session.spoiler, session.is_public)
+                    client.add_game_session(session.game_id, Some(session.date.clone()), Some(session.hours), notes, session.spoiler, session.is_public, None)
                 } else {
                     client.update_game_hours(session.game_id, session.hours)
                 };
