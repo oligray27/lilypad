@@ -16,7 +16,7 @@ if (!isDevServer) {
 
 const VIEW_SIZE = {
   loginView: { width: 560, height: 328 },
-  mainView: { width: 550, height: 402 },
+  mainView: { width: 550, height: 444 },
   mappingsView: { width: 642, height: 760 },
   sessionView: { width: 440, height: 165 },
   pendingView: { width: 550, height: 480 },
