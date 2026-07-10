@@ -117,17 +117,7 @@ fn maybe_start_unmapped_tracking(
     // binary as their resolved `exe_path`).
     let (found, matched_path) = {
         let games = installed_games.read().unwrap();
-        let result = find_installed_game_for_exe_or_cmd(exe_path, cmd, &games).map(|(g, p)| (g.clone(), p));
-        if result.is_none() {
-            log::debug!(
-                "[LilyPad] no installed-game match for exe_path={:?} cmd={:?} against {} installed games: {:?}",
-                exe_path,
-                cmd,
-                games.len(),
-                games.iter().map(|g| (&g.appid, &g.install_dir)).collect::<Vec<_>>(),
-            );
-        }
-        result?
+        find_installed_game_for_exe_or_cmd(exe_path, cmd, &games).map(|(g, p)| (g.clone(), p))?
     };
     log::debug!("[LilyPad] matched installed game appid={} via path={:?}", found.appid, matched_path);
     let exe_name = matched_path.file_name().and_then(|n| n.to_str())?.to_string();
