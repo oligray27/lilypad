@@ -10,7 +10,7 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
-use sysinfo::{Pid, ProcessesToUpdate, System};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 /// Filters out companion processes that live inside a game's own install directory but aren't
 /// the game itself — crash reporters, anti-cheat services, prerequisite installers. These would
@@ -700,7 +700,29 @@ pub fn run_poll_loop(
                         );
                         None
                     } else {
-                        system.refresh_processes(ProcessesToUpdate::All);
+                        // Plain `refresh_processes(ProcessesToUpdate::All)` is equivalent to
+                        // `ProcessRefreshKind::new().with_memory().with_cpu().with_disk_usage()
+                        // .with_exe(UpdateKind::OnlyIfNotSet)` -- it does NOT include `cmd` at
+                        // all. `System::new_all()` (used once, at thread startup) does a fully
+                        // comprehensive refresh that does populate cmd, so a process already
+                        // running when this thread starts gets correct cmd data forever after --
+                        // but any process that starts *later* is only ever discovered through
+                        // this per-tick refresh, whose cmd never gets populated, leaving
+                        // `p.cmd()` permanently empty for it. That's exactly why Proton-game
+                        // detection worked when the game was already running before LilyPad
+                        // started, but silently never fired when LilyPad was already running and
+                        // the game started afterward -- `find_proton_exe_path`'s cmdline scan had
+                        // nothing to look at. Explicitly requesting cmd (and exe, for safety)
+                        // fixes it for both orderings.
+                        system.refresh_processes_specifics(
+                            ProcessesToUpdate::All,
+                            ProcessRefreshKind::new()
+                                .with_memory()
+                                .with_cpu()
+                                .with_disk_usage()
+                                .with_exe(UpdateKind::Always)
+                                .with_cmd(UpdateKind::Always),
+                        );
                         let mut found = None;
                         'proc_scan: for (pid, p) in system.processes().iter() {
                             // Try the resolved binary name first (right for native processes),
