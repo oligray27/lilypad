@@ -71,16 +71,27 @@ pub fn start(state: &AppState, tx: async_channel::Sender<MonitorEvent>) {
                 log::warn!("[LilyPad] failed to auto-link already-owned game: {e}");
             }
             // Best-effort, off this thread (this callback runs on the poll loop itself, and
-            // this needs a couple of network round-trips): the game LilyPad just silently
-            // linked to might be a Steam-bulk-imported entry that was never actually started
-            // (status "Imported", no start_date) -- fix that up now that it's genuinely being
-            // played. No-op if it isn't "Imported".
+            // this needs a couple of network round-trips). Two follow-ups now that LilyPad has
+            // linked itself to this game:
+            // - It might be a Steam-bulk-imported entry that was never actually started (status
+            //   "Imported", no start_date) -- fix that up now that it's genuinely being played.
+            //   No-op if it isn't "Imported".
+            // - `monitor.rs` already treats this session as "session"-type locally (see the
+            //   comment there), so the backend needs to actually have session_tracking on too,
+            //   with any pre-existing hours preserved as a "Pre-tracked hours" session --
+            //   enable_session_tracking is idempotent, so calling it even for a game that's
+            //   already session-tracked is safe (no duplicate seed session).
             let froglog_id = mapping.froglog_id;
             let game_type = mapping.r#type;
             std::thread::spawn(move || {
                 let client = client_for(&auth);
                 if let Err(e) = client.fix_imported_status_if_needed(froglog_id, &game_type) {
                     log::warn!("[LilyPad] failed to fix imported status: {e}");
+                }
+                if !game_type.eq_ignore_ascii_case("live") {
+                    if let Err(e) = client.enable_session_tracking(froglog_id) {
+                        log::warn!("[LilyPad] failed to enable session tracking: {e}");
+                    }
                 }
             });
         },

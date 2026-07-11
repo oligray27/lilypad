@@ -112,17 +112,27 @@ pub fn resolve_as_existing(
     let client = client_for(&auth);
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
     let notes = Some("Logged from LilyPad's untracked-session detection".to_string());
-    if game_type.eq_ignore_ascii_case("live") {
-        client.add_live_service_session(game_id, Some(date), Some(entry.hours), notes, false, true, None)?;
-    } else if game_type.eq_ignore_ascii_case("session") {
-        client.add_game_session(game_id, Some(date), Some(entry.hours), notes, false, true, None)?;
+    // Anything mapped here should end up session-tracked, not "regular" (a single running
+    // hours_played total) -- matches the silent already-owned auto-link path (see the comment
+    // in monitor.rs). enable_session_tracking is idempotent and preserves any pre-existing hours
+    // as a "Pre-tracked hours" session, same flow as enabling it manually on the website.
+    let effective_game_type = if game_type.eq_ignore_ascii_case("live") {
+        "live"
     } else {
-        client.update_game_hours(game_id, entry.hours)?;
+        if let Err(e) = client.enable_session_tracking(game_id) {
+            log::warn!("[LilyPad] failed to enable session tracking: {e}");
+        }
+        "session"
+    };
+    if effective_game_type == "live" {
+        client.add_live_service_session(game_id, Some(date), Some(entry.hours), notes, false, true, None)?;
+    } else {
+        client.add_game_session(game_id, Some(date), Some(entry.hours), notes, false, true, None)?;
     }
     // Best-effort: a game picked here might be a Steam-bulk-imported entry that was never
     // actually started (status "Imported", no start_date) -- now that a real session's been
     // logged against it, transition it to "In Progress". No-op if it isn't "Imported".
-    if let Err(e) = client.fix_imported_status_if_needed(game_id, game_type) {
+    if let Err(e) = client.fix_imported_status_if_needed(game_id, effective_game_type) {
         log::warn!("[LilyPad] failed to fix imported status: {e}");
     }
     config::remove_pending_game_submission(appid);
@@ -135,7 +145,7 @@ pub fn resolve_as_existing(
             &state.process_map,
             &auth,
             entry.exe_name.clone(),
-            game_type.to_string(),
+            effective_game_type.to_string(),
             game_id,
             Some(game_title.to_string()),
         ) {

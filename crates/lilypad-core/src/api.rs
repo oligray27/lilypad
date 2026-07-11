@@ -350,18 +350,26 @@ impl FroglogClient {
         self.put_game(game_id, serde_json::Value::Object(obj))
     }
 
-    /// Turn on session_tracking for a game via PUT /games/{id}, leaving hours_played
-    /// untouched. When `initial_session_hours` is given, the backend seeds a one-off
-    /// "Pre-tracked hours" session so the game's session-aggregate total doesn't
-    /// visibly drop to zero the moment session tracking is enabled.
-    pub fn enable_session_tracking(
-        &self,
-        game_id: i32,
-        initial_session_hours: Option<f64>,
-    ) -> Result<serde_json::Value, String> {
+    /// Turns on session_tracking for a game via PUT /games/{id}, if it isn't on already.
+    /// Leaves `hours_played` untouched, but if it's currently > 0, seeds a one-off "Pre-tracked
+    /// hours" session for that amount (the backend's own established flow for this, same as
+    /// enabling it manually on the website) so the game's session-aggregate total doesn't
+    /// visibly drop to zero the moment session tracking turns on.
+    ///
+    /// Idempotent -- a fresh GET always checks the current `session_tracking` value first and
+    /// no-ops if it's already `true`, rather than trusting a possibly-stale caller-supplied
+    /// flag. This makes it safe to call unconditionally every time LilyPad links a process to a
+    /// game, not just the first time; without this check, calling it again on an
+    /// already-session-tracked game would insert a duplicate "Pre-tracked hours" session and
+    /// silently inflate the total every single time that game launches.
+    pub fn enable_session_tracking(&self, game_id: i32) -> Result<serde_json::Value, String> {
         let mut obj = self.game_payload_base(game_id)?;
+        if obj.get("session_tracking").and_then(|v| v.as_bool()).unwrap_or(false) {
+            return Ok(serde_json::Value::Object(obj));
+        }
+        let existing_hours = obj.get("hours_played").and_then(Self::num_from_value);
         obj.insert("session_tracking".to_string(), serde_json::json!(true));
-        if let Some(h) = initial_session_hours {
+        if let Some(h) = existing_hours {
             if h > 0.0 {
                 obj.insert("initial_session_hours".to_string(), serde_json::json!(h));
             }

@@ -141,9 +141,25 @@ fn maybe_start_unmapped_tracking(
 
     if let Some(resolved) = library_index.read().unwrap().resolve_by_appid(&found.appid) {
         last_ended_unmapped.write().unwrap().insert(found.appid.clone(), Instant::now());
+        // Anything LilyPad auto-links itself should end up session-tracked, not "regular"
+        // (single running hours_played total) -- session data is strictly more useful, and the
+        // caller is responsible for actually flipping session_tracking on server-side (see
+        // `fix_imported_status_if_needed`'s sibling call, `enable_session_tracking`, in the
+        // per-platform on_already_owned_game_needs_link callback). Doesn't apply to live-service
+        // games, which are a separate concept entirely. Setting it here (rather than leaving it
+        // as whatever `resolved.game_type` already says) matters because this exact value is
+        // what decides how *this* session gets submitted once it ends -- if it stayed "regular"
+        // here, this session's hours would go through `update_game_hours` instead of
+        // `add_game_session`, silently missing the session-tracking flip happening
+        // asynchronously alongside it.
+        let game_type = if resolved.game_type.eq_ignore_ascii_case("live") {
+            resolved.game_type.clone()
+        } else {
+            "session".to_string()
+        };
         let mapping = ProcessMapping {
             process: exe_name.to_string(),
-            r#type: resolved.game_type.clone(),
+            r#type: game_type,
             froglog_id: resolved.id,
             title: Some(resolved.title.clone()),
             title_filter: None,

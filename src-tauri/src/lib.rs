@@ -903,17 +903,27 @@ fn resolve_pending_game_as_existing(
     let client = api_client(&auth).ok_or("Not logged in")?;
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
     let notes = Some("Logged from LilyPad's untracked-session detection".to_string());
-    if game_type.eq_ignore_ascii_case("live") {
-        client.add_live_service_session(game_id, Some(date), Some(entry.hours), notes, false, true, None)?;
-    } else if game_type.eq_ignore_ascii_case("session") {
-        client.add_game_session(game_id, Some(date), Some(entry.hours), notes, false, true, None)?;
+    // Anything mapped here should end up session-tracked, not "regular" (a single running
+    // hours_played total) -- matches the silent already-owned auto-link path (see the comment
+    // in monitor.rs). enable_session_tracking is idempotent and preserves any pre-existing hours
+    // as a "Pre-tracked hours" session, same flow as enabling it manually on the website.
+    let effective_game_type = if game_type.eq_ignore_ascii_case("live") {
+        "live".to_string()
     } else {
-        client.update_game_hours(game_id, entry.hours)?;
+        if let Err(e) = client.enable_session_tracking(game_id) {
+            log::warn!("[LilyPad] failed to enable session tracking: {e}");
+        }
+        "session".to_string()
+    };
+    if effective_game_type == "live" {
+        client.add_live_service_session(game_id, Some(date), Some(entry.hours), notes, false, true, None)?;
+    } else {
+        client.add_game_session(game_id, Some(date), Some(entry.hours), notes, false, true, None)?;
     }
     // Best-effort: a game picked here might be a Steam-bulk-imported entry that was never
     // actually started (status "Imported", no start_date) -- now that a real session's been
     // logged against it, transition it to "In Progress". No-op if it isn't "Imported".
-    if let Err(e) = client.fix_imported_status_if_needed(game_id, &game_type) {
+    if let Err(e) = client.fix_imported_status_if_needed(game_id, &effective_game_type) {
         log::warn!("[LilyPad] failed to fix imported status: {e}");
     }
     config::remove_pending_game_submission(&appid);
@@ -926,7 +936,7 @@ fn resolve_pending_game_as_existing(
             &state.process_map_arc,
             &auth,
             entry.exe_name.clone(),
-            game_type,
+            effective_game_type,
             game_id,
             Some(game_title),
         ) {
@@ -1599,14 +1609,25 @@ pub fn run() {
                                 let _ = update_tray_state(&handle2);
                             });
                         }
-                        // Best-effort, off this thread: the game LilyPad just silently linked
-                        // to might be a Steam-bulk-imported entry that was never actually
-                        // started (status "Imported", no start_date) -- fix that up now that
-                        // it's genuinely being played. No-op if it isn't "Imported".
+                        // Best-effort, off this thread. Two follow-ups now that LilyPad has
+                        // linked itself to this game:
+                        // - It might be a Steam-bulk-imported entry that was never actually
+                        //   started (status "Imported", no start_date) -- fix that up now that
+                        //   it's genuinely being played. No-op if it isn't "Imported".
+                        // - monitor.rs already treats this session as "session"-type locally,
+                        //   so the backend needs session_tracking on too, with any pre-existing
+                        //   hours preserved as a "Pre-tracked hours" session --
+                        //   enable_session_tracking is idempotent, so calling it even for an
+                        //   already-session-tracked game is safe (no duplicate seed session).
                         std::thread::spawn(move || {
                             if let Some(client) = api_client(&auth) {
                                 if let Err(e) = client.fix_imported_status_if_needed(froglog_id, &game_type) {
                                     log::warn!("[LilyPad] failed to fix imported status: {e}");
+                                }
+                                if !game_type.eq_ignore_ascii_case("live") {
+                                    if let Err(e) = client.enable_session_tracking(froglog_id) {
+                                        log::warn!("[LilyPad] failed to enable session tracking: {e}");
+                                    }
                                 }
                             }
                         });
