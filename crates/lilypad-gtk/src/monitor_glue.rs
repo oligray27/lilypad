@@ -1,3 +1,4 @@
+use crate::session_flow::client_for;
 use crate::state::AppState;
 use lilypad_core::config::{self, ProcessMapping};
 use lilypad_core::monitor::run_poll_loop;
@@ -63,12 +64,25 @@ pub fn start(state: &AppState, tx: async_channel::Sender<MonitorEvent>) {
                 &state_for_link.process_map,
                 &auth,
                 mapping.process,
-                mapping.r#type,
+                mapping.r#type.clone(),
                 mapping.froglog_id,
                 mapping.title,
             ) {
                 log::warn!("[LilyPad] failed to auto-link already-owned game: {e}");
             }
+            // Best-effort, off this thread (this callback runs on the poll loop itself, and
+            // this needs a couple of network round-trips): the game LilyPad just silently
+            // linked to might be a Steam-bulk-imported entry that was never actually started
+            // (status "Imported", no start_date) -- fix that up now that it's genuinely being
+            // played. No-op if it isn't "Imported".
+            let froglog_id = mapping.froglog_id;
+            let game_type = mapping.r#type;
+            std::thread::spawn(move || {
+                let client = client_for(&auth);
+                if let Err(e) = client.fix_imported_status_if_needed(froglog_id, &game_type) {
+                    log::warn!("[LilyPad] failed to fix imported status: {e}");
+                }
+            });
         },
     );
 }

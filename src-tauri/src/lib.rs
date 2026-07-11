@@ -910,6 +910,12 @@ fn resolve_pending_game_as_existing(
     } else {
         client.update_game_hours(game_id, entry.hours)?;
     }
+    // Best-effort: a game picked here might be a Steam-bulk-imported entry that was never
+    // actually started (status "Imported", no start_date) -- now that a real session's been
+    // logged against it, transition it to "In Progress". No-op if it isn't "Imported".
+    if let Err(e) = client.fix_imported_status_if_needed(game_id, &game_type) {
+        log::warn!("[LilyPad] failed to fix imported status: {e}");
+    }
     config::remove_pending_game_submission(&appid);
 
     // Link the exe to this game so future sessions are tracked normally instead of falling
@@ -1576,6 +1582,8 @@ pub fn run() {
                     move |mapping: ProcessMapping| {
                         let state = handle.state::<AppState>();
                         let auth = state.auth.read().unwrap().clone();
+                        let froglog_id = mapping.froglog_id;
+                        let game_type = mapping.r#type.clone();
                         if let Err(e) = config::link_process_mapping(
                             &state.process_map_arc,
                             &auth,
@@ -1591,6 +1599,17 @@ pub fn run() {
                                 let _ = update_tray_state(&handle2);
                             });
                         }
+                        // Best-effort, off this thread: the game LilyPad just silently linked
+                        // to might be a Steam-bulk-imported entry that was never actually
+                        // started (status "Imported", no start_date) -- fix that up now that
+                        // it's genuinely being played. No-op if it isn't "Imported".
+                        std::thread::spawn(move || {
+                            if let Some(client) = api_client(&auth) {
+                                if let Err(e) = client.fix_imported_status_if_needed(froglog_id, &game_type) {
+                                    log::warn!("[LilyPad] failed to fix imported status: {e}");
+                                }
+                            }
+                        });
                     }
                 },
             );

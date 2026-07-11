@@ -119,6 +119,12 @@ pub fn resolve_as_existing(
     } else {
         client.update_game_hours(game_id, entry.hours)?;
     }
+    // Best-effort: a game picked here might be a Steam-bulk-imported entry that was never
+    // actually started (status "Imported", no start_date) -- now that a real session's been
+    // logged against it, transition it to "In Progress". No-op if it isn't "Imported".
+    if let Err(e) = client.fix_imported_status_if_needed(game_id, game_type) {
+        log::warn!("[LilyPad] failed to fix imported status: {e}");
+    }
     config::remove_pending_game_submission(appid);
 
     // Link the exe to this game so future sessions are tracked normally instead of falling

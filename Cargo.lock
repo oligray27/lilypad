@@ -2676,6 +2676,7 @@ dependencies = [
 name = "lilypad-core"
 version = "0.5.1"
 dependencies = [
+ "chrono",
  "dirs 5.0.1",
  "log",
  "reqwest 0.12.28",

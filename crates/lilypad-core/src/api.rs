@@ -369,6 +369,41 @@ impl FroglogClient {
         self.put_game(game_id, serde_json::Value::Object(obj))
     }
 
+    /// If the game is currently in "Imported" status (added via FrogLog's Steam library bulk
+    /// import, which sets `hours_played` from Steam but never a `start_date` -- so it shows as
+    /// "owned" but never actually started), transitions it to "In Progress" by setting
+    /// `start_date`, mirroring how a brand-new game created from a detected LilyPad session
+    /// already gets a `start_date`. The backend recomputes `status` from `start_date` itself
+    /// (see `computeStatus` in `backend/routes/games.js`), so setting the date is enough -- no
+    /// need to touch `status` in the payload directly.
+    ///
+    /// Uses the earliest session already logged for the game, if any (rare for a freshly
+    /// imported game, since the bulk import doesn't create session rows, but possible if the
+    /// user logged one manually before LilyPad got to it); falls back to today otherwise. No-op
+    /// if the game isn't "Imported" -- this is meant to be called opportunistically every time
+    /// LilyPad links a process to an existing game, not just once.
+    pub fn fix_imported_status_if_needed(&self, game_id: i32, game_type: &str) -> Result<(), String> {
+        // "Imported" is a `games`-table-only concept (set by the Steam bulk-import route) --
+        // live-service games are a separate table/concept entirely.
+        if !game_type.eq_ignore_ascii_case("regular") && !game_type.eq_ignore_ascii_case("session") {
+            return Ok(());
+        }
+        let mut obj = self.game_payload_base(game_id)?;
+        if obj.get("status").and_then(|v| v.as_str()) != Some("Imported") {
+            return Ok(());
+        }
+        let sessions = self.get_game_sessions(game_id).unwrap_or_default();
+        let earliest_session_date = sessions
+            .iter()
+            .filter_map(|s| s.get("date").and_then(|d| d.as_str()))
+            .min()
+            .map(|s| s.to_string());
+        let start_date = earliest_session_date.unwrap_or_else(|| chrono::Local::now().format("%Y-%m-%d").to_string());
+        obj.insert("start_date".to_string(), serde_json::json!(start_date));
+        self.put_game(game_id, serde_json::Value::Object(obj))?;
+        Ok(())
+    }
+
     /// GET /games/{id}/sessions — raw session rows (id, date, hours, notes, ...).
     pub fn get_game_sessions(&self, game_id: i32) -> Result<Vec<serde_json::Value>, String> {
         let res = self
