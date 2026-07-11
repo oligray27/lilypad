@@ -367,19 +367,9 @@ fn build_window(app: &adw::Application, state: AppState) {
     // games are picked up without restarting LilyPad.
     {
         let refresh_state = state.clone();
-        let library_index = state.library_index.clone();
-        let auth = state.auth.clone();
         std::thread::spawn(move || loop {
             refresh_state.refresh_installed_games();
-            let auth_snapshot = auth.read().unwrap().clone();
-            if auth_snapshot.token.is_some() {
-                let client = session_flow::client_for(&auth_snapshot);
-                let games = client.get_games().unwrap_or_default();
-                let wishlist = client.get_wishlist().unwrap_or_default();
-                let live_service = client.get_live_service_games().unwrap_or_default();
-                *library_index.write().unwrap() =
-                    lilypad_core::library_match::LibraryIndex::build(&games, &wishlist, &live_service);
-            }
+            refresh_state.refresh_library_index();
             std::thread::sleep(std::time::Duration::from_secs(300));
         });
     }

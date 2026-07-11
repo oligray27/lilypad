@@ -69,4 +69,23 @@ impl AppState {
         games.extend(lilypad_core::local_games::scan_watched_directories(&watched_dirs));
         *self.installed_games.write().unwrap() = games;
     }
+
+    /// Re-fetches games/wishlist/live-service from FrogLog and rebuilds `library_index`.
+    /// Blocking (network calls) -- call from a background thread. Called both by the periodic
+    /// background refresh in `app.rs` and immediately after resolving a "New Games" entry
+    /// (`resolve.rs`), so a game just created/mapped doesn't still look "not in my library" to
+    /// the next detection attempt for up to 5 minutes (the periodic refresh interval) --
+    /// mirrors `refresh_installed_games`'s immediate-refresh-after-mutation pattern.
+    pub fn refresh_library_index(&self) {
+        let auth = self.auth.read().unwrap().clone();
+        if auth.token.is_none() {
+            return;
+        }
+        let client = crate::session_flow::client_for(&auth);
+        let games = client.get_games().unwrap_or_default();
+        let wishlist = client.get_wishlist().unwrap_or_default();
+        let live_service = client.get_live_service_games().unwrap_or_default();
+        *self.library_index.write().unwrap() =
+            lilypad_core::library_match::LibraryIndex::build(&games, &wishlist, &live_service);
+    }
 }

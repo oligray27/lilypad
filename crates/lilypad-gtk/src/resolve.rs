@@ -84,6 +84,11 @@ pub fn resolve_as_new(state: &AppState, appid: &str, igdb_title: &str) -> Result
         }
     }
 
+    // Without this, library_index only refreshes every 5 minutes -- relaunching the same game
+    // shortly after resolving it here would still look "not in my library" to the next
+    // detection attempt and get flagged as a new game all over again.
+    state.refresh_library_index();
+
     Ok(created)
 }
 
@@ -131,6 +136,9 @@ pub fn resolve_as_existing(
             log::warn!("[LilyPad] failed to link exe to existing game: {e}");
         }
     }
+
+    // See the matching comment in resolve_as_new -- avoids a 5-minute stale-library window.
+    state.refresh_library_index();
 
     Ok(())
 }
