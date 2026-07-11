@@ -694,6 +694,10 @@ pub fn run_poll_loop(
                     let cfg = config.read().unwrap().clone();
                     let mut cur = current_session.write().unwrap();
                     if cur.is_some() {
+                        log::debug!(
+                            "[LilyPad] poll tick skipped: current_session already occupied by {:?}",
+                            cur.as_ref().map(|s| (&s.process_name, &s.mapping.title, s.started_at.elapsed()))
+                        );
                         None
                     } else {
                         system.refresh_processes(ProcessesToUpdate::All);
