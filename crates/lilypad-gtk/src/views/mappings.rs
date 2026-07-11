@@ -498,15 +498,23 @@ pub fn build(
 
             let auth = state.auth.read().unwrap().clone();
             let (tx, rx) = async_channel::bounded(1);
-            std::thread::spawn(move || {
-                let base = auth.base_url.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| DEFAULT_API_URL.to_string());
-                let mut client = FroglogClient::new(base);
-                client.set_token(auth.token.clone());
-                let result = client.get_games().and_then(|games| {
-                    client.get_live_service_games().map(|live| (games, live))
+            {
+                let state = state.clone();
+                std::thread::spawn(move || {
+                    let base = auth.base_url.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| DEFAULT_API_URL.to_string());
+                    let mut client = FroglogClient::new(base);
+                    client.set_token(auth.token.clone());
+                    let result = client.get_games().and_then(|games| {
+                        client.get_live_service_games().map(|live| (games, live))
+                    });
+                    // Opening Configure already fetches this same data -- also refresh the
+                    // shared library_index the monitor uses for auto-link/New-Games detection,
+                    // so it doesn't sit stale for up to 5 minutes (the periodic refresh
+                    // interval) after a change made directly on the FrogLog website.
+                    state.refresh_library_index();
+                    let _ = tx.send_blocking(result);
                 });
-                let _ = tx.send_blocking(result);
-            });
+            }
 
             let state = state.clone();
             let view_state = Rc::clone(&view_state);

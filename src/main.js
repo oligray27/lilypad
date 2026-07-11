@@ -597,6 +597,11 @@ async function loadMappingsView() {
       nNotice.innerHTML = '&#10003; No games detected outside FrogLog';
     }
   });
+  // Force an immediate refresh of the monitor's library index (fire-and-forget) -- this view
+  // already fetches games/live-service fresh below for its own display, so this is a free
+  // "refresh now" for auto-link/New-Games detection instead of it sitting stale for up to 5
+  // minutes after a change made directly on the FrogLog website.
+  invoke('refresh_library_index').catch(() => {});
   try {
     const [games, liveService, mapConfig] = await Promise.all([
       invoke('get_games'),

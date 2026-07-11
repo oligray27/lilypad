@@ -180,6 +180,20 @@ fn refresh_installed_games(state: &AppState) {
     *state.installed_games_arc.write().unwrap() = games;
 }
 
+/// Re-fetches games/wishlist/live-service from FrogLog and rebuilds `state.library_index_arc`.
+/// Called both by the periodic background refresh and on-demand (see the
+/// `refresh_library_index` command) whenever the Configure view opens, since it already fetches
+/// this same data for its own display and the shared index otherwise sits stale for up to 5
+/// minutes after a change made directly on the FrogLog website.
+fn refresh_library_index_state(state: &AppState) {
+    let auth = state.auth.read().unwrap().clone();
+    let Some(client) = api_client(&auth) else { return };
+    let games = client.get_games().unwrap_or_default();
+    let wishlist = client.get_wishlist().unwrap_or_default();
+    let live_service = client.get_live_service_games().unwrap_or_default();
+    *state.library_index_arc.write().unwrap() = LibraryIndex::build(&games, &wishlist, &live_service);
+}
+
 /// Persisted to disk when a session starts; cleared when it ends normally.
 /// Survives LilyPad crashes so sessions can be recovered on next launch.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1068,6 +1082,16 @@ fn enable_session_tracking(state: tauri::State<AppState>, game_id: i32) -> Resul
     Ok(())
 }
 
+/// Forces an immediate refresh of `library_index_arc` (see `refresh_library_index_state`).
+/// Called from the Configure view on open, which already fetches this same games/live-service
+/// data for its own display -- otherwise the shared index used for auto-link/New-Games
+/// detection can sit stale for up to 5 minutes (the periodic refresh interval) after a change
+/// made directly on the FrogLog website.
+#[tauri::command]
+fn refresh_library_index(state: tauri::State<AppState>) {
+    refresh_library_index_state(&state);
+}
+
 #[tauri::command]
 fn save_auto_submit(state: tauri::State<AppState>, regular: bool, live: bool, session: bool) -> Result<(), String> {
     let mut map = state.process_map_arc.read().unwrap().clone();
@@ -1261,6 +1285,7 @@ pub fn run() {
             get_process_mappings,
             save_process_mapping,
             enable_session_tracking,
+            refresh_library_index,
             delete_process_mapping,
             save_auto_submit,
             save_now_playing_share,
@@ -1415,20 +1440,12 @@ pub fn run() {
             // periodically in the background, so newly installed games or newly logged
             // games are picked up without restarting LilyPad.
             {
-                let library_index_arc = Arc::clone(&library_index_arc);
                 let app_handle_refresh = app_handle.clone();
                 std::thread::spawn(move || loop {
-                    let auth = {
+                    {
                         let state = app_handle_refresh.state::<AppState>();
                         refresh_installed_games(&state);
-                        let auth = state.auth.read().unwrap().clone();
-                        auth
-                    };
-                    if let Some(client) = api_client(&auth) {
-                        let games = client.get_games().unwrap_or_default();
-                        let wishlist = client.get_wishlist().unwrap_or_default();
-                        let live_service = client.get_live_service_games().unwrap_or_default();
-                        *library_index_arc.write().unwrap() = LibraryIndex::build(&games, &wishlist, &live_service);
+                        refresh_library_index_state(&state);
                     }
                     std::thread::sleep(Duration::from_secs(300));
                 });
