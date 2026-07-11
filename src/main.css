@@ -127,7 +127,6 @@ a:hover { text-decoration: underline; }
 .mappings-switch { display: flex; gap: 0; }
 .mappings-switch button { padding: 0 1rem; border: 1px solid var(--border); background: var(--switch-bg); color: var(--text); cursor: pointer; font-size: 0.9rem; display: inline-flex; align-items: center; justify-content: center; height: 2.25rem; box-sizing: border-box; }
 .mappings-switch button:first-child { border-radius: 4px 0 0 4px; margin-right: -1px; }
-#mappingsSwitchSession { border-radius: 0; margin-right: -1px; }
 .mappings-switch button:last-child { border-radius: 0 4px 4px 0; margin-right: 0; }
 .mappings-switch button.active { background: var(--switch-active-bg); color: var(--switch-active-text); border-color: var(--switch-active-bg); z-index: 1; }
 .mappings-watched-dirs-btn { margin: 0; padding: 0 0.8rem; font-size: 0.85rem; white-space: nowrap; height: 2.25rem; box-sizing: border-box; display: inline-flex; align-items: center; justify-content: center; }

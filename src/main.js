@@ -446,7 +446,7 @@ let pendingExeFor = {};        // working copy (not yet saved to disk)
 let pendingTitleFilterFor = {};
 let savedExeFor = {};          // reflects what's currently on disk
 let savedTitleFilterFor = {};
-let mappingsMode = 'regular'; // 'regular' | 'live' | 'session'
+let mappingsMode = 'regular'; // 'regular' (merged Games tab, covers both regular+session-tracked rows) | 'live'
 let mappingsPage = 0;
 let mappingsSearch = '';
 const MAPPINGS_PAGE_SIZE = 6;
@@ -473,7 +473,13 @@ function renderMappingsTable() {
   const tableBody = $('mappingsTableBody');
   if (!tableBody || !mappingsAllRows.length) return;
   const needle = mappingsSearch.toLowerCase();
-  const filtered = mappingsAllRows.filter((r) => r.type === mappingsMode && (!needle || r.title.toLowerCase().includes(needle)));
+  // "Games" mode (mappingsMode === 'regular') matches both regular and session-tracked rows --
+  // only 'live' is still its own separate mode. LilyPad auto-enables session tracking on
+  // anything it links itself to now, so the distinction isn't worth a whole separate tab.
+  const filtered = mappingsAllRows.filter((r) => {
+    const modeMatches = mappingsMode === 'live' ? r.type === 'live' : r.type !== 'live';
+    return modeMatches && (!needle || r.title.toLowerCase().includes(needle));
+  });
   const totalPages = Math.max(1, Math.ceil(filtered.length / MAPPINGS_PAGE_SIZE));
   mappingsPage = Math.min(Math.max(0, mappingsPage), totalPages - 1);
   const rows = filtered.slice(mappingsPage * MAPPINGS_PAGE_SIZE, (mappingsPage + 1) * MAPPINGS_PAGE_SIZE);
@@ -503,10 +509,8 @@ function renderMappingsTable() {
   });
   const btnGames = $('mappingsSwitchGames');
   const btnLive = $('mappingsSwitchLive');
-  const btnSession = $('mappingsSwitchSession');
   if (btnGames) btnGames.classList.toggle('active', mappingsMode === 'regular');
   if (btnLive) btnLive.classList.toggle('active', mappingsMode === 'live');
-  if (btnSession) btnSession.classList.toggle('active', mappingsMode === 'session');
   const paginationEl = $('mappingsPagination');
   const prevBtn = $('mappingsPrev');
   const nextBtn = $('mappingsNext');
@@ -735,17 +739,14 @@ function refreshMappingsState() {
         input.classList.toggle('mappings-exe-conflict', conflicts.has(key));
     });
     
-    // Highlight mode switch buttons whose tab contains conflicts
+    // Highlight mode switch buttons whose tab contains conflicts. "regular" and "session" both
+    // live under the merged "Games" tab now, so that button lights up if either has a conflict
+    // (computed as an OR per button, not a naive last-write-wins loop over both type keys).
     const conflictTypes = new Set([...conflicts].map((k) => k.split(':')[0]));
-    const switchBtnMap = { 
-        regular: 'mappingsSwitchGames', 
-        session: 'mappingsSwitchSession', 
-        live: 'mappingsSwitchLive' 
-    };
-    for (const [type, btnId] of Object.entries(switchBtnMap)) {
-        const btn = $(btnId);
-        if (btn) btn.classList.toggle('mappings-switch-conflict', conflictTypes.has(type));
-    }
+    const gamesBtn = $('mappingsSwitchGames');
+    if (gamesBtn) gamesBtn.classList.toggle('mappings-switch-conflict', conflictTypes.has('regular') || conflictTypes.has('session'));
+    const liveBtn = $('mappingsSwitchLive');
+    if (liveBtn) liveBtn.classList.toggle('mappings-switch-conflict', conflictTypes.has('live'));
     
     // Apply button state
     const applyBtn = $('mappingsApply');
@@ -825,12 +826,13 @@ function onTitleFilterBlur(e) {
 async function doApply() {
     const errEl = $('mappingsError');
     if (errEl) errEl.textContent = '';
-    
+
     const allKeys = new Set([
         ...Object.keys(pendingExeFor),
         ...Object.keys(savedExeFor),
     ]);
-    
+    const needsSessionEnable = [];
+
     for (const key of allKeys) {
         const [gameType, idStr] = key.split(':');
         const gameId = parseInt(idStr, 10);
@@ -838,15 +840,20 @@ async function doApply() {
         const oldExe = norm(savedExeFor[key]);
         const newFilter = norm(pendingTitleFilterFor[key]) || null;
         const oldFilter = norm(savedTitleFilterFor[key]) || null;
-        
+
         if (newExe === oldExe && newFilter === oldFilter) continue;
-        
+
         try {
             if (newExe) {
                 const row = mappingsAllRows.find((r) => mappingKey(r.type, r.id) === key);
+                // Any "regular" row being actively (re)saved here gets promoted to
+                // "session" -- matches LilyPad's own auto-link behavior, and is why the mode
+                // switch above no longer distinguishes them.
+                const effectiveType = gameType === 'regular' ? 'session' : gameType;
+                if (gameType === 'regular') needsSessionEnable.push(gameId);
                 await invoke('save_process_mapping', {
                     process: newExe,
-                    gameType,
+                    gameType: effectiveType,
                     froglogId: gameId,
                     title: (row && row.title) || undefined,
                     titleFilter: newFilter || undefined,
@@ -870,7 +877,17 @@ async function doApply() {
             return;
         }
     }
-    
+
+    // Enable session tracking server-side for anything just promoted, in the background --
+    // doesn't block the "saved successfully" message below, and enable_session_tracking is
+    // idempotent (checks the game's current state itself) so this is safe to fire even if it
+    // races with something else touching the same game.
+    for (const gameId of needsSessionEnable) {
+        invoke('enable_session_tracking', { gameId }).catch((e) => {
+            console.warn('[LilyPad] failed to enable session tracking:', e);
+        });
+    }
+
     refreshMappingsState();
     
     // If successful, show success message briefly
@@ -1047,7 +1064,6 @@ app.innerHTML = `
       <div class="mappings-switch-row">
         <div class="mappings-switch">
           <button type="button" id="mappingsSwitchGames" class="active">Games</button>
-          <button type="button" id="mappingsSwitchSession">Session tracked</button>
           <button type="button" id="mappingsSwitchLive">Live service</button>
         </div>
         <button type="button" id="mappingsOpenWatchedDirs" class="mappings-watched-dirs-btn">Non-Steam Games…</button>
@@ -1128,7 +1144,6 @@ document.getElementById('sessionForm').addEventListener('submit', onSubmitSessio
 document.getElementById('skipSession').addEventListener('click', onSkipSession);
 $('mappingsSwitchGames').addEventListener('click', () => setMappingsMode('regular'));
 $('mappingsSwitchLive').addEventListener('click', () => setMappingsMode('live'));
-$('mappingsSwitchSession').addEventListener('click', () => setMappingsMode('session'));
 $('mappingsPrev').addEventListener('click', () => { mappingsPage--; renderMappingsTable(); });
 $('mappingsNext').addEventListener('click', () => { mappingsPage++; renderMappingsTable(); });
 $('mappingsSearch').addEventListener('input', (e) => { mappingsSearch = e.target.value; mappingsPage = 0; renderMappingsTable(); });

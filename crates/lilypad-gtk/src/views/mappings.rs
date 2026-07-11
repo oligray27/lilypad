@@ -158,16 +158,18 @@ pub fn build(
         });
     }
 
-    // --- Mode switch (Games / Session-tracked / Live service) ---
+    // --- Mode switch (Games / Live service) ---
+    // "Games" now covers both regular and session-tracked entries in one merged list -- LilyPad
+    // auto-enables session tracking on anything it links itself to (see resolve.rs/monitor_glue.rs
+    // and the Apply handler below), so the distinction is increasingly not worth a whole separate
+    // tab. The underlying `game_type` ("regular" vs "session") is still tracked per-row internally
+    // (it's how the backend actually stores it), just no longer surfaced as a filter here.
     let mode_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     mode_box.add_css_class("linked");
     let btn_regular = gtk4::ToggleButton::builder().label("Games").active(true).build();
-    let btn_session = gtk4::ToggleButton::builder().label("Session tracked").build();
     let btn_live = gtk4::ToggleButton::builder().label("Live service").build();
-    btn_session.set_group(Some(&btn_regular));
     btn_live.set_group(Some(&btn_regular));
     mode_box.append(&btn_regular);
-    mode_box.append(&btn_session);
     mode_box.append(&btn_live);
 
     let watched_dirs_btn = gtk4::Button::with_label("Non-Steam Games…");
@@ -253,7 +255,12 @@ pub fn build(
             let rows: Vec<GameRow> = vs
                 .all_rows
                 .iter()
-                .filter(|r| r.game_type == mode && (needle.is_empty() || r.title.to_lowercase().contains(&needle)))
+                .filter(|r| {
+                    // "Games" mode (mode == "regular") matches both regular and session-tracked
+                    // rows -- only "live" is still its own separate mode.
+                    let mode_matches = if mode == "live" { r.game_type == "live" } else { r.game_type != "live" };
+                    mode_matches && (needle.is_empty() || r.title.to_lowercase().contains(&needle))
+                })
                 .cloned()
                 .collect();
 
@@ -331,7 +338,7 @@ pub fn build(
     }
 
     // Mode buttons.
-    for (btn, mode) in [(&btn_regular, "regular"), (&btn_session, "session"), (&btn_live, "live")] {
+    for (btn, mode) in [(&btn_regular, "regular"), (&btn_live, "live")] {
         let view_state = Rc::clone(&view_state);
         let rebuild_list = Rc::clone(&rebuild_list);
         let mode = mode.to_string();
@@ -370,6 +377,12 @@ pub fn build(
                 .cloned()
                 .collect();
 
+            // Any "regular" row being actively saved here (a real change, not just re-saving
+            // something untouched) gets promoted to "session" -- matches LilyPad's own
+            // auto-link behavior, and is why the mode switch above no longer distinguishes them.
+            // Collected here and enabled server-side in the background after the local save,
+            // since this handler runs on the GTK main thread.
+            let mut needs_session_enable: Vec<i32> = Vec::new();
             let mut map = state.process_map.write().unwrap();
             for key in &all_keys {
                 let new_exe = mappings_model::norm(vs.pending.exe.get(key).map(|s| s.as_str()).unwrap_or(""));
@@ -383,9 +396,15 @@ pub fn build(
                 map.mappings.retain(|m| !(m.froglog_id == id && m.r#type == game_type));
                 if !new_exe.is_empty() {
                     let title = vs.all_rows.iter().find(|r| r.key() == *key).map(|r| r.title.clone());
+                    let effective_type = if game_type == "regular" {
+                        needs_session_enable.push(id);
+                        "session".to_string()
+                    } else {
+                        game_type
+                    };
                     map.mappings.push(lilypad_core::config::ProcessMapping {
                         process: new_exe,
-                        r#type: game_type,
+                        r#type: effective_type,
                         froglog_id: id,
                         title,
                         title_filter: if new_filter.is_empty() { None } else { Some(new_filter) },
@@ -394,6 +413,20 @@ pub fn build(
             }
             let _ = map.save_to(&process_map_path_for_auth(&state.auth.read().unwrap()));
             drop(map);
+
+            if !needs_session_enable.is_empty() {
+                let auth = state.auth.read().unwrap().clone();
+                std::thread::spawn(move || {
+                    let base = auth.base_url.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| DEFAULT_API_URL.to_string());
+                    let mut client = FroglogClient::new(base);
+                    client.set_token(auth.token.clone());
+                    for id in needs_session_enable {
+                        if let Err(e) = client.enable_session_tracking(id) {
+                            log::warn!("[LilyPad] failed to enable session tracking for game {id}: {e}");
+                        }
+                    }
+                });
+            }
 
             vs.saved = vs.pending.clone();
             drop(vs);

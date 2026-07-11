@@ -1055,6 +1055,19 @@ fn save_process_mapping(
     Ok(())
 }
 
+/// Turns on session tracking for a game (idempotent -- no-op if it's already on), preserving
+/// any pre-existing hours as a "Pre-tracked hours" session. Used by the Configure UI when the
+/// user manually maps an exe to a "regular" game, since anything LilyPad tracks should end up
+/// session-tracked -- matches the automatic behavior on the silent already-owned auto-link path
+/// and the New Games "Map to Existing" flow.
+#[tauri::command]
+fn enable_session_tracking(state: tauri::State<AppState>, game_id: i32) -> Result<(), String> {
+    let auth = state.auth.read().unwrap();
+    let client = api_client(&auth).ok_or("Not logged in")?;
+    client.enable_session_tracking(game_id)?;
+    Ok(())
+}
+
 #[tauri::command]
 fn save_auto_submit(state: tauri::State<AppState>, regular: bool, live: bool, session: bool) -> Result<(), String> {
     let mut map = state.process_map_arc.read().unwrap().clone();
@@ -1247,6 +1260,7 @@ pub fn run() {
             get_auth_config,
             get_process_mappings,
             save_process_mapping,
+            enable_session_tracking,
             delete_process_mapping,
             save_auto_submit,
             save_now_playing_share,
