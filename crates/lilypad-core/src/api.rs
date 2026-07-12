@@ -377,6 +377,25 @@ impl FroglogClient {
         self.put_game(game_id, serde_json::Value::Object(obj))
     }
 
+    /// If the game is currently Completed or DNF, clears `end_date`, `dnf`, and
+    /// `status_override` via PUT /games/{id} so the backend's own `computeStatus` puts it back
+    /// to "In Progress". Used whenever the user explicitly logs a fresh session against a
+    /// finished game -- e.g. resolving a "New Games" entry via "Continue That Entry" (whether
+    /// that's a genuine replay prompt or the general "Map to Existing" picker landing on a
+    /// finished game) -- since continuing to pile hours onto a game that still reads as
+    /// "Completed" would be misleading. No-op if the game isn't currently finished.
+    pub fn resume_finished_game(&self, game_id: i32) -> Result<serde_json::Value, String> {
+        let mut obj = self.game_payload_base(game_id)?;
+        let status = obj.get("status").and_then(|v| v.as_str());
+        if !matches!(status, Some("Completed") | Some("DNF")) {
+            return Ok(serde_json::Value::Object(obj));
+        }
+        obj.insert("dnf".to_string(), serde_json::json!(false));
+        obj.insert("end_date".to_string(), serde_json::Value::Null);
+        obj.insert("status_override".to_string(), serde_json::Value::Null);
+        self.put_game(game_id, serde_json::Value::Object(obj))
+    }
+
     /// If the game is currently in "Imported" status (added via FrogLog's Steam library bulk
     /// import, which sets `hours_played` from Steam but never a `start_date` -- so it shows as
     /// "owned" but never actually started), transitions it to "In Progress" by setting

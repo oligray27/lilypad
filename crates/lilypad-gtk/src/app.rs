@@ -422,23 +422,28 @@ fn build_window(app: &adw::Application, state: AppState) {
                         }
                         refresh_tray();
                     }
-                    MonitorEvent::UnmappedGameSessionEnded { title, appid, exe_name, duration_secs } => {
+                    MonitorEvent::UnmappedGameSessionEnded { title, appid, exe_name, duration_secs, replay_of } => {
                         let raw_hours = duration_secs / 3600.0;
                         let hours = {
                             let r = (raw_hours * 100.0).round() / 100.0;
                             if r < 0.01 { 0.01 } else { r }
                         };
-                        lilypad_core::config::record_pending_game_submission(&appid, &title, &exe_name, hours);
+                        lilypad_core::config::record_pending_game_submission(&appid, &title, &exe_name, hours, replay_of.clone());
                         let total_mins = (duration_secs / 60.0).round() as u64;
                         let time_str = if total_mins >= 60 {
                             format!("{}h {}m", total_mins / 60, total_mins % 60)
                         } else {
                             format!("{total_mins}m")
                         };
+                        let notif_body = if replay_of.is_some() {
+                            format!("{title} ({time_str}) is marked as finished in FrogLog. Resolve?")
+                        } else {
+                            format!("{title} ({time_str}) isn't in your FrogLog yet.")
+                        };
                         let app_tx = app_tx.clone();
                         notify::show_with_action(
                             "Session Recorded",
-                            &format!("{title} ({time_str}) isn't in your FrogLog yet."),
+                            &notif_body,
                             "Go to New Games",
                             move || {
                                 let _ = app_tx.send_blocking(AppAction::GoToNewGames);

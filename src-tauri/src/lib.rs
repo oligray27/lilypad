@@ -896,6 +896,86 @@ fn resolve_pending_game_as_new(
     Ok(created)
 }
 
+/// Resolves a pending game submission flagged as a possible replay (`entry.replay_of` is
+/// `Some`) by creating a brand-new FrogLog game entry for it — distinct from the old
+/// Completed/DNF entry, which is left untouched. Mirrors `resolve_pending_game_as_new`, but
+/// skips the IGDB lookup entirely: the game is already known (same Steam appid as the existing
+/// entry), so this just fetches that entry's own details via `GET /games/{id}` and reuses them
+/// as the starting point for the new row, rather than re-deriving them from an IGDB search.
+/// `replay: true` is set explicitly rather than relying on the backend's title-based auto-detect
+/// on `POST /games` — we already know for certain this is the same title, no guessing needed.
+#[tauri::command]
+fn resolve_pending_game_as_replay(
+    state: tauri::State<AppState>,
+    appid: String,
+) -> Result<serde_json::Value, String> {
+    let pending = config::load_pending_game_submissions();
+    let entry = pending
+        .iter()
+        .find(|p| p.appid == appid)
+        .ok_or("Pending submission not found")?
+        .clone();
+    let replay_of = entry.replay_of.clone().ok_or("Pending submission has no replay match")?;
+
+    let auth = state.auth.read().unwrap();
+    let client = api_client(&auth).ok_or("Not logged in")?;
+
+    let mut payload = client.get_game_raw(replay_of.id)?;
+    let obj = payload.as_object_mut().ok_or("Unexpected response shape")?;
+    // Strip everything identity/progress-related from the old entry -- this is a fresh
+    // playthrough, not a continuation, so none of it should carry over.
+    for field in ["id", "hours_played", "start_date", "end_date", "status", "status_override", "user_id", "created_at"] {
+        obj.remove(field);
+    }
+    obj.insert("dnf".to_string(), serde_json::json!(false));
+    obj.insert("session_tracking".to_string(), serde_json::json!(true));
+    obj.insert("replay".to_string(), serde_json::json!(true));
+    if let Some(start_date) = chrono::DateTime::from_timestamp(entry.first_seen_secs as i64, 0)
+        .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
+    {
+        obj.insert("start_date".to_string(), serde_json::json!(start_date));
+    }
+
+    let created = client.create_game(payload)?;
+    let created_id = created.get("id").and_then(|v| v.as_i64()).ok_or("Created game missing id")?;
+    let created_title = created.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    client.add_game_session(
+        created_id as i32,
+        Some(date),
+        Some(entry.hours),
+        Some("Session logged from LilyPad".to_string()),
+        false,
+        true,
+        None,
+    )?;
+
+    config::remove_pending_game_submission(&appid);
+
+    // Link the exe to the newly-created replay entry, not the old one, so future sessions of
+    // this playthrough are tracked against it instead of falling through detection again.
+    if !entry.exe_name.is_empty() {
+        if let Err(e) = config::link_process_mapping(
+            &state.process_map_arc,
+            &auth,
+            entry.exe_name.clone(),
+            "session".to_string(),
+            created_id as i32,
+            created_title.or(Some(replay_of.title)),
+        ) {
+            log::warn!("[LilyPad] failed to link newly-created replay's exe: {e}");
+        }
+    }
+
+    // Without this, the library index only refreshes every 5 minutes -- relaunching the same
+    // appid shortly after resolving it here would still see the old Completed/DNF entry and
+    // prompt the replay question all over again instead of auto-linking to the new entry.
+    refresh_library_index_state(&state);
+
+    Ok(created)
+}
+
 /// Resolves a pending game submission by logging its accumulated hours against a game/live
 /// service entry the user already has in their FrogLog library.
 #[tauri::command]
@@ -927,6 +1007,12 @@ fn resolve_pending_game_as_existing(
         if let Err(e) = client.enable_session_tracking(game_id) {
             log::warn!("[LilyPad] failed to enable session tracking: {e}");
         }
+        // If this game is currently Completed/DNF, logging a fresh session against it means
+        // it's being played again -- clear its end date so it reads as "In Progress" instead of
+        // silently piling hours onto a game that still looks finished. No-op otherwise.
+        if let Err(e) = client.resume_finished_game(game_id) {
+            log::warn!("[LilyPad] failed to resume finished game: {e}");
+        }
         "session".to_string()
     };
     if effective_game_type == "live" {
@@ -957,6 +1043,12 @@ fn resolve_pending_game_as_existing(
             log::warn!("[LilyPad] failed to link exe to existing game: {e}");
         }
     }
+
+    // Without this, the library index only refreshes every 5 minutes -- relaunching the same
+    // exe shortly after resolving it here would still see the old Completed/DNF status and
+    // prompt the replay question all over again instead of resuming normally. Matches the GTK
+    // build's `resolve_as_existing`, which already does this.
+    refresh_library_index_state(&state);
 
     Ok(())
 }
@@ -1280,6 +1372,7 @@ pub fn run() {
             search_igdb_games,
             resolve_pending_game_as_new,
             resolve_pending_game_as_existing,
+            resolve_pending_game_as_replay,
             intercept_auto_submit,
             get_auth_config,
             get_process_mappings,
@@ -1604,13 +1697,18 @@ pub fn run() {
                 library_index_arc,
                 {
                     let handle = app_handle_for_unmapped;
-                    move |title: String, appid: String, exe_name: String, duration_secs: f64| {
+                    move |title: String, appid: String, exe_name: String, duration_secs: f64, replay_of: Option<lilypad_core::library_match::ResolvedLibraryGame>| {
                         let raw_hours = duration_secs / 3600.0;
                         let hours = { let r = (raw_hours * 100.0).round() / 100.0; if r < 0.01 { 0.01 } else { r } };
-                        config::record_pending_game_submission(&appid, &title, &exe_name, hours);
+                        let replay_of = replay_of.map(|r| config::ReplayOf { id: r.id, game_type: r.game_type, title: r.title, status: r.status });
+                        config::record_pending_game_submission(&appid, &title, &exe_name, hours, replay_of.clone());
                         let total_mins = (duration_secs / 60.0).round() as u64;
                         let time_str = if total_mins >= 60 { format!("{}h {}m", total_mins / 60, total_mins % 60) } else { format!("{}m", total_mins) };
-                        let body = format!("{title} ({time_str}) isn't in your FrogLog yet.");
+                        let body = if replay_of.is_some() {
+                            format!("{title} ({time_str}) is marked as finished in FrogLog. Resolve?")
+                        } else {
+                            format!("{title} ({time_str}) isn't in your FrogLog yet.")
+                        };
                         show_pending_game_toast(&body, handle.clone());
                         let handle_tray = handle.clone();
                         let _ = handle.run_on_main_thread(move || {

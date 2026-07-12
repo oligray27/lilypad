@@ -220,7 +220,11 @@ pub fn build(
         let error_label = error_label.clone();
         Rc::new(move || {
             let vs = view_state.borrow();
-            let conflicts = mappings_model::detect_conflicts(&vs.pending);
+            // Only compare mappings for rows still visible in the table -- a mapping left over
+            // on an older, now-hidden replay duplicate (see `dedupe_latest_by_title`) shouldn't
+            // flag a conflict the user has no row to see or fix.
+            let visible_keys: HashSet<MapKey> = vs.all_rows.iter().map(|r| r.key()).collect();
+            let conflicts = mappings_model::detect_conflicts(&vs.pending, &visible_keys);
             let dirty = mappings_model::is_dirty(&vs.pending, &vs.saved);
             apply_button.set_sensitive(conflicts.is_empty() && dirty);
             if conflicts.is_empty() {
@@ -555,6 +559,9 @@ pub fn build(
                                 game_type: "live".into(),
                             }))
                             .collect();
+                        // Collapse replay duplicates (same title, multiple `games` rows) down to
+                        // just the most recent playthrough -- see `dedupe_latest_by_title`.
+                        let rows = mappings_model::dedupe_latest_by_title(rows);
 
                         let staged = StagedMappings::from_process_mappings(&state.process_map.read().unwrap().mappings);
                         {

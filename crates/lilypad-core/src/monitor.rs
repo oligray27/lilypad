@@ -1,7 +1,7 @@
 //! Process monitor: WMI event-based start detection (Windows), poll-based fallback.
 
 use crate::config::{ProcessMapConfig, ProcessMapping};
-use crate::library_match::LibraryIndex;
+use crate::library_match::{is_finished_status, LibraryIndex, ResolvedLibraryGame};
 use crate::steam::{find_installed_game_for_exe_or_cmd, InstalledGame};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -45,12 +45,13 @@ fn is_known_helper_process(exe_name: &str) -> bool {
 }
 
 /// Blocks until the given PID exits, then fires `on_unmapped_session_ended(title, appid,
-/// exe_name, duration_secs)`, releases the appid from `currently_tracking` so a later relaunch
-/// of the same game starts a fresh tracked session, and records the appid's end time in
-/// `last_ended_unmapped` so a trailing companion process (e.g. a crash reporter that outlives
-/// the game briefly) doesn't get misattributed as a second session. Mirrors `run_wait_thread`'s
-/// exit-detection logic, but for an unmapped (no `ProcessMapping`) installed game rather than
-/// a tracked one.
+/// exe_name, duration_secs, replay_of)`, releases the appid from `currently_tracking` so a
+/// later relaunch of the same game starts a fresh tracked session, and records the appid's end
+/// time in `last_ended_unmapped` so a trailing companion process (e.g. a crash reporter that
+/// outlives the game briefly) doesn't get misattributed as a second session. Mirrors
+/// `run_wait_thread`'s exit-detection logic, but for an unmapped (no `ProcessMapping`) installed
+/// game rather than a tracked one. `replay_of` is `Some` when this appid actually matches an
+/// existing but finished (Completed/DNF) library entry — see `maybe_start_unmapped_tracking`.
 #[allow(clippy::too_many_arguments)]
 fn run_unmapped_wait_thread(
     pid: Pid,
@@ -58,9 +59,10 @@ fn run_unmapped_wait_thread(
     appid: String,
     exe_name: String,
     started_at: Instant,
+    replay_of: Option<ResolvedLibraryGame>,
     currently_tracking: Arc<RwLock<HashSet<String>>>,
     last_ended_unmapped: Arc<RwLock<HashMap<String, Instant>>>,
-    on_unmapped_session_ended: Arc<dyn Fn(String, String, String, f64) + Send + Sync>,
+    on_unmapped_session_ended: Arc<dyn Fn(String, String, String, f64, Option<ResolvedLibraryGame>) + Send + Sync>,
 ) {
     std::thread::spawn(move || {
         let mut system = System::new_all();
@@ -81,23 +83,91 @@ fn run_unmapped_wait_thread(
         let duration_secs = started_at.elapsed().as_secs_f64();
         currently_tracking.write().unwrap().remove(&appid);
         last_ended_unmapped.write().unwrap().insert(appid.clone(), Instant::now());
-        on_unmapped_session_ended(title, appid, exe_name, duration_secs);
+        on_unmapped_session_ended(title, appid, exe_name, duration_secs, replay_of);
     });
 }
 
+/// Decides whether an *existing* `ProcessMapping` should still be trusted for normal tracking,
+/// or whether the mapped game's current (freshly refreshed) status makes this launch look like
+/// a possible replay. `None` means proceed with normal tracking as always -- not finished, which
+/// covers both "never was" and "was, but `resolve_as_existing`'s `resume_finished_game` call
+/// already reset it back to In Progress after the user picked Continue last time". `Some` means
+/// the caller should skip normal tracking for this launch and instead route it through
+/// `start_replay_prompt_tracking`, exactly like a genuinely unmapped detection. Deliberately has
+/// no separate "already asked about this" memory: the mapped game's live status *is* that
+/// signal, and unlike a persisted flag it can't go stale -- it only reads as finished when the
+/// game is actually, currently finished, whether that's the first time or the fifth.
+fn check_mapped_game_needs_replay_prompt(mapping: &ProcessMapping, library_index: &LibraryIndex) -> Option<ResolvedLibraryGame> {
+    if mapping.r#type.eq_ignore_ascii_case("live") {
+        return None; // live-service games have no finished state
+    }
+    let resolved = library_index.resolve_by_id(mapping.froglog_id)?;
+    if !is_finished_status(&resolved.status) {
+        return None;
+    }
+    Some(resolved.clone())
+}
+
+/// Starts tracking a play session for an already-mapped exe whose target game looks like an
+/// unacknowledged possible replay (see `check_mapped_game_needs_replay_prompt`), instead of the
+/// normal `on_session_started`/`on_session_ended` flow — reuses the same background wait-thread
+/// and pending-submission mechanism as a genuinely unmapped detection (`run_unmapped_wait_thread`),
+/// so it surfaces in New Games with the "Continue That Entry" / "Log as New Replay" choice
+/// rather than silently resuming the finished entry. Since a `ProcessMapping` has no Steam
+/// appid of its own, a synthetic `"mapped:<froglog_id>"` key stands in for one — `PendingGameSubmission.appid`
+/// is just an opaque dedup/lookup key everywhere it's used, never assumed to be a real Steam id
+/// except when parsed for an appid-based IGDB lookup, which the replay UI never does. Returns
+/// `false` (does nothing) if a wait-thread for this same mapping is already running, so this is
+/// safe to call on every poll tick / title-filter check while the game keeps running.
+fn start_replay_prompt_tracking(
+    pid: Pid,
+    mapping: &ProcessMapping,
+    resolved: ResolvedLibraryGame,
+    currently_tracking_unmapped: &Arc<RwLock<HashSet<String>>>,
+    last_ended_unmapped: &Arc<RwLock<HashMap<String, Instant>>>,
+    on_unmapped_session_ended: &Arc<dyn Fn(String, String, String, f64, Option<ResolvedLibraryGame>) + Send + Sync>,
+) -> bool {
+    let synthetic_appid = format!("mapped:{}", mapping.froglog_id);
+    {
+        let mut tracking = currently_tracking_unmapped.write().unwrap();
+        if tracking.contains(&synthetic_appid) {
+            return false;
+        }
+        tracking.insert(synthetic_appid.clone());
+    }
+    let title = mapping.title.clone().unwrap_or_else(|| resolved.title.clone());
+    run_unmapped_wait_thread(
+        pid,
+        title,
+        synthetic_appid,
+        mapping.process.clone(),
+        Instant::now(),
+        Some(resolved),
+        Arc::clone(currently_tracking_unmapped),
+        Arc::clone(last_ended_unmapped),
+        Arc::clone(on_unmapped_session_ended),
+    );
+    true
+}
+
 /// Handles a process that doesn't match any `ProcessMapping`, but does match an installed
-/// Steam game. Two outcomes:
-/// - The game is already in the FrogLog library under a known Steam appid (`resolve_by_appid`)
-///   but has no `ProcessMapping` yet (e.g. resolved from a "New Games" entry, or added to
-///   FrogLog directly on the website). `on_already_owned_game_needs_link` fires so the caller
-///   can persist the new mapping, and the mapping is also returned so the caller can start
-///   tracking *this* launch immediately — deferring to "the next poll tick / launch will pick
-///   it up" would silently drop the current session entirely on the WMI path, since a process-
-///   start event never refires just because a mapping appeared afterward.
-/// - Otherwise, starts a background wait-thread (see `run_unmapped_wait_thread`) so the full
-///   play session gets recorded once the game exits, guarded by `currently_tracking` so this is
-///   safe to call on every poll tick / WMI event without spawning duplicate wait-threads for a
-///   game that's still running.
+/// Steam game. Three outcomes:
+/// - The game is already in the FrogLog library under a known Steam appid (`resolve_by_appid`),
+///   its status isn't Completed/DNF, and it has no `ProcessMapping` yet (e.g. resolved from a
+///   "New Games" entry, or added to FrogLog directly on the website). `on_already_owned_game_needs_link`
+///   fires so the caller can persist the new mapping, and the mapping is also returned so the
+///   caller can start tracking *this* launch immediately — deferring to "the next poll tick /
+///   launch will pick it up" would silently drop the current session entirely on the WMI path,
+///   since a process-start event never refires just because a mapping appeared afterward.
+/// - The game resolves by appid but its status IS Completed/DNF — relaunching it looks more
+///   like a deliberate replay than a continuation, so instead of silently resuming the old
+///   entry, this falls through to the same background wait-thread as a genuinely new game, just
+///   carrying `replay_of` so the caller can ask the user "continue that entry, or log this as a
+///   new replay?" once the session ends, rather than guessing.
+/// - Otherwise (no library match at all), starts a background wait-thread (see
+///   `run_unmapped_wait_thread`) so the full play session gets recorded once the game exits,
+///   guarded by `currently_tracking` so this is safe to call on every poll tick / WMI event
+///   without spawning duplicate wait-threads for a game that's still running.
 #[allow(clippy::too_many_arguments)]
 fn maybe_start_unmapped_tracking(
     exe_path: Option<&Path>,
@@ -107,7 +177,7 @@ fn maybe_start_unmapped_tracking(
     library_index: &Arc<RwLock<LibraryIndex>>,
     currently_tracking: &Arc<RwLock<HashSet<String>>>,
     last_ended_unmapped: &Arc<RwLock<HashMap<String, Instant>>>,
-    on_unmapped_session_ended: &Arc<dyn Fn(String, String, String, f64) + Send + Sync>,
+    on_unmapped_session_ended: &Arc<dyn Fn(String, String, String, f64, Option<ResolvedLibraryGame>) + Send + Sync>,
     on_already_owned_game_needs_link: &Arc<dyn Fn(ProcessMapping) + Send + Sync>,
 ) -> Option<ProcessMapping> {
     // The matched path may be a translated Proton/Wine command-line argument rather than
@@ -139,33 +209,41 @@ fn maybe_start_unmapped_tracking(
         }
     }
 
-    if let Some(resolved) = library_index.read().unwrap().resolve_by_appid(&found.appid) {
-        last_ended_unmapped.write().unwrap().insert(found.appid.clone(), Instant::now());
-        // Anything LilyPad auto-links itself should end up session-tracked, not "regular"
-        // (single running hours_played total) -- session data is strictly more useful, and the
-        // caller is responsible for actually flipping session_tracking on server-side (see
-        // `fix_imported_status_if_needed`'s sibling call, `enable_session_tracking`, in the
-        // per-platform on_already_owned_game_needs_link callback). Doesn't apply to live-service
-        // games, which are a separate concept entirely. Setting it here (rather than leaving it
-        // as whatever `resolved.game_type` already says) matters because this exact value is
-        // what decides how *this* session gets submitted once it ends -- if it stayed "regular"
-        // here, this session's hours would go through `update_game_hours` instead of
-        // `add_game_session`, silently missing the session-tracking flip happening
-        // asynchronously alongside it.
-        let game_type = if resolved.game_type.eq_ignore_ascii_case("live") {
-            resolved.game_type.clone()
-        } else {
-            "session".to_string()
-        };
-        let mapping = ProcessMapping {
-            process: exe_name.to_string(),
-            r#type: game_type,
-            froglog_id: resolved.id,
-            title: Some(resolved.title.clone()),
-            title_filter: None,
-        };
-        on_already_owned_game_needs_link(mapping.clone());
-        return Some(mapping);
+    let mut replay_of = None;
+    if let Some(resolved) = library_index.read().unwrap().resolve_by_appid(&found.appid).cloned() {
+        if !is_finished_status(&resolved.status) {
+            last_ended_unmapped.write().unwrap().insert(found.appid.clone(), Instant::now());
+            // Anything LilyPad auto-links itself should end up session-tracked, not "regular"
+            // (single running hours_played total) -- session data is strictly more useful, and the
+            // caller is responsible for actually flipping session_tracking on server-side (see
+            // `fix_imported_status_if_needed`'s sibling call, `enable_session_tracking`, in the
+            // per-platform on_already_owned_game_needs_link callback). Doesn't apply to live-service
+            // games, which are a separate concept entirely. Setting it here (rather than leaving it
+            // as whatever `resolved.game_type` already says) matters because this exact value is
+            // what decides how *this* session gets submitted once it ends -- if it stayed "regular"
+            // here, this session's hours would go through `update_game_hours` instead of
+            // `add_game_session`, silently missing the session-tracking flip happening
+            // asynchronously alongside it.
+            let game_type = if resolved.game_type.eq_ignore_ascii_case("live") {
+                resolved.game_type.clone()
+            } else {
+                "session".to_string()
+            };
+            let mapping = ProcessMapping {
+                process: exe_name.to_string(),
+                r#type: game_type,
+                froglog_id: resolved.id,
+                title: Some(resolved.title.clone()),
+                title_filter: None,
+            };
+            on_already_owned_game_needs_link(mapping.clone());
+            return Some(mapping);
+        }
+        // Matched appid, but the entry is Completed/DNF -- don't silently resume it. Fall
+        // through to the wait-thread path below like a genuinely new game, carrying the match
+        // along so the caller can ask "continue that entry, or start a new replay?" once this
+        // session ends.
+        replay_of = Some(resolved);
     }
     {
         let mut tracking = currently_tracking.write().unwrap();
@@ -180,6 +258,7 @@ fn maybe_start_unmapped_tracking(
         found.appid,
         exe_name.to_string(),
         Instant::now(),
+        replay_of,
         Arc::clone(currently_tracking),
         Arc::clone(last_ended_unmapped),
         Arc::clone(on_unmapped_session_ended),
@@ -411,7 +490,7 @@ fn try_run_wmi_watch(
     library_index: Arc<RwLock<LibraryIndex>>,
     currently_tracking_unmapped: Arc<RwLock<HashSet<String>>>,
     last_ended_unmapped: Arc<RwLock<HashMap<String, Instant>>>,
-    on_unmapped_session_ended: Arc<dyn Fn(String, String, String, f64) + Send + Sync + 'static>,
+    on_unmapped_session_ended: Arc<dyn Fn(String, String, String, f64, Option<ResolvedLibraryGame>) + Send + Sync + 'static>,
     on_already_owned_game_needs_link: Arc<dyn Fn(ProcessMapping) + Send + Sync + 'static>,
 ) -> bool {
     use serde::Deserialize;
@@ -530,12 +609,23 @@ fn try_run_wmi_watch(
                         }
                     }
                 }
+                let mapping = candidates.into_iter().next().unwrap();
+                let pid = Pid::from(event.process_id as usize);
+                if let Some(resolved) = check_mapped_game_needs_replay_prompt(&mapping, &library_index.read().unwrap()) {
+                    start_replay_prompt_tracking(
+                        pid,
+                        &mapping,
+                        resolved,
+                        &currently_tracking_unmapped,
+                        &last_ended_unmapped,
+                        &on_unmapped_session_ended,
+                    );
+                    continue;
+                }
                 let mut cur = current_session.write().unwrap();
                 if cur.is_some() {
                     continue;
                 }
-                let mapping = candidates.into_iter().next().unwrap();
-                let pid = Pid::from(event.process_id as usize);
                 let started_at = Instant::now();
                 *cur = Some(ActiveSession {
                     process_name: event.process_name.clone(),
@@ -554,6 +644,10 @@ fn try_run_wmi_watch(
                 let process_id = event.process_id;
                 let last_ended_clone = Arc::clone(&last_ended);
                 let force_stopped_clone = Arc::clone(&force_stopped_process);
+                let library_index_tf = Arc::clone(&library_index);
+                let currently_tracking_unmapped_tf = Arc::clone(&currently_tracking_unmapped);
+                let last_ended_unmapped_tf = Arc::clone(&last_ended_unmapped);
+                let on_unmapped_session_ended_tf = Arc::clone(&on_unmapped_session_ended);
 
                 std::thread::spawn(move || {
                     let pid = Pid::from(process_id as usize);
@@ -585,6 +679,17 @@ fn try_run_wmi_watch(
                         }
                         let window_titles = get_window_titles_for_pid(process_id);
                         if let Some(mapping) = pick_mapping(&candidates, &window_titles) {
+                            if let Some(resolved) = check_mapped_game_needs_replay_prompt(&mapping, &library_index_tf.read().unwrap()) {
+                                start_replay_prompt_tracking(
+                                    pid,
+                                    &mapping,
+                                    resolved,
+                                    &currently_tracking_unmapped_tf,
+                                    &last_ended_unmapped_tf,
+                                    &on_unmapped_session_ended_tf,
+                                );
+                                return;
+                            }
                             let mut cur = current_session.write().unwrap();
                             if cur.is_some() {
                                 return;
@@ -616,11 +721,12 @@ fn try_run_wmi_watch(
 ///
 /// `installed_games` and `library_index` are refreshed by the caller (Steam library scan +
 /// FrogLog games/wishlist fetch, respectively) and read live here, the same way `config` is.
-/// `on_unmapped_session_ended(title, appid, exe_name, duration_secs)` fires once per full play
-/// session (launch to close) of a process that doesn't match any `ProcessMapping` but does
-/// match an installed Steam game that isn't already in the user's FrogLog library — the whole
-/// session's duration is tracked in the background the same way a mapped session would be, so
-/// the caller finds out (and can notify) only once the game has actually closed.
+/// `on_unmapped_session_ended(title, appid, exe_name, duration_secs, replay_of)` fires once per
+/// full play session (launch to close) of a process that doesn't match any `ProcessMapping` and
+/// either doesn't match anything in the user's FrogLog library at all, or matches an entry
+/// that's Completed/DNF (`replay_of` is `Some` in that case — see `maybe_start_unmapped_tracking`)
+/// — the whole session's duration is tracked in the background the same way a mapped session
+/// would be, so the caller finds out (and can notify) only once the game has actually closed.
 /// `on_already_owned_game_needs_link(mapping)` fires instead when the installed game turns out
 /// to already be in the library (by exact Steam appid) but just has no `ProcessMapping` yet —
 /// the caller should persist it. The *current* launch is tracked immediately using that same
@@ -637,7 +743,7 @@ pub fn run_poll_loop(
     mut on_session_ended: impl FnMut(String, ProcessMapping, f64) + Send + 'static,
     installed_games: Arc<RwLock<Vec<InstalledGame>>>,
     library_index: Arc<RwLock<LibraryIndex>>,
-    on_unmapped_session_ended: impl Fn(String, String, String, f64) + Send + Sync + 'static,
+    on_unmapped_session_ended: impl Fn(String, String, String, f64, Option<ResolvedLibraryGame>) + Send + Sync + 'static,
     on_already_owned_game_needs_link: impl Fn(ProcessMapping) + Send + Sync + 'static,
 ) {
     let (tx, rx) = mpsc::channel::<(String, ProcessMapping, f64)>();
@@ -659,7 +765,7 @@ pub fn run_poll_loop(
     // Wrap in Arc so it can be shared between WMI path and polling fallback.
     let on_started: Arc<dyn Fn(String, ProcessMapping) + Send + Sync + 'static> =
         Arc::new(on_session_started);
-    let on_unmapped_ended: Arc<dyn Fn(String, String, String, f64) + Send + Sync + 'static> =
+    let on_unmapped_ended: Arc<dyn Fn(String, String, String, f64, Option<ResolvedLibraryGame>) + Send + Sync + 'static> =
         Arc::new(on_unmapped_session_ended);
     let on_already_owned: Arc<dyn Fn(ProcessMapping) + Send + Sync + 'static> =
         Arc::new(on_already_owned_game_needs_link);
@@ -832,6 +938,17 @@ pub fn run_poll_loop(
                                 candidates.into_iter().next()
                             };
                             if let Some(mapping) = mapping {
+                                if let Some(resolved) = check_mapped_game_needs_replay_prompt(&mapping, &library_index_poll.read().unwrap()) {
+                                    start_replay_prompt_tracking(
+                                        *pid,
+                                        &mapping,
+                                        resolved,
+                                        &currently_tracking_unmapped_poll,
+                                        &last_ended_unmapped_poll,
+                                        &on_unmapped_ended_poll,
+                                    );
+                                    continue 'proc_scan;
+                                }
                                 *cur = Some(ActiveSession {
                                     process_name: name.clone(),
                                     mapping: mapping.clone(),

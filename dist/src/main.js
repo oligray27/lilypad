@@ -196,7 +196,21 @@ async function loadNewGamesView() {
     list.innerHTML = NEW_GAMES_EMPTY_HTML;
     return;
   }
-  list.innerHTML = items.map((g) => `
+  list.innerHTML = items.map((g) => g.replay_of ? `
+    <div class="pending-item" data-appid="${escapeAttr(g.appid)}" data-replay-game-type="${escapeAttr(g.replay_of.game_type)}" data-replay-game-id="${g.replay_of.id}" data-replay-game-title="${escapeAttr(g.replay_of.title)}">
+      <div class="pending-title">${escapeHtml(g.title)}</div>
+      <div class="pending-meta">
+        <span>${g.hours}h · ${g.session_count} session${g.session_count === 1 ? '' : 's'}. This game is already marked as ${escapeHtml(g.replay_of.status || 'finished')}</span>
+      </div>
+      <p class="muted" style="font-size:0.85rem;margin:0.25rem 0;">Logging to the most recent entry will remove its end date and return it to "In Progress" status.</p>
+      <div class="pending-actions">
+        <button type="button" class="newgame-continue">Log to most recent entry</button>
+        <button type="button" class="newgame-replay">Create and log to new entry (replay)</button>
+        <button type="button" class="pending-delete newgame-dismiss">Dismiss</button>
+        <span class="pending-status"></span>
+      </div>
+    </div>
+  ` : `
     <div class="pending-item" data-appid="${escapeAttr(g.appid)}">
       <div class="pending-title">${escapeHtml(g.title)}</div>
       <div class="pending-meta">
@@ -229,6 +243,7 @@ async function loadNewGamesView() {
       </div>
       <div class="newgame-map-panel" hidden>
         <select class="newgame-map-select"></select>
+        <p class="muted" style="font-size:0.85rem;margin:0.25rem 0;">If the selected game is already marked Completed or DNF, logging hours here will clear its end date and return it to "In Progress" status.</p>
         <button type="button" class="newgame-map-confirm">Log Hours</button>
       </div>
     </div>
@@ -245,6 +260,60 @@ async function loadNewGamesView() {
       item.remove();
       invoke('refresh_tray_menu').catch(() => {});
       removeCardIfEmpty();
+    });
+  });
+
+  // Possible-replay items: appid matched an existing Completed/DNF entry, so instead of the
+  // usual Create/Map flow the user just picks whether this session belongs to that entry after
+  // all, or is a fresh replay that should get its own new entry.
+  list.querySelectorAll('.newgame-continue').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const item = btn.closest('[data-appid]');
+      const status = item.querySelector('.pending-status');
+      const replayBtn = item.querySelector('.newgame-replay');
+      btn.disabled = true;
+      if (replayBtn) replayBtn.disabled = true;
+      status.textContent = 'Logging…';
+      status.style.color = '';
+      try {
+        await invoke('resolve_pending_game_as_existing', {
+          appid: item.dataset.appid,
+          gameType: item.dataset.replayGameType,
+          gameId: parseInt(item.dataset.replayGameId, 10),
+          gameTitle: item.dataset.replayGameTitle,
+        });
+        item.remove();
+        invoke('refresh_tray_menu').catch(() => {});
+        removeCardIfEmpty();
+      } catch (err) {
+        btn.disabled = false;
+        if (replayBtn) replayBtn.disabled = false;
+        status.textContent = String(err);
+        status.style.color = 'red';
+      }
+    });
+  });
+
+  list.querySelectorAll('.newgame-replay').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const item = btn.closest('[data-appid]');
+      const status = item.querySelector('.pending-status');
+      const continueBtn = item.querySelector('.newgame-continue');
+      btn.disabled = true;
+      if (continueBtn) continueBtn.disabled = true;
+      status.textContent = 'Creating…';
+      status.style.color = '';
+      try {
+        await invoke('resolve_pending_game_as_replay', { appid: item.dataset.appid });
+        item.remove();
+        invoke('refresh_tray_menu').catch(() => {});
+        removeCardIfEmpty();
+      } catch (err) {
+        btn.disabled = false;
+        if (continueBtn) continueBtn.disabled = false;
+        status.textContent = String(err);
+        status.style.color = 'red';
+      }
     });
   });
 
@@ -454,6 +523,31 @@ const MAPPINGS_PAGE_SIZE = 6;
 function mappingKey(type, id) {
   return `${type}:${id}`;
 }
+// Collapses rows that share a title down to just the most recent one -- the replay feature
+// creates a brand-new game row for each fresh playthrough rather than reusing an old completed
+// one, so without this the mappings table fills up with old, already-finished duplicates of the
+// same game. "Most recent" is the highest id (Postgres SERIAL ids are monotonically increasing
+// per insert, and a replay's new row is always inserted after the one it replays), which also
+// means a game just resolved via "Log as New Replay" naturally becomes the one shown here,
+// since its row is newer than the entry it replaced. Live-service rows are left alone -- the
+// replay feature only ever creates regular game rows, so live entries can't have this kind of
+// duplicate, and title-deduping them could otherwise wrongly hide a distinct live-service game
+// and a regular game that happen to share a title.
+function dedupeLatestByTitle(rows) {
+  const latestByTitle = new Map();
+  const out = [];
+  for (const row of rows) {
+    if (row.type === 'live') {
+      out.push(row);
+      continue;
+    }
+    const key = row.title.trim().toLowerCase();
+    const existing = latestByTitle.get(key);
+    if (!existing || existing.id < row.id) latestByTitle.set(key, row);
+  }
+  out.push(...latestByTitle.values());
+  return out;
+}
 function exeByGame(mappings) {
   const out = {};
   (mappings || []).forEach((m) => {
@@ -624,10 +718,10 @@ async function loadMappingsView() {
     pendingTitleFilterFor = { ...loadedTitleFilter };
     savedExeFor = { ...loadedExe };
     savedTitleFilterFor = { ...loadedTitleFilter };
-    mappingsAllRows = [
+    mappingsAllRows = dedupeLatestByTitle([
       ...(games || []).map((g) => ({ id: g.id, title: g.title || `#${g.id}`, type: g.session_tracking ? 'session' : 'regular' })),
       ...(liveService || []).map((g) => ({ id: g.id, title: g.title || `#${g.id}`, type: 'live' })),
-    ];
+    ]);
     mappingsMode = 'regular';
     mappingsPage = 0;
     mappingsSearch = '';
@@ -683,8 +777,13 @@ Conflict = two different entries sharing the same exe where:
 function detectConflicts() {
     const conflicts = new Set();
     const byExe = {};
-    
+    // Only compare mappings for rows still visible in the table -- a mapping left over on an
+    // older, now-hidden replay duplicate (see dedupeLatestByTitle) shouldn't flag a conflict
+    // the user has no row to see or fix.
+    const visibleKeys = new Set(mappingsAllRows.map((r) => mappingKey(r.type, r.id)));
+
     for (const [key, exe] of Object.entries(pendingExeFor)) {
+        if (!visibleKeys.has(key)) continue;
         if (!exe) continue;
         const exeLower = exe.toLowerCase();
         if (!byExe[exeLower]) byExe[exeLower] = [];

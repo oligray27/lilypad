@@ -1,6 +1,6 @@
 use crate::session_flow::client_for;
 use crate::state::AppState;
-use lilypad_core::config::{self, ProcessMapping};
+use lilypad_core::config::{self, ProcessMapping, ReplayOf};
 use lilypad_core::monitor::run_poll_loop;
 
 /// Events pushed from the monitor's background threads; consumed on the GTK main
@@ -21,6 +21,9 @@ pub enum MonitorEvent {
         appid: String,
         exe_name: String,
         duration_secs: f64,
+        /// Set when this appid actually matches an existing but Completed/DNF library entry —
+        /// this is a possible replay, not a genuinely unknown game. See `ReplayOf`.
+        replay_of: Option<ReplayOf>,
     },
 }
 
@@ -50,12 +53,13 @@ pub fn start(state: &AppState, tx: async_channel::Sender<MonitorEvent>) {
         },
         state.installed_games.clone(),
         state.library_index.clone(),
-        move |title, appid, exe_name, duration_secs| {
+        move |title, appid, exe_name, duration_secs, replay_of| {
             let _ = tx_unmapped.send_blocking(MonitorEvent::UnmappedGameSessionEnded {
                 title,
                 appid,
                 exe_name,
                 duration_secs,
+                replay_of: replay_of.map(|r| ReplayOf { id: r.id, game_type: r.game_type, title: r.title, status: r.status }),
             });
         },
         move |mapping: ProcessMapping| {

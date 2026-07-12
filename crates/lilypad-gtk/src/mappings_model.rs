@@ -32,6 +32,36 @@ impl GameRow {
     }
 }
 
+/// Collapses rows that share a title down to just the most recent one -- the replay feature
+/// creates a brand-new `games` row for each fresh playthrough rather than reusing an old
+/// completed one, so without this the mappings table fills up with old, already-finished
+/// duplicates of the same game. "Most recent" is the highest `id` (Postgres SERIAL ids are
+/// monotonically increasing per insert, and a replay's new row is always inserted after the one
+/// it replays), which also means a game just resolved via "Log as New Replay" naturally becomes
+/// the one shown here, since its row is newer than the entry it replaced. Live-service rows are
+/// left alone -- the replay feature only ever creates `games` rows, so live entries can't have
+/// this kind of duplicate, and title-deduping them could otherwise wrongly hide a distinct
+/// live-service game and a regular game that happen to share a title.
+pub fn dedupe_latest_by_title(rows: Vec<GameRow>) -> Vec<GameRow> {
+    let mut latest_by_title: HashMap<String, GameRow> = HashMap::new();
+    let mut out = Vec::new();
+    for row in rows {
+        if row.game_type.eq_ignore_ascii_case("live") {
+            out.push(row);
+            continue;
+        }
+        let key = row.title.trim().to_lowercase();
+        match latest_by_title.get(&key) {
+            Some(existing) if existing.id >= row.id => {}
+            _ => {
+                latest_by_title.insert(key, row);
+            }
+        }
+    }
+    out.extend(latest_by_title.into_values());
+    out
+}
+
 /// exe / title-filter values keyed by (game_type, id). Used for both the
 /// on-disk snapshot ("saved") and the in-progress edit buffer ("pending").
 #[derive(Debug, Clone, Default)]
@@ -56,11 +86,20 @@ impl StagedMappings {
 /// Mirrors `detectConflicts()`: two entries conflict if they share the same
 /// (case-insensitive) exe and either both lack a title filter, share the same
 /// filter, or any entry among that group lacks one.
-pub fn detect_conflicts(staged: &StagedMappings) -> HashSet<MapKey> {
+///
+/// `visible` restricts comparison to keys currently shown in the table (see
+/// `dedupe_latest_by_title`) -- a mapping left over on an older, now-hidden replay
+/// duplicate would otherwise flag a "conflict" the user has no way to see or fix
+/// (its row isn't in the list at all), even though nothing is actually wrong with
+/// what's on screen.
+pub fn detect_conflicts(staged: &StagedMappings, visible: &HashSet<MapKey>) -> HashSet<MapKey> {
     let mut conflicts = HashSet::new();
     let mut by_exe: HashMap<String, Vec<(MapKey, String)>> = HashMap::new();
 
     for (key, exe) in &staged.exe {
+        if !visible.contains(key) {
+            continue;
+        }
         let exe = norm(exe);
         if exe.is_empty() {
             continue;
@@ -131,16 +170,22 @@ mod tests {
         s
     }
 
+    /// Every key in `staged` counts as visible -- what the old (pre-dedup) callers of
+    /// `detect_conflicts` implicitly assumed.
+    fn all_keys(staged: &StagedMappings) -> HashSet<MapKey> {
+        staged.exe.keys().cloned().collect()
+    }
+
     #[test]
     fn no_conflict_when_exes_differ() {
         let s = staged(&[("regular", 1, "hl2.exe", ""), ("regular", 2, "portal2.exe", "")]);
-        assert!(detect_conflicts(&s).is_empty());
+        assert!(detect_conflicts(&s, &all_keys(&s)).is_empty());
     }
 
     #[test]
     fn conflict_when_same_exe_no_filters() {
         let s = staged(&[("regular", 1, "javaw.exe", ""), ("regular", 2, "javaw.exe", "")]);
-        let conflicts = detect_conflicts(&s);
+        let conflicts = detect_conflicts(&s, &all_keys(&s));
         assert_eq!(conflicts.len(), 2);
         assert!(conflicts.contains(&map_key("regular", 1)));
         assert!(conflicts.contains(&map_key("regular", 2)));
@@ -152,7 +197,7 @@ mod tests {
             ("regular", 1, "javaw.exe", "Modpack A"),
             ("regular", 2, "javaw.exe", "Modpack B"),
         ]);
-        assert!(detect_conflicts(&s).is_empty());
+        assert!(detect_conflicts(&s, &all_keys(&s)).is_empty());
     }
 
     #[test]
@@ -161,7 +206,7 @@ mod tests {
             ("regular", 1, "javaw.exe", "Modpack A"),
             ("regular", 2, "javaw.exe", "Modpack A"),
         ]);
-        assert_eq!(detect_conflicts(&s).len(), 2);
+        assert_eq!(detect_conflicts(&s, &all_keys(&s)).len(), 2);
     }
 
     #[test]
@@ -170,7 +215,7 @@ mod tests {
             ("regular", 1, "javaw.exe", "Modpack A"),
             ("regular", 2, "javaw.exe", ""),
         ]);
-        assert_eq!(detect_conflicts(&s).len(), 2);
+        assert_eq!(detect_conflicts(&s, &all_keys(&s)).len(), 2);
     }
 
     #[test]
@@ -179,7 +224,25 @@ mod tests {
             ("regular", 1, "javaw.exe", "Modpack A"),
             ("regular", 2, "javaw.exe", "modpack a"),
         ]);
-        assert_eq!(detect_conflicts(&s).len(), 2);
+        assert_eq!(detect_conflicts(&s, &all_keys(&s)).len(), 2);
+    }
+
+    #[test]
+    fn hidden_key_is_excluded_from_conflict_comparison() {
+        // Same shape as `conflict_when_same_exe_no_filters`, but id 1's row has been collapsed
+        // away by `dedupe_latest_by_title` (e.g. an old replay duplicate) -- only id 2 is
+        // "visible", so there's nothing left to conflict with.
+        let s = staged(&[("regular", 1, "javaw.exe", ""), ("regular", 2, "javaw.exe", "")]);
+        let visible: HashSet<MapKey> = [map_key("regular", 2)].into_iter().collect();
+        assert!(detect_conflicts(&s, &visible).is_empty());
+    }
+
+    #[test]
+    fn conflict_still_flagged_when_both_sides_visible() {
+        // Sanity check that hiding is opt-in per key, not a global bypass.
+        let s = staged(&[("regular", 1, "javaw.exe", ""), ("regular", 2, "javaw.exe", "")]);
+        let visible: HashSet<MapKey> = [map_key("regular", 1), map_key("regular", 2)].into_iter().collect();
+        assert_eq!(detect_conflicts(&s, &visible).len(), 2);
     }
 
     #[test]
@@ -201,5 +264,46 @@ mod tests {
         let saved = staged(&[("regular", 1, "hl2.exe", "")]);
         let pending = staged(&[("regular", 1, "  hl2.exe  ", "")]);
         assert!(!is_dirty(&pending, &saved));
+    }
+
+    fn row(id: i32, title: &str, game_type: &str) -> GameRow {
+        GameRow { id, title: title.to_string(), game_type: game_type.to_string() }
+    }
+
+    #[test]
+    fn dedupe_keeps_only_the_highest_id_per_title() {
+        let rows = vec![
+            row(1, "Metal Gear Rising: Revengeance", "regular"),
+            row(5, "Metal Gear Rising: Revengeance", "session"),
+            row(3, "Hades", "regular"),
+        ];
+        let mut out = dedupe_latest_by_title(rows);
+        out.sort_by_key(|r| r.id);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].id, 3);
+        assert_eq!(out[1].id, 5);
+        assert_eq!(out[1].game_type, "session");
+    }
+
+    #[test]
+    fn dedupe_is_case_and_whitespace_insensitive() {
+        let rows = vec![row(1, "  Hades ", "regular"), row(2, "hades", "session")];
+        let out = dedupe_latest_by_title(rows);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, 2);
+    }
+
+    #[test]
+    fn dedupe_never_collapses_live_service_rows() {
+        let rows = vec![row(1, "Destiny 2", "live"), row(2, "Destiny 2", "live")];
+        let out = dedupe_latest_by_title(rows);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn dedupe_does_not_collapse_live_against_regular_with_same_title() {
+        let rows = vec![row(1, "Same Title", "regular"), row(2, "Same Title", "live")];
+        let out = dedupe_latest_by_title(rows);
+        assert_eq!(out.len(), 2);
     }
 }

@@ -9,7 +9,7 @@ use crate::session_flow::client_for;
 use crate::state::AppState;
 use crate::tray::RefreshTray;
 use adw::prelude::*;
-use lilypad_core::config::{load_pending_game_submissions, remove_pending_game_submission, PendingGameSubmission};
+use lilypad_core::config::{load_pending_game_submissions, remove_pending_game_submission, PendingGameSubmission, ReplayOf};
 use lilypad_core::library_match::normalize_title;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -113,6 +113,10 @@ pub fn build(state: AppState, refresh_tray: RefreshTray) -> (gtk4::Widget, Rc<dy
 }
 
 fn build_row(state: AppState, entry: PendingGameSubmission, on_changed: Rc<dyn Fn()>) -> gtk4::Box {
+    if let Some(replay_of) = entry.replay_of.clone() {
+        return build_replay_row(state, entry, replay_of, on_changed);
+    }
+
     let row = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
     row.set_margin_top(10);
     row.set_margin_bottom(10);
@@ -201,6 +205,14 @@ fn build_row(state: AppState, entry: PendingGameSubmission, on_changed: Rc<dyn F
     map_panel.set_margin_top(6);
     let map_combo = gtk4::ComboBoxText::new();
     map_panel.append(&map_combo);
+    let map_note = gtk4::Label::new(Some(
+        "If the selected game is already marked Completed or DNF, logging hours here will clear its end date and return it to \"In Progress\" status.",
+    ));
+    map_note.add_css_class("dim-label");
+    map_note.add_css_class("caption");
+    map_note.set_halign(gtk4::Align::Start);
+    map_note.set_wrap(true);
+    map_panel.append(&map_note);
     let map_confirm_btn = gtk4::Button::with_label("Log Hours");
     map_confirm_btn.add_css_class("suggested-action");
     map_panel.append(&map_confirm_btn);
@@ -547,6 +559,149 @@ fn build_row(state: AppState, entry: PendingGameSubmission, on_changed: Rc<dyn F
                     Ok(Ok(())) => on_changed(),
                     Ok(Err(e)) => {
                         btn.set_sensitive(true);
+                        status_label.add_css_class("error");
+                        status_label.set_text(&e);
+                    }
+                    Err(_) => {}
+                }
+            });
+        }
+    });
+
+    dismiss_btn.connect_clicked({
+        let appid = entry.appid.clone();
+        let on_changed = Rc::clone(&on_changed);
+        move |_| {
+            remove_pending_game_submission(&appid);
+            on_changed();
+        }
+    });
+
+    row
+}
+
+/// Row for a pending submission whose appid matches an existing library entry that's already
+/// Completed/DNF (`entry.replay_of`) — LilyPad deliberately didn't auto-resume that entry (see
+/// `maybe_start_unmapped_tracking` in `monitor.rs`), so the user picks whether this session
+/// belongs to it after all, or is a fresh replay that should get its own entry.
+fn build_replay_row(state: AppState, entry: PendingGameSubmission, replay_of: ReplayOf, on_changed: Rc<dyn Fn()>) -> gtk4::Box {
+    let row = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+    row.set_margin_top(10);
+    row.set_margin_bottom(10);
+    row.set_margin_start(12);
+    row.set_margin_end(12);
+
+    let title_label = gtk4::Label::new(Some(&entry.title));
+    title_label.add_css_class("heading");
+    title_label.set_halign(gtk4::Align::Start);
+    title_label.set_wrap(true);
+    row.append(&title_label);
+
+    let status_text = replay_of.status.clone().unwrap_or_else(|| "finished".to_string());
+    let meta_label = gtk4::Label::new(Some(&format!(
+        "{}h · {} session{}. This game is already marked as {status_text}",
+        entry.hours,
+        entry.session_count,
+        if entry.session_count == 1 { "" } else { "s" }
+    )));
+    meta_label.add_css_class("dim-label");
+    meta_label.set_halign(gtk4::Align::Start);
+    meta_label.set_wrap(true);
+    row.append(&meta_label);
+
+    let continue_note = gtk4::Label::new(Some("Logging to the most recent entry will remove its end date and return it to \"In Progress\" status."));
+    continue_note.add_css_class("dim-label");
+    continue_note.add_css_class("caption");
+    continue_note.set_halign(gtk4::Align::Start);
+    continue_note.set_wrap(true);
+    row.append(&continue_note);
+
+    let actions_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    let continue_btn = gtk4::Button::with_label("Log to most recent entry");
+    continue_btn.add_css_class("suggested-action");
+    let replay_btn = gtk4::Button::with_label("Create and log to new entry (replay)");
+    let dismiss_btn = gtk4::Button::with_label("Dismiss");
+    let status_label = gtk4::Label::new(None);
+    status_label.add_css_class("dim-label");
+    actions_box.append(&continue_btn);
+    actions_box.append(&replay_btn);
+    actions_box.append(&dismiss_btn);
+    actions_box.append(&status_label);
+    row.append(&actions_box);
+
+    continue_btn.connect_clicked({
+        let state = state.clone();
+        let status_label = status_label.clone();
+        let appid = entry.appid.clone();
+        let replay_of = replay_of.clone();
+        let on_changed = Rc::clone(&on_changed);
+        let continue_btn = continue_btn.clone();
+        let replay_btn = replay_btn.clone();
+        move |_| {
+            continue_btn.set_sensitive(false);
+            replay_btn.set_sensitive(false);
+            status_label.remove_css_class("error");
+            status_label.set_text("Logging…");
+
+            let state = state.clone();
+            let appid = appid.clone();
+            let replay_of = replay_of.clone();
+            let (tx, rx) = async_channel::bounded(1);
+            std::thread::spawn(move || {
+                let result = resolve::resolve_as_existing(&state, &appid, &replay_of.game_type, replay_of.id, &replay_of.title);
+                let _ = tx.send_blocking(result);
+            });
+
+            let continue_btn = continue_btn.clone();
+            let replay_btn = replay_btn.clone();
+            let status_label = status_label.clone();
+            let on_changed = Rc::clone(&on_changed);
+            glib::spawn_future_local(async move {
+                match rx.recv().await {
+                    Ok(Ok(())) => on_changed(),
+                    Ok(Err(e)) => {
+                        continue_btn.set_sensitive(true);
+                        replay_btn.set_sensitive(true);
+                        status_label.add_css_class("error");
+                        status_label.set_text(&e);
+                    }
+                    Err(_) => {}
+                }
+            });
+        }
+    });
+
+    replay_btn.connect_clicked({
+        let state = state.clone();
+        let status_label = status_label.clone();
+        let appid = entry.appid.clone();
+        let on_changed = Rc::clone(&on_changed);
+        let continue_btn = continue_btn.clone();
+        let replay_btn = replay_btn.clone();
+        move |_| {
+            continue_btn.set_sensitive(false);
+            replay_btn.set_sensitive(false);
+            status_label.remove_css_class("error");
+            status_label.set_text("Creating…");
+
+            let state = state.clone();
+            let appid = appid.clone();
+            let (tx, rx) = async_channel::bounded(1);
+            std::thread::spawn(move || {
+                let result = resolve::resolve_as_replay(&state, &appid);
+                let _ = tx.send_blocking(result);
+            });
+
+            let continue_btn = continue_btn.clone();
+            let replay_btn = replay_btn.clone();
+            let status_label = status_label.clone();
+            let on_changed = Rc::clone(&on_changed);
+            glib::spawn_future_local(async move {
+                match rx.recv().await {
+                    Ok(Ok(_)) => on_changed(),
+                    Ok(Err(e)) => {
+                        continue_btn.set_sensitive(true);
+                        replay_btn.set_sensitive(true);
                         status_label.add_css_class("error");
                         status_label.set_text(&e);
                     }

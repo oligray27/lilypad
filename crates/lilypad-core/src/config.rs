@@ -110,6 +110,18 @@ pub fn save_pending_sessions(sessions: &[PendingSession]) {
     let _ = std::fs::write(&path, serde_json::to_string_pretty(sessions).unwrap_or_default());
 }
 
+/// A `games` entry LilyPad already knows about (exact Steam appid match) whose status is
+/// "Completed" or "DNF" — present on a `PendingGameSubmission` when relaunching that appid
+/// looked more like a deliberate replay than a continuation, so the monitor asked instead of
+/// silently resuming it (see `library_match::is_finished_status`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayOf {
+    pub id: i32,
+    pub game_type: String,
+    pub title: String,
+    pub status: Option<String>,
+}
+
 /// A completed play session for a Steam game that isn't in the user's FrogLog library yet
 /// (see `monitor::run_poll_loop`'s `on_unmapped_session_ended`). Not a "failed submission" like
 /// `PendingSession` — this is a game that was never submitted at all, waiting to be resolved
@@ -129,6 +141,12 @@ pub struct PendingGameSubmission {
     /// entries persisted before this field existed.
     #[serde(default)]
     pub exe_name: String,
+    /// Set when this appid actually matches an existing (but finished) library entry — i.e.
+    /// this isn't a genuinely new game, it's a possible replay of one already marked
+    /// Completed/DNF. `None` for a true "never seen this before" entry. Defaults to `None` for
+    /// entries persisted before this field existed.
+    #[serde(default)]
+    pub replay_of: Option<ReplayOf>,
 }
 
 pub fn pending_game_submissions_path() -> PathBuf {
@@ -153,7 +171,12 @@ pub fn save_pending_game_submissions(items: &[PendingGameSubmission]) {
 /// Records a completed session for a not-yet-in-library game: accumulates hours into an
 /// existing pending entry for the same appid if one exists, or creates a new one. Returns the
 /// updated total hours for that entry, so the caller can put it in a notification.
-pub fn record_pending_game_submission(appid: &str, title: &str, exe_name: &str, hours: f64) -> f64 {
+///
+/// `replay_of` should be `Some` when this appid actually matches an existing library entry
+/// that's Completed/DNF (a possible replay, see `ReplayOf`) rather than a genuinely unknown
+/// game — it's refreshed on every accumulated session in case the matched entry's status
+/// changed since the pending item was first created.
+pub fn record_pending_game_submission(appid: &str, title: &str, exe_name: &str, hours: f64, replay_of: Option<ReplayOf>) -> f64 {
     let mut items = load_pending_game_submissions();
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -166,6 +189,7 @@ pub fn record_pending_game_submission(appid: &str, title: &str, exe_name: &str, 
         existing.last_session_secs = now_secs;
         existing.title = title.to_string();
         existing.exe_name = exe_name.to_string();
+        existing.replay_of = replay_of;
         existing.hours
     } else {
         items.push(PendingGameSubmission {
@@ -176,6 +200,7 @@ pub fn record_pending_game_submission(appid: &str, title: &str, exe_name: &str, 
             first_seen_secs: now_secs,
             last_session_secs: now_secs,
             exe_name: exe_name.to_string(),
+            replay_of,
         });
         hours
     };
@@ -232,12 +257,32 @@ pub fn process_map_path_for_auth(auth: &AuthConfig) -> PathBuf {
     app_data_dir().join(name)
 }
 
+/// Whether an existing mapping should survive a `link_process_mapping` call that's about to
+/// point `process` at `(froglog_id, game_type)`. Drops the mapping being replaced (same
+/// `froglog_id`/`game_type`), plus any *other*, unfiltered mapping for the same exe -- an exe
+/// should map to exactly one game unless the user has deliberately disambiguated with a title
+/// filter (e.g. multiple modpacks sharing javaw.exe). Without the second check, resolving a
+/// replay to a fresh entry would leave the exe pointing at both the old and new game, and which
+/// one `find_all_by_process` returns first (and therefore which one gets tracked) would be
+/// arbitrary -- in practice, always the stale old one, since it was inserted first.
+fn survives_relink(existing: &ProcessMapping, process: &str, game_type: &str, froglog_id: i32) -> bool {
+    if existing.froglog_id == froglog_id && existing.r#type == game_type {
+        return false;
+    }
+    if existing.title_filter.is_none() && existing.process.eq_ignore_ascii_case(process) {
+        return false;
+    }
+    true
+}
+
 /// Creates (or replaces) a `ProcessMapping` linking `process` to a FrogLog game, persisting it
-/// immediately. Used both when auto-linking an already-owned installed game and when resolving
-/// a pending "New Games" entry — in both cases the exe is known to have no existing mapping
-/// (that's why detection reached this code path), so no conflict-checking is needed here (that
-/// only matters for the manual multi-exe-sharing Configure UI flow, which stays in each
-/// frontend since it has its own conflict-reporting UX).
+/// immediately. Used when auto-linking an already-owned installed game, when resolving a
+/// pending "New Games" entry, and when the user tells LilyPad to keep tracking a mapping it
+/// flagged as a possible replay (see `monitor::check_mapped_game_needs_replay_prompt`) — that
+/// last case is the only one where a mapping for this exact `froglog_id`/`game_type` might
+/// already exist, so any `title_filter` already configured on it is carried over rather than
+/// silently dropped. See `survives_relink` for how a stale mapping to a *different* game on the
+/// same exe gets cleaned up here too.
 pub fn link_process_mapping(
     process_map_arc: &std::sync::Arc<std::sync::RwLock<ProcessMapConfig>>,
     auth: &AuthConfig,
@@ -247,8 +292,19 @@ pub fn link_process_mapping(
     title: Option<String>,
 ) -> Result<(), String> {
     let mut map = process_map_arc.read().unwrap().clone();
-    map.mappings.retain(|m| !(m.froglog_id == froglog_id && m.r#type == game_type));
-    map.mappings.push(ProcessMapping { process, r#type: game_type, froglog_id, title, title_filter: None });
+    let existing_title_filter = map
+        .mappings
+        .iter()
+        .find(|m| m.froglog_id == froglog_id && m.r#type == game_type)
+        .and_then(|m| m.title_filter.clone());
+    map.mappings.retain(|m| survives_relink(m, &process, &game_type, froglog_id));
+    map.mappings.push(ProcessMapping {
+        process,
+        r#type: game_type,
+        froglog_id,
+        title,
+        title_filter: existing_title_filter,
+    });
     map.save_to(&process_map_path_for_auth(auth)).map_err(|e| e.to_string())?;
     *process_map_arc.write().unwrap() = map;
     Ok(())
@@ -279,5 +335,56 @@ impl AuthConfig {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(path, serde_json::to_string_pretty(self).unwrap_or_default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mapping(process: &str, game_type: &str, froglog_id: i32, title_filter: Option<&str>) -> ProcessMapping {
+        ProcessMapping {
+            process: process.to_string(),
+            r#type: game_type.to_string(),
+            froglog_id,
+            title: None,
+            title_filter: title_filter.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn relink_drops_the_mapping_being_replaced() {
+        let m = mapping("game.exe", "session", 1, None);
+        assert!(!survives_relink(&m, "game.exe", "session", 1));
+    }
+
+    #[test]
+    fn relink_drops_a_stale_unfiltered_mapping_for_the_same_exe_on_a_different_game() {
+        // Simulates the replay scenario: "game.exe" was mapped to the old (id=1) entry;
+        // resolving "Log as New Replay" links it to a brand-new id=2 entry instead. The old
+        // mapping must not survive, or `find_all_by_process("game.exe")` would return both and
+        // arbitrarily pick one on the next launch.
+        let old = mapping("game.exe", "session", 1, None);
+        assert!(!survives_relink(&old, "game.exe", "session", 2));
+    }
+
+    #[test]
+    fn relink_preserves_a_title_filtered_mapping_for_the_same_exe() {
+        // Deliberate multi-game-per-exe setup (e.g. javaw.exe shared by distinct modpacks) --
+        // relinking a different game to the same exe must not silently remove this one.
+        let filtered = mapping("javaw.exe", "regular", 1, Some("Modpack A"));
+        assert!(survives_relink(&filtered, "javaw.exe", "regular", 2));
+    }
+
+    #[test]
+    fn relink_preserves_mappings_for_other_exes() {
+        let other = mapping("other.exe", "regular", 5, None);
+        assert!(survives_relink(&other, "game.exe", "session", 2));
+    }
+
+    #[test]
+    fn relink_exe_match_is_case_insensitive() {
+        let old = mapping("Game.EXE", "session", 1, None);
+        assert!(!survives_relink(&old, "game.exe", "session", 2));
     }
 }
