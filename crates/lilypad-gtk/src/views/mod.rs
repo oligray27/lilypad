@@ -1,3 +1,4 @@
+pub mod excluded_games;
 pub mod login;
 pub mod main_view;
 pub mod mappings;

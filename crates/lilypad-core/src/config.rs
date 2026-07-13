@@ -25,6 +25,20 @@ pub struct WatchedDirectory {
     pub path: String,
 }
 
+/// A Steam appid the user has explicitly told LilyPad to never treat as a game — e.g.
+/// Wallpaper Engine, which installs and manifests exactly like a real game (its own
+/// `appmanifest_*.acf`, its own `steamapps/common/` folder) but obviously isn't one. Unlike
+/// `steam::is_known_non_game`'s hardcoded, maintainer-only list (Steamworks Redistributables,
+/// Proton itself, etc. — things that are *never* a game for any user), this is user-configured
+/// per appid, for the much larger set of things that are legitimate Steam "apps" but not games
+/// anyone would want session-tracked. `name` is stored alongside `appid` purely for display in
+/// the exclusion list UI, since a bare numeric id isn't meaningful on its own.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExcludedApp {
+    pub appid: String,
+    pub name: String,
+}
+
 /// In-memory mapping list.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ProcessMapConfig {
@@ -45,14 +59,50 @@ pub struct ProcessMapConfig {
     /// Root folders scanned for non-Steam games (see `local_games::scan_watched_directories`).
     #[serde(default)]
     pub watched_directories: Vec<WatchedDirectory>,
+    /// Steam appids excluded from detection entirely (see `ExcludedApp`) — filtered out of the
+    /// installed-games scan by each platform's `refresh_installed_games`, so an excluded app
+    /// behaves as though it were never installed.
+    #[serde(default)]
+    pub excluded_apps: Vec<ExcludedApp>,
+    /// Whether `seed_default_exclusions` has already run once for this config -- prevents a
+    /// default exclusion (currently just Wallpaper Engine) from silently reappearing after the
+    /// user explicitly removes it.
+    #[serde(default)]
+    pub default_exclusions_seeded: bool,
 }
 
 impl ProcessMapConfig {
     pub fn load_from(path: &std::path::Path) -> Self {
-        match std::fs::read_to_string(path) {
+        let mut cfg: Self = match std::fs::read_to_string(path) {
             Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
             _ => Self::default(),
+        };
+        if cfg.seed_default_exclusions() {
+            let _ = cfg.save_to(path);
         }
+        cfg
+    }
+
+    /// One-time seeding of exclusions almost every user wants (currently just Wallpaper Engine,
+    /// appid 431960 -- installs and manifests exactly like a real game but obviously isn't one).
+    /// Unlike `steam::is_known_non_game`'s hardcoded, unconditional filter, this only
+    /// *pre-populates* the user's own editable `excluded_apps` list once -- if they later remove
+    /// it, `default_exclusions_seeded` staying `true` means it never comes back. Runs for both a
+    /// brand-new config and an existing one from before this field existed (`#[serde(default)]`
+    /// gives both the same starting `false`), so upgrading an existing install seeds it too.
+    /// Returns `true` if it changed anything, so the caller knows to persist.
+    fn seed_default_exclusions(&mut self) -> bool {
+        if self.default_exclusions_seeded {
+            return false;
+        }
+        self.default_exclusions_seeded = true;
+        if !self.excluded_apps.iter().any(|e| e.appid == "431960") {
+            self.excluded_apps.push(ExcludedApp {
+                appid: "431960".to_string(),
+                name: "Wallpaper Engine".to_string(),
+            });
+        }
+        true
     }
 
     pub fn save_to(&self, path: &std::path::Path) -> std::io::Result<()> {
@@ -413,5 +463,40 @@ mod tests {
     fn relink_exe_match_is_case_insensitive() {
         let old = mapping("Game.EXE", "session", 1, None);
         assert!(!survives_relink(&old, "game.exe", "session", 2));
+    }
+
+    #[test]
+    fn seed_default_exclusions_adds_wallpaper_engine_once() {
+        let mut cfg = ProcessMapConfig::default();
+        assert!(cfg.seed_default_exclusions());
+        assert!(cfg.excluded_apps.iter().any(|e| e.appid == "431960"));
+        assert!(cfg.default_exclusions_seeded);
+    }
+
+    #[test]
+    fn seed_default_exclusions_is_a_no_op_once_already_seeded() {
+        let mut cfg = ProcessMapConfig::default();
+        cfg.default_exclusions_seeded = true;
+        assert!(!cfg.seed_default_exclusions());
+        assert!(cfg.excluded_apps.is_empty());
+    }
+
+    #[test]
+    fn seed_default_exclusions_does_not_reintroduce_a_removed_default() {
+        // Simulates: fresh config seeded once, user then explicitly removed Wallpaper Engine.
+        // Loading again later must not silently bring it back.
+        let mut cfg = ProcessMapConfig::default();
+        cfg.seed_default_exclusions();
+        cfg.excluded_apps.retain(|e| e.appid != "431960");
+        assert!(!cfg.seed_default_exclusions());
+        assert!(cfg.excluded_apps.is_empty());
+    }
+
+    #[test]
+    fn seed_default_exclusions_does_not_duplicate_an_existing_entry() {
+        let mut cfg = ProcessMapConfig::default();
+        cfg.excluded_apps.push(ExcludedApp { appid: "431960".to_string(), name: "Wallpaper Engine".to_string() });
+        cfg.seed_default_exclusions();
+        assert_eq!(cfg.excluded_apps.iter().filter(|e| e.appid == "431960").count(), 1);
     }
 }

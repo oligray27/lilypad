@@ -1,7 +1,7 @@
 use lilypad_core::{api, config, library_match, local_games, monitor, steam};
 
 use api::FroglogClient;
-use config::{AuthConfig, ProcessMapConfig, ProcessMapping, PendingSession, WatchedDirectory, auth_config_path, process_map_path_for_auth, load_pending_sessions, save_pending_sessions};
+use config::{AuthConfig, ExcludedApp, ProcessMapConfig, ProcessMapping, PendingSession, WatchedDirectory, auth_config_path, process_map_path_for_auth, load_pending_sessions, save_pending_sessions};
 use library_match::LibraryIndex;
 use monitor::{run_poll_loop, ActiveSession};
 use steam::InstalledGame;
@@ -168,15 +168,19 @@ fn refresh_installed_games(state: &AppState) {
     let mut games = steam::find_steam_root()
         .map(|root| steam::scan_installed_games(&root))
         .unwrap_or_default();
-    let watched_dirs: Vec<String> = state
-        .process_map_arc
-        .read()
-        .unwrap()
-        .watched_directories
-        .iter()
-        .map(|w| w.path.clone())
-        .collect();
+    let (watched_dirs, excluded_appids): (Vec<String>, std::collections::HashSet<String>) = {
+        let cfg = state.process_map_arc.read().unwrap();
+        (
+            cfg.watched_directories.iter().map(|w| w.path.clone()).collect(),
+            cfg.excluded_apps.iter().map(|e| e.appid.clone()).collect(),
+        )
+    };
     games.extend(local_games::scan_watched_directories(&watched_dirs));
+    // User-excluded apps (see `config::ExcludedApp`) -- e.g. Wallpaper Engine, which manifests
+    // exactly like a real Steam game but obviously isn't one. Filtered here rather than in
+    // `scan_installed_games` itself so the scan stays a pure "what does Steam say is installed"
+    // function; this is where per-user preference gets applied on top of it.
+    games.retain(|g| !excluded_appids.contains(&g.appid));
     *state.installed_games_arc.write().unwrap() = games;
 }
 
@@ -1357,6 +1361,45 @@ fn remove_watched_directory(state: tauri::State<AppState>, path: String) -> Resu
     Ok(())
 }
 
+/// Returns everything the current scan considers "installed" (Steam + watched non-Steam
+/// directories), already excluding anything in `excluded_apps` (see `refresh_installed_games`)
+/// -- used to populate the Excluded Games picker with what's left to exclude.
+#[tauri::command]
+fn get_installed_games(state: tauri::State<AppState>) -> Vec<InstalledGame> {
+    state.installed_games_arc.read().unwrap().clone()
+}
+
+#[tauri::command]
+fn get_excluded_apps(state: tauri::State<AppState>) -> Vec<ExcludedApp> {
+    state.process_map_arc.read().unwrap().excluded_apps.clone()
+}
+
+#[tauri::command]
+fn add_excluded_app(state: tauri::State<AppState>, appid: String, name: String) -> Result<(), String> {
+    let mut map = state.process_map_arc.read().unwrap().clone();
+    if !map.excluded_apps.iter().any(|e| e.appid == appid) {
+        map.excluded_apps.push(ExcludedApp { appid, name });
+    }
+    map.save_to(&process_map_path_for_auth(&state.auth.read().unwrap()))
+        .map_err(|e| e.to_string())?;
+    *state.process_map_arc.write().unwrap() = map;
+    // Scan immediately rather than waiting for the next 300s background refresh, so the
+    // excluded app stops being detectable right away.
+    refresh_installed_games(&state);
+    Ok(())
+}
+
+#[tauri::command]
+fn remove_excluded_app(state: tauri::State<AppState>, appid: String) -> Result<(), String> {
+    let mut map = state.process_map_arc.read().unwrap().clone();
+    map.excluded_apps.retain(|e| e.appid != appid);
+    map.save_to(&process_map_path_for_auth(&state.auth.read().unwrap()))
+        .map_err(|e| e.to_string())?;
+    *state.process_map_arc.write().unwrap() = map;
+    refresh_installed_games(&state);
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let auth = AuthConfig::load_from(&auth_config_path());
@@ -1420,6 +1463,10 @@ pub fn run() {
             get_watched_directories,
             add_watched_directory,
             remove_watched_directory,
+            get_installed_games,
+            get_excluded_apps,
+            add_excluded_app,
+            remove_excluded_app,
         ])
         .on_window_event(|window, event| {
             if window.label() == "main" {

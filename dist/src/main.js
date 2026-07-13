@@ -21,6 +21,7 @@ const VIEW_SIZE = {
   sessionView: { width: 440, height: 165 },
   pendingView: { width: 550, height: 480 },
   watchedDirsView: { width: 550, height: 480 },
+  excludedGamesView: { width: 550, height: 480 },
 };
 
 function showView(id, heightOrOpts) {
@@ -639,6 +640,31 @@ async function loadWatchedDirectories() {
   });
 }
 
+async function loadExcludedGames() {
+  const list = $('excludedGamesList');
+  if (!list) return;
+  const addPanel = $('excludedGamesAddPanel');
+  if (addPanel) addPanel.hidden = true;
+  const excluded = await invoke('get_excluded_apps').catch(() => []);
+  if (!excluded || !excluded.length) {
+    list.innerHTML = '<p class="muted watched-dirs-empty">No games excluded.</p>';
+    return;
+  }
+  list.innerHTML = excluded.map((app) => `
+    <div class="watched-dir-item" data-appid="${escapeAttr(app.appid)}">
+      <span class="watched-dir-path">${escapeHtml(app.name)} <span class="muted">(${escapeHtml(app.appid)})</span></span>
+      <button type="button" class="watched-dir-remove">Remove</button>
+    </div>
+  `).join('');
+  list.querySelectorAll('.watched-dir-remove').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const item = btn.closest('[data-appid]');
+      await invoke('remove_excluded_app', { appid: item.dataset.appid }).catch(() => {});
+      loadExcludedGames();
+    });
+  });
+}
+
 async function loadMappingsView() {
   const errEl = $('mappingsError');
   const tableWrap = $('mappingsTableWrap');
@@ -1170,7 +1196,10 @@ app.innerHTML = `
           <button type="button" id="mappingsSwitchGames" class="active">Games</button>
           <button type="button" id="mappingsSwitchLive">Live service</button>
         </div>
-        <button type="button" id="mappingsOpenWatchedDirs" class="mappings-watched-dirs-btn">Non-Steam Games…</button>
+        <div class="mappings-switch-row-end">
+          <button type="button" id="mappingsOpenWatchedDirs" class="mappings-watched-dirs-btn">Non-Steam Games…</button>
+          <button type="button" id="mappingsOpenExcludedGames" class="mappings-watched-dirs-btn">Excluded Games…</button>
+        </div>
       </div>
       <div class="mappings-search-wrap"><input type="search" id="mappingsSearch" class="mappings-search" placeholder="Search…" /></div>
       <p id="mappingsError" class="error"></p>
@@ -1234,6 +1263,19 @@ app.innerHTML = `
       <button type="button" id="watchedDirsBack">Back</button>
     </div>
   </div>
+  <div data-view id="excludedGamesView" hidden>
+    <div class="page-header"><h2>Excluded Games</h2><span class="app-version"></span></div>
+    <p class="muted">Some Steam apps aren't really games but install exactly like one (e.g. Wallpaper Engine). Exclude them here and LilyPad will never detect or track sessions for them.</p>
+    <div id="excludedGamesList" class="watched-dirs-list"></div>
+    <div id="excludedGamesAddPanel" class="excluded-games-add-panel" hidden>
+      <select id="excludedGamesSelect"></select>
+      <button type="button" id="excludedGamesConfirm">Exclude</button>
+    </div>
+    <button type="button" id="excludedGamesAdd">Exclude a Game…</button>
+    <div class="mappings-footer">
+      <button type="button" id="excludedGamesBack">Back</button>
+    </div>
+  </div>
 `;
 
 document.addEventListener('click', (e) => {
@@ -1289,4 +1331,37 @@ $('mappingsOpenWatchedDirs').addEventListener('click', () => {
   loadWatchedDirectories();
 });
 $('watchedDirsBack').addEventListener('click', () => { showView('mappingsView'); loadMappingsView(); });
+$('mappingsOpenExcludedGames').addEventListener('click', () => {
+  showView('excludedGamesView');
+  loadExcludedGames();
+});
+$('excludedGamesBack').addEventListener('click', () => { showView('mappingsView'); loadMappingsView(); });
+$('excludedGamesAdd').addEventListener('click', async () => {
+  const panel = $('excludedGamesAddPanel');
+  const select = $('excludedGamesSelect');
+  const wasHidden = panel.hidden;
+  panel.hidden = !panel.hidden;
+  if (!wasHidden) return;
+
+  select.innerHTML = '<option value="">Loading…</option>';
+  const [installed, excluded] = await Promise.all([
+    invoke('get_installed_games').catch(() => []),
+    invoke('get_excluded_apps').catch(() => []),
+  ]);
+  const excludedIds = new Set((excluded || []).map((e) => e.appid));
+  const candidates = (installed || []).filter((g) => !excludedIds.has(g.appid) && !g.appid.startsWith('local:'));
+  select.innerHTML = candidates.length
+    ? candidates.map((g) => `<option value="${escapeAttr(g.appid)}" data-name="${escapeAttr(g.name)}">${escapeHtml(g.name)} (${escapeHtml(g.appid)})</option>`).join('')
+    : '<option value="">No eligible installed games detected</option>';
+});
+$('excludedGamesConfirm').addEventListener('click', async () => {
+  const select = $('excludedGamesSelect');
+  const appid = select.value;
+  if (!appid) return;
+  const name = select.options[select.selectedIndex].dataset.name || appid;
+  await invoke('add_excluded_app', { appid, name }).catch((err) => {
+    console.error('[LilyPad] add_excluded_app error:', err);
+  });
+  loadExcludedGames();
+});
 init();

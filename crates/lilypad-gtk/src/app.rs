@@ -20,6 +20,7 @@ fn view_size(view: &str) -> (i32, i32) {
         "pending" => (560, 480),
         "new_games" => (560, 480),
         "watched_dirs" => (550, 480),
+        "excluded_games" => (550, 480),
         "main" => (560, 340),
         _ => (560, 420),
     }
@@ -53,6 +54,7 @@ fn back_target(view: &str) -> Option<&'static str> {
         "pending" => Some("main"),
         "new_games" => Some("mappings"),
         "watched_dirs" => Some("mappings"),
+        "excluded_games" => Some("mappings"),
         _ => None,
     }
 }
@@ -164,6 +166,7 @@ fn build_window(app: &adw::Application, state: AppState) {
     let (pending_widget, reload_pending) = views::pending::build(state.clone());
     let (new_games_widget, reload_new_games) = views::new_games::build(state.clone(), refresh_tray.clone());
     let (watched_dirs_widget, reload_watched_dirs) = views::watched_dirs::build(state.clone(), window.clone().upcast());
+    let (excluded_games_widget, reload_excluded_games) = views::excluded_games::build(state.clone());
     let (mappings_widget, reload_mappings) = views::mappings::build(
         state.clone(),
         window.clone().upcast(),
@@ -174,6 +177,15 @@ fn build_window(app: &adw::Application, state: AppState) {
             move || {
                 goto_view(&window, &stack, "watched_dirs");
                 reload_watched_dirs();
+            }
+        },
+        {
+            let stack = stack.clone();
+            let window = window.clone();
+            let reload_excluded_games = Rc::clone(&reload_excluded_games);
+            move || {
+                goto_view(&window, &stack, "excluded_games");
+                reload_excluded_games();
             }
         },
         {
@@ -211,6 +223,7 @@ fn build_window(app: &adw::Application, state: AppState) {
     stack.add_named(&pending_widget, Some("pending"));
     stack.add_named(&new_games_widget, Some("new_games"));
     stack.add_named(&watched_dirs_widget, Some("watched_dirs"));
+    stack.add_named(&excluded_games_widget, Some("excluded_games"));
     let initial_view = if state.logged_in() { "main" } else { "login" };
     stack.set_visible_child_name(initial_view);
     {

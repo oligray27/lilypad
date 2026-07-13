@@ -39,6 +39,7 @@ pub fn build(
     state: AppState,
     window: gtk4::Window,
     on_show_watched_dirs: impl Fn() + 'static,
+    on_show_excluded_games: impl Fn() + 'static,
     on_show_new_games: impl Fn() + 'static,
     on_show_pending: impl Fn() + 'static,
 ) -> (gtk4::Widget, Rc<dyn Fn()>) {
@@ -175,9 +176,16 @@ pub fn build(
     let watched_dirs_btn = gtk4::Button::with_label("Non-Steam Games…");
     watched_dirs_btn.connect_clicked(move |_| on_show_watched_dirs());
 
+    let excluded_games_btn = gtk4::Button::with_label("Excluded Games…");
+    excluded_games_btn.connect_clicked(move |_| on_show_excluded_games());
+
+    let end_buttons = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    end_buttons.append(&watched_dirs_btn);
+    end_buttons.append(&excluded_games_btn);
+
     let mode_row = gtk4::CenterBox::new();
     mode_row.set_start_widget(Some(&mode_box));
-    mode_row.set_end_widget(Some(&watched_dirs_btn));
+    mode_row.set_end_widget(Some(&end_buttons));
     container.append(&mode_row);
 
     // --- Search ---

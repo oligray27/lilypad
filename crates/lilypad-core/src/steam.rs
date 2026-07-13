@@ -2,6 +2,7 @@
 //! (`libraryfolders.vdf` + `appmanifest_*.acf`) so process detection can recognize
 //! "this is a game" from the exe's install directory, without exe-name/path heuristics.
 
+use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -9,7 +10,7 @@ use std::path::{Path, PathBuf};
 /// `appmanifest_<appid>.acf` file), `appid` is the real numeric Steam appid. For non-Steam
 /// games (see `local_games.rs`), `appid` is a synthetic `local:<path>` identity instead — it's
 /// just "the stable identity of this install," not always a literal Steam appid.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct InstalledGame {
     pub appid: String,
     pub name: String,

@@ -129,6 +129,7 @@ a:hover { text-decoration: underline; }
 .mappings-switch button:first-child { border-radius: 4px 0 0 4px; margin-right: -1px; }
 .mappings-switch button:last-child { border-radius: 0 4px 4px 0; margin-right: 0; }
 .mappings-switch button.active { background: var(--switch-active-bg); color: var(--switch-active-text); border-color: var(--switch-active-bg); z-index: 1; }
+.mappings-switch-row-end { display: flex; gap: 0.5rem; }
 .mappings-watched-dirs-btn { margin: 0; padding: 0 0.8rem; font-size: 0.85rem; white-space: nowrap; height: 2.25rem; box-sizing: border-box; display: inline-flex; align-items: center; justify-content: center; }
 .mappings-auto-submit-label { display: flex; align-items: center; gap: 0.4rem; margin-top: 0.5rem; font-size: 0.9rem; cursor: pointer; width: fit-content; }
 .mappings-auto-submit-label input { width: auto; margin: 0; }
@@ -141,6 +142,13 @@ a:hover { text-decoration: underline; }
 .watched-dir-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, monospace; font-size: 0.85em; }
 .watched-dir-remove { flex-shrink: 0; margin: 0; padding: 0.2rem 0.6rem; font-size: 0.8rem; }
 #watchedDirsAdd { margin: 0 0 0.5rem; padding: 0.25rem 0.7rem; font-size: 0.85rem; align-self: flex-start; }
+/* Excluded Games view — reuses .watched-dirs-* above for the list/row chrome */
+#excludedGamesView { width: 100%; max-width: none; display: flex; flex-direction: column; height: calc(100vh - 2rem); }
+#excludedGamesView .mappings-footer { padding-top: 0.5rem; }
+#excludedGamesAdd { margin: 0 0 0.5rem; padding: 0.25rem 0.7rem; font-size: 0.85rem; align-self: flex-start; }
+.excluded-games-add-panel { display: flex; gap: 0.5rem; margin-bottom: 0.5rem; }
+.excluded-games-add-panel select { flex: 1; min-width: 0; }
+.excluded-games-add-panel button { flex-shrink: 0; margin: 0; padding: 0.25rem 0.7rem; font-size: 0.85rem; }
 .mappings-search-wrap { margin-top: 0.5rem; margin-right: 0.35rem; }
 input#mappingsSearch { width: 100%; padding-right: 0.35rem; box-sizing: border-box; }
 .mappings-table-wrap { overflow-x: auto; margin-top: 0.5rem; }

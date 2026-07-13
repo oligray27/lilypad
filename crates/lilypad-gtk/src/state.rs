@@ -58,15 +58,19 @@ impl AppState {
         let mut games = lilypad_core::steam::find_steam_root()
             .map(|root| lilypad_core::steam::scan_installed_games(&root))
             .unwrap_or_default();
-        let watched_dirs: Vec<String> = self
-            .process_map
-            .read()
-            .unwrap()
-            .watched_directories
-            .iter()
-            .map(|w| w.path.clone())
-            .collect();
+        let (watched_dirs, excluded_appids): (Vec<String>, std::collections::HashSet<String>) = {
+            let cfg = self.process_map.read().unwrap();
+            (
+                cfg.watched_directories.iter().map(|w| w.path.clone()).collect(),
+                cfg.excluded_apps.iter().map(|e| e.appid.clone()).collect(),
+            )
+        };
         games.extend(lilypad_core::local_games::scan_watched_directories(&watched_dirs));
+        // User-excluded apps (see `ExcludedApp`) -- e.g. Wallpaper Engine, which manifests
+        // exactly like a real Steam game but obviously isn't one. Filtered here rather than in
+        // `scan_installed_games` itself so the scan stays a pure "what does Steam say is
+        // installed" function; this is where per-user preference gets applied on top of it.
+        games.retain(|g| !excluded_appids.contains(&g.appid));
         *self.installed_games.write().unwrap() = games;
     }
 

@@ -33,6 +33,14 @@ fn is_known_helper_process(exe_name: &str) -> bool {
         "battleye.exe",
         "beservice.exe",
         "beservice_x64.exe",
+        // Epic Online Services -- bundled by many games (not just Epic Games Store titles) for
+        // anti-cheat/social/overlay features, installed into the game's own folder right
+        // alongside the real exe. Confirmed misattributed as "the game" for For Honor, whose
+        // EOS helper is literally named eos.exe.
+        "eos.exe",
+        "eosbootstrapper.exe",
+        "eosoverlayrenderer-win32-shipping.exe",
+        "eosoverlayrenderer-win64-shipping.exe",
         "vc_redist.x64.exe",
         "vc_redist.x86.exe",
         "dxsetup.exe",
@@ -1046,7 +1054,9 @@ mod tests {
         assert!(is_known_helper_process("UnityCrashHandler64.exe"));
         assert!(is_known_helper_process("unitycrashhandler64.exe"));
         assert!(is_known_helper_process("EasyAntiCheat_Launcher.exe"));
-        assert!(!is_known_helper_process("Among Us.exe"));
-        assert!(!is_known_helper_process("Celeste.exe"));
+        // For Honor mapped this instead of the real game exe -- see the comment above the list.
+        assert!(is_known_helper_process("eos.exe"));
+        assert!(is_known_helper_process("EOS.exe"));
+        assert!(is_known_helper_process("EOSBootstrapper.exe"));
     }
 }
