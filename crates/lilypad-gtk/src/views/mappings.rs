@@ -516,6 +516,12 @@ pub fn build(
                     // so it doesn't sit stale for up to 5 minutes (the periodic refresh
                     // interval) after a change made directly on the FrogLog website.
                     state.refresh_library_index();
+                    // Also rescan installed games (Steam + watched non-Steam directories) --
+                    // a game added to an already-watched folder has no dedicated immediate-
+                    // refresh trigger of its own (unlike adding/removing the watched directory
+                    // itself), so without this it would otherwise sit undetected until the next
+                    // 300s periodic scan.
+                    state.refresh_installed_games();
                     let _ = tx.send_blocking(result);
                 });
             }

@@ -1205,6 +1205,12 @@ fn enable_session_tracking(state: tauri::State<AppState>, game_id: i32) -> Resul
 #[tauri::command]
 fn refresh_library_index(state: tauri::State<AppState>) {
     refresh_library_index_state(&state);
+    // Also rescan installed games (Steam + watched non-Steam directories) here -- a game added
+    // to an already-watched folder has no dedicated immediate-refresh trigger of its own (unlike
+    // adding/removing the watched directory itself), so without this it would otherwise sit
+    // undetected until the next 300s periodic scan. Configure opening is already the established
+    // "refresh anything that might be stale" moment (see `refresh_library_index_state`'s doc).
+    refresh_installed_games(&state);
 }
 
 #[tauri::command]
