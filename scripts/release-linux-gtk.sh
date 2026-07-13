@@ -3,7 +3,10 @@
 # Linux build (crates/lilypad-gtk) — the Windows/Tauri build has its own
 # release.sh/release.ps1 and is not touched by this script.
 #
-# Usage: bash scripts/release-linux-gtk.sh
+# Usage: bash scripts/release-linux-gtk.sh [--appimage-only]
+#   --appimage-only  Skip the .deb/.rpm steps and build just the .AppImage.
+#                     Useful on a machine without cargo-deb/cargo-generate-rpm
+#                     set up, or when you only want to (re-)publish the AppImage.
 #
 # Requires: cargo, cargo-deb (cargo install cargo-deb), cargo-generate-rpm
 # (cargo install cargo-generate-rpm), and for the AppImage step: linuxdeploy
@@ -13,6 +16,11 @@
 # package artifacts. See scripts/release.sh for the Windows/Tauri release flow.
 
 set -e
+
+APPIMAGE_ONLY=0
+for arg in "$@"; do
+  [ "$arg" = "--appimage-only" ] && APPIMAGE_ONLY=1
+done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$SCRIPT_DIR/.."
@@ -25,13 +33,17 @@ cd "$ROOT"
 echo "== Building release binary =="
 cargo build --release -p lilypad-gtk
 
-echo "== Building .deb =="
-cargo deb -p lilypad-gtk --no-build
-mkdir -p "$BUNDLE_DIR/deb"
-mv target/debian/*.deb "$BUNDLE_DIR/deb/"
+if [ "$APPIMAGE_ONLY" -eq 0 ]; then
+  echo "== Building .deb =="
+  cargo deb -p lilypad-gtk --no-build
+  mkdir -p "$BUNDLE_DIR/deb"
+  mv target/debian/*.deb "$BUNDLE_DIR/deb/"
 
-echo "== Building .rpm =="
-(cd "$CRATE" && cargo generate-rpm --target-dir "$ROOT/target" -o "$BUNDLE_DIR/rpm/")
+  echo "== Building .rpm =="
+  (cd "$CRATE" && cargo generate-rpm --target-dir "$ROOT/target" -o "$BUNDLE_DIR/rpm/")
+else
+  echo "== Skipping .deb/.rpm (--appimage-only) =="
+fi
 
 echo "== Building .AppImage =="
 mkdir -p "$CACHE_DIR"

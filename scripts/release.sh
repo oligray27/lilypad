@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Usage: bash scripts/release.sh [--no-bump]
-#   --no-bump  Skip version increment and use the current version as-is.
-#              Use this when adding another platform's build to an already-tagged
-#              release (e.g. this release was tagged from Linux, and you're now
-#              running this script's Windows-flavored steps elsewhere) — see below.
+# Usage: bash scripts/release.sh [--no-bump] [--appimage-only]
+#   --no-bump        Skip version increment and use the current version as-is.
+#                     Use this when adding another platform's build to an already-tagged
+#                     release (e.g. this release was tagged from Linux, and you're now
+#                     running this script's Windows-flavored steps elsewhere) — see below.
+#   --appimage-only  Linux only: skip .deb/.rpm and only build/upload the .AppImage
+#                     (see scripts/release-linux-gtk.sh). Ignored on other platforms.
 #
 # Bumps the version everywhere, commits, tags, pushes, builds this platform's
 # installers, and creates (or adds to) the GitHub release for that tag.
@@ -30,8 +32,10 @@
 set -e
 
 NO_BUMP=0
+APPIMAGE_ONLY=0
 for arg in "$@"; do
   [ "$arg" = "--no-bump" ] && NO_BUMP=1
+  [ "$arg" = "--appimage-only" ] && APPIMAGE_ONLY=1
 done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -83,15 +87,25 @@ fi
 # --- Build (platform-specific) ---
 ASSETS=()
 if [ "$(uname -s)" = "Linux" ]; then
-  echo "Building Linux native GTK app (.deb/.rpm/.AppImage)..."
-  bash scripts/release-linux-gtk.sh
+  if [ "$APPIMAGE_ONLY" -eq 1 ]; then
+    echo "Building Linux native GTK app (.AppImage only)..."
+    bash scripts/release-linux-gtk.sh --appimage-only
+  else
+    echo "Building Linux native GTK app (.deb/.rpm/.AppImage)..."
+    bash scripts/release-linux-gtk.sh
+  fi
   BUNDLE_DIR="target/release/bundle"
-  DEB=$(ls -t "$BUNDLE_DIR"/deb/*.deb 2>/dev/null | head -1)
-  RPM=$(ls -t "$BUNDLE_DIR"/rpm/*.rpm 2>/dev/null | head -1)
   APPIMAGE=$(ls -t "$BUNDLE_DIR"/appimage/*.AppImage 2>/dev/null | head -1)
-  [ -n "$DEB" ] && ASSETS+=("$DEB")
-  [ -n "$RPM" ] && ASSETS+=("$RPM")
   [ -n "$APPIMAGE" ] && ASSETS+=("$APPIMAGE")
+  if [ "$APPIMAGE_ONLY" -eq 0 ]; then
+    # Only collected on a full build -- with --appimage-only, a stale .deb/.rpm from an
+    # earlier run would otherwise get silently re-uploaded even though this run never
+    # touched them.
+    DEB=$(ls -t "$BUNDLE_DIR"/deb/*.deb 2>/dev/null | head -1)
+    RPM=$(ls -t "$BUNDLE_DIR"/rpm/*.rpm 2>/dev/null | head -1)
+    [ -n "$DEB" ] && ASSETS+=("$DEB")
+    [ -n "$RPM" ] && ASSETS+=("$RPM")
+  fi
 else
   echo "Building Tauri Windows app..."
   npm run build
