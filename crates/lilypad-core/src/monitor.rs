@@ -175,6 +175,7 @@ fn maybe_start_unmapped_tracking(
     pid: Pid,
     installed_games: &Arc<RwLock<Vec<InstalledGame>>>,
     library_index: &Arc<RwLock<LibraryIndex>>,
+    config: &Arc<RwLock<ProcessMapConfig>>,
     currently_tracking: &Arc<RwLock<HashSet<String>>>,
     last_ended_unmapped: &Arc<RwLock<HashMap<String, Instant>>>,
     on_unmapped_session_ended: &Arc<dyn Fn(String, String, String, f64, Option<ResolvedLibraryGame>) + Send + Sync>,
@@ -211,6 +212,18 @@ fn maybe_start_unmapped_tracking(
 
     let mut replay_of = None;
     if let Some(resolved) = library_index.read().unwrap().resolve_by_appid(&found.appid).cloned() {
+        // If some OTHER process is already mapped to this exact game (most commonly: the game's
+        // own renamed "<Game>.exe" process, when *this* process is a Proton/Wine launcher
+        // wrapper that never gets renamed -- e.g. the `python3 <proton> waitforexitandrun <exe>`
+        // process, whose own comm/exe never matches the stored mapping by name) -- that other
+        // process is already the authoritative tracker for this session. Without this check,
+        // both processes independently ran this whole function every poll tick, sometimes
+        // reaching two different conclusions for the very same launch (one silently
+        // auto-linking, the other seeing the game as finished and prompting a replay decision),
+        // confirmed against a real Proton session that produced exactly that.
+        if config.read().unwrap().mappings.iter().any(|m| m.froglog_id == resolved.id) {
+            return None;
+        }
         if !is_finished_status(&resolved.status) {
             last_ended_unmapped.write().unwrap().insert(found.appid.clone(), Instant::now());
             // Anything LilyPad auto-links itself should end up session-tracked, not "regular"
@@ -561,6 +574,7 @@ fn try_run_wmi_watch(
                     pid,
                     &installed_games,
                     &library_index,
+                    &config,
                     &currently_tracking_unmapped,
                     &last_ended_unmapped,
                     &on_unmapped_session_ended,
@@ -847,6 +861,24 @@ pub fn run_poll_loop(
                         );
                         let mut found = None;
                         'proc_scan: for (pid, p) in system.processes().iter() {
+                            // sysinfo surfaces individual threads as their own entries in this
+                            // map (their `Pid` is really the kernel thread id, not the owning
+                            // process's), always sharing the same comm/exe/cmdline as their
+                            // parent process for as long as they haven't changed their own name
+                            // -- confirmed against a real Among Us session, where the game's main
+                            // process (a single stable pid) came with 80-90+ such thread entries
+                            // that appear and disappear continuously as the engine's thread pool
+                            // churns. Matching against one of these instead of the real process
+                            // is exactly why exit detection (and, before the mapped-game replay
+                            // check existed, which appid a launch resolved to) was unreliable --
+                            // whichever pid happened to be examined first could easily be a
+                            // thread that exits seconds later while the actual game keeps
+                            // running, reporting a false "session ended" every time that happens.
+                            // `thread_kind()` is `None` for a genuine process and always `None`
+                            // on non-Linux, so this is a no-op everywhere else.
+                            if p.thread_kind().is_some() {
+                                continue 'proc_scan;
+                            }
                             // Try the resolved binary name first (right for native processes),
                             // then fall back to the reported process name/"comm" (right for
                             // Wine/Proton-hosted Windows games: Wine itself stays the real
@@ -889,6 +921,7 @@ pub fn run_poll_loop(
                                         *pid,
                                         &installed_games_poll,
                                         &library_index_poll,
+                                        &config,
                                         &currently_tracking_unmapped_poll,
                                         &last_ended_unmapped_poll,
                                         &on_unmapped_ended_poll,

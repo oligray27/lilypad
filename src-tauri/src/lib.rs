@@ -803,6 +803,26 @@ fn search_igdb_games(state: tauri::State<AppState>, query: String) -> Result<Vec
     client.search_igdb(&query)
 }
 
+/// Logs each individually-accumulated real-world play session in `entry.sessions` as its own
+/// FrogLog session (each with its own real date), via `submit_one(date, hours)`. Falls back to a
+/// single entry dated today using the accumulated `entry.hours` total for a pending item
+/// persisted before per-session tracking existed (`sessions` defaults to empty in that case) --
+/// otherwise resolving it would silently lose the hours rather than just merging them.
+fn log_each_pending_session(
+    entry: &config::PendingGameSubmission,
+    mut submit_one: impl FnMut(String, f64) -> Result<serde_json::Value, String>,
+) -> Result<(), String> {
+    if entry.sessions.is_empty() {
+        let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+        submit_one(date, entry.hours)?;
+    } else {
+        for session in &entry.sessions {
+            submit_one(session.date.clone(), session.hours)?;
+        }
+    }
+    Ok(())
+}
+
 /// Resolves a pending game submission by creating a brand-new FrogLog game entry for it.
 /// `igdb_title` is the exact title of the IGDB search result the user picked; enriched details
 /// for it are fetched fresh (via `fetch_game_details`) rather than trusting the lightweight
@@ -863,16 +883,17 @@ fn resolve_pending_game_as_new(
     // popup/notifications going forward.
     let created_title = created.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());
 
-    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-    client.add_game_session(
-        created_id as i32,
-        Some(date),
-        Some(entry.hours),
-        Some("Session logged from LilyPad".to_string()),
-        false,
-        true,
-        None,
-    )?;
+    log_each_pending_session(&entry, |date, hours| {
+        client.add_game_session(
+            created_id as i32,
+            Some(date),
+            Some(hours),
+            Some("Session logged from LilyPad".to_string()),
+            false,
+            true,
+            None,
+        )
+    })?;
 
     config::remove_pending_game_submission(&appid);
 
@@ -940,16 +961,17 @@ fn resolve_pending_game_as_replay(
     let created_id = created.get("id").and_then(|v| v.as_i64()).ok_or("Created game missing id")?;
     let created_title = created.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());
 
-    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-    client.add_game_session(
-        created_id as i32,
-        Some(date),
-        Some(entry.hours),
-        Some("Session logged from LilyPad".to_string()),
-        false,
-        true,
-        None,
-    )?;
+    log_each_pending_session(&entry, |date, hours| {
+        client.add_game_session(
+            created_id as i32,
+            Some(date),
+            Some(hours),
+            Some("Session logged from LilyPad".to_string()),
+            false,
+            true,
+            None,
+        )
+    })?;
 
     config::remove_pending_game_submission(&appid);
 
@@ -995,8 +1017,6 @@ fn resolve_pending_game_as_existing(
 
     let auth = state.auth.read().unwrap();
     let client = api_client(&auth).ok_or("Not logged in")?;
-    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let notes = Some("Logged from LilyPad's untracked-session detection".to_string());
     // Anything mapped here should end up session-tracked, not "regular" (a single running
     // hours_played total) -- matches the silent already-owned auto-link path (see the comment
     // in monitor.rs). enable_session_tracking is idempotent and preserves any pre-existing hours
@@ -1015,11 +1035,14 @@ fn resolve_pending_game_as_existing(
         }
         "session".to_string()
     };
-    if effective_game_type == "live" {
-        client.add_live_service_session(game_id, Some(date), Some(entry.hours), notes, false, true, None)?;
-    } else {
-        client.add_game_session(game_id, Some(date), Some(entry.hours), notes, false, true, None)?;
-    }
+    let notes = Some("Logged from LilyPad's untracked-session detection".to_string());
+    log_each_pending_session(&entry, |date, hours| {
+        if effective_game_type == "live" {
+            client.add_live_service_session(game_id, Some(date), Some(hours), notes.clone(), false, true, None)
+        } else {
+            client.add_game_session(game_id, Some(date), Some(hours), notes.clone(), false, true, None)
+        }
+    })?;
     // Best-effort: a game picked here might be a Steam-bulk-imported entry that was never
     // actually started (status "Imported", no start_date) -- now that a real session's been
     // logged against it, transition it to "In Progress". No-op if it isn't "Imported".

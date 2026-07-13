@@ -139,16 +139,19 @@ fn build_row(state: AppState, entry: PendingGameSubmission, on_changed: Rc<dyn F
     meta_label.set_halign(gtk4::Align::Start);
     row.append(&meta_label);
 
+    let status_label = gtk4::Label::new(None);
+    status_label.add_css_class("dim-label");
+    status_label.set_halign(gtk4::Align::Start);
+    status_label.set_visible(false);
+    row.append(&status_label);
+
     let actions_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
     let create_btn = gtk4::Button::with_label("Create New");
     let map_btn = gtk4::Button::with_label("Map to Existing");
     let dismiss_btn = gtk4::Button::with_label("Dismiss");
-    let status_label = gtk4::Label::new(None);
-    status_label.add_css_class("dim-label");
     actions_box.append(&create_btn);
     actions_box.append(&map_btn);
     actions_box.append(&dismiss_btn);
-    actions_box.append(&status_label);
     row.append(&actions_box);
 
     // --- Create New panel ---
@@ -331,6 +334,7 @@ fn build_row(state: AppState, entry: PendingGameSubmission, on_changed: Rc<dyn F
             btn.set_sensitive(false);
             status_label.remove_css_class("error");
             status_label.set_text("Creating…");
+            status_label.set_visible(true);
 
             let state = state.clone();
             let appid = appid.clone();
@@ -350,6 +354,7 @@ fn build_row(state: AppState, entry: PendingGameSubmission, on_changed: Rc<dyn F
                         btn.set_sensitive(true);
                         status_label.add_css_class("error");
                         status_label.set_text(&e);
+                        status_label.set_visible(true);
                     }
                     Err(_) => {}
                 }
@@ -426,6 +431,7 @@ fn build_row(state: AppState, entry: PendingGameSubmission, on_changed: Rc<dyn F
             btn.set_sensitive(false);
             status_label.remove_css_class("error");
             status_label.set_text("Creating…");
+            status_label.set_visible(true);
 
             let state = state.clone();
             let appid = appid.clone();
@@ -445,6 +451,7 @@ fn build_row(state: AppState, entry: PendingGameSubmission, on_changed: Rc<dyn F
                         btn.set_sensitive(true);
                         status_label.add_css_class("error");
                         status_label.set_text(&e);
+                        status_label.set_visible(true);
                     }
                     Err(_) => {}
                 }
@@ -542,6 +549,7 @@ fn build_row(state: AppState, entry: PendingGameSubmission, on_changed: Rc<dyn F
             btn.set_sensitive(false);
             status_label.remove_css_class("error");
             status_label.set_text("Logging…");
+            status_label.set_visible(true);
 
             let state = state.clone();
             let appid = appid.clone();
@@ -561,6 +569,7 @@ fn build_row(state: AppState, entry: PendingGameSubmission, on_changed: Rc<dyn F
                         btn.set_sensitive(true);
                         status_label.add_css_class("error");
                         status_label.set_text(&e);
+                        status_label.set_visible(true);
                     }
                     Err(_) => {}
                 }
@@ -616,17 +625,20 @@ fn build_replay_row(state: AppState, entry: PendingGameSubmission, replay_of: Re
     continue_note.set_wrap(true);
     row.append(&continue_note);
 
+    let status_label = gtk4::Label::new(None);
+    status_label.add_css_class("dim-label");
+    status_label.set_halign(gtk4::Align::Start);
+    status_label.set_visible(false);
+    row.append(&status_label);
+
     let actions_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
     let continue_btn = gtk4::Button::with_label("Log to most recent entry");
     continue_btn.add_css_class("suggested-action");
     let replay_btn = gtk4::Button::with_label("Create and log to new entry (replay)");
     let dismiss_btn = gtk4::Button::with_label("Dismiss");
-    let status_label = gtk4::Label::new(None);
-    status_label.add_css_class("dim-label");
     actions_box.append(&continue_btn);
     actions_box.append(&replay_btn);
     actions_box.append(&dismiss_btn);
-    actions_box.append(&status_label);
     row.append(&actions_box);
 
     continue_btn.connect_clicked({
@@ -642,6 +654,7 @@ fn build_replay_row(state: AppState, entry: PendingGameSubmission, replay_of: Re
             replay_btn.set_sensitive(false);
             status_label.remove_css_class("error");
             status_label.set_text("Logging…");
+            status_label.set_visible(true);
 
             let state = state.clone();
             let appid = appid.clone();
@@ -664,6 +677,7 @@ fn build_replay_row(state: AppState, entry: PendingGameSubmission, replay_of: Re
                         replay_btn.set_sensitive(true);
                         status_label.add_css_class("error");
                         status_label.set_text(&e);
+                        status_label.set_visible(true);
                     }
                     Err(_) => {}
                 }
@@ -683,6 +697,7 @@ fn build_replay_row(state: AppState, entry: PendingGameSubmission, replay_of: Re
             replay_btn.set_sensitive(false);
             status_label.remove_css_class("error");
             status_label.set_text("Creating…");
+            status_label.set_visible(true);
 
             let state = state.clone();
             let appid = appid.clone();
@@ -704,6 +719,7 @@ fn build_replay_row(state: AppState, entry: PendingGameSubmission, replay_of: Re
                         replay_btn.set_sensitive(true);
                         status_label.add_css_class("error");
                         status_label.set_text(&e);
+                        status_label.set_visible(true);
                     }
                     Err(_) => {}
                 }

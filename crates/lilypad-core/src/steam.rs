@@ -350,25 +350,47 @@ pub fn find_installed_game_for_exe_or_cmd<'a>(
     None
 }
 
-/// Scans a process's command-line arguments for a `.exe` path, in whichever form the launcher
-/// happened to pass it. Steam's own Proton launch chain passes a plain native Linux path (the
-/// common case, confirmed against a real running session -- see `find_installed_game_for_exe_or_cmd`),
-/// taken as-is; a `Z:\...` Windows-style path is also accepted as a fallback for launch methods
-/// that might pass one instead, translated via Proton/Wine's default prefix convention of mapping
-/// drive `Z:` onto the Unix root `/`.
+/// Finds the `<exe>` argument of a genuine `proton waitforexitandrun <exe>` invocation in a
+/// process's own argv, in whichever path form the launcher happened to pass it.
+///
+/// `proton` must appear within the first few positions of *this exact process's* own argv (its
+/// own command, give or take a `python3` interpreter prefix), immediately followed by
+/// `waitforexitandrun` -- not just found anywhere in the array. Confirmed against a real
+/// captured Among Us launch: every wrapper in Steam's launch chain (`reaper`, pressure-vessel's
+/// `srt-bwrap`/`pv-adverb`, the SteamLinuxRuntime entry-point) inherits the *entire* downstream
+/// command as trailing arguments of its own, so all of them carry the identical trailing
+/// `.../proton waitforexitandrun .../Among Us.exe` sequence too -- just buried increasingly deep
+/// behind each wrapper's own flags (`proton` sat at argv index 7 for `reaper`, deeper still for
+/// `srt-bwrap`/`pv-adverb`, versus index 0 or 1 for the actual `proton`/`python3 proton`
+/// process). A naive "does this cmd contain that sequence anywhere" scan matched all of them
+/// equally, and which one the poll loop happened to examine first (arbitrary `HashMap`
+/// iteration order) ended up as the PID tracked for exit detection -- those wrapper layers don't
+/// reliably share the game's exact lifetime the way the real `proton waitforexitandrun` process
+/// is specifically designed to (see `find_installed_game_for_exe_or_cmd`), so which one won was
+/// producing inconsistent, unreliable session tracking across launches.
+///
+/// The path itself is usually a plain native Linux path (confirmed against that same real
+/// session); a `Z:\...` Windows-style path is also accepted as a fallback for launch methods
+/// that might pass one instead, translated via Proton/Wine's default prefix convention of
+/// mapping drive `Z:` onto the Unix root `/`.
 #[cfg(target_os = "linux")]
 fn find_proton_exe_path(cmd: &[std::ffi::OsString]) -> Option<PathBuf> {
-    cmd.iter().find_map(|arg| {
-        let arg = arg.to_str()?;
-        if !arg.to_lowercase().ends_with(".exe") {
-            return None;
-        }
-        if arg.starts_with('/') {
-            return Some(PathBuf::from(arg));
-        }
-        let rest = arg.strip_prefix("Z:").or_else(|| arg.strip_prefix("z:"))?;
-        Some(PathBuf::from(rest.replace('\\', "/")))
-    })
+    let proton_idx = cmd.iter().take(3).position(|arg| {
+        let s = arg.to_str().unwrap_or_default();
+        s == "proton" || s.ends_with("/proton")
+    })?;
+    if cmd.get(proton_idx + 1)?.to_str()? != "waitforexitandrun" {
+        return None;
+    }
+    let arg = cmd.get(proton_idx + 2)?.to_str()?;
+    if !arg.to_lowercase().ends_with(".exe") {
+        return None;
+    }
+    if arg.starts_with('/') {
+        return Some(PathBuf::from(arg));
+    }
+    let rest = arg.strip_prefix("Z:").or_else(|| arg.strip_prefix("z:"))?;
+    Some(PathBuf::from(rest.replace('\\', "/")))
 }
 
 #[cfg(test)]
@@ -468,6 +490,93 @@ mod tests {
             "/home/user/.local/share/Steam/steamapps/common/Proton - Experimental/proton".into(),
             "waitforexitandrun".into(),
             "/home/user/.local/share/Steam/steamapps/common/Among Us/Among Us.exe".into(),
+        ];
+        let (found, matched_path) = find_installed_game_for_exe_or_cmd(Some(&python_exe), &cmd, &games).unwrap();
+        assert_eq!(found.appid, "945360");
+        assert_eq!(matched_path.file_name().unwrap(), "Among Us.exe");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn ignores_a_wrapper_process_that_merely_inherited_the_proton_command() {
+        // Captured verbatim from a real Among Us launch: reaper's own argv (Steam's process
+        // supervisor, launched for every Steam game) inherits the *entire* downstream command,
+        // so it carries the same trailing "proton waitforexitandrun <exe>" sequence as the real
+        // proton process -- just with `proton` sitting at index 7, not index 0/1. This process
+        // must NOT match, or which of several such wrapper processes the poll loop happens to
+        // examine first (arbitrary HashMap iteration order) ends up non-deterministically chosen
+        // as the PID tracked for exit detection, none of which reliably share the game's exact
+        // lifetime the way the real proton process does.
+        let games = vec![InstalledGame {
+            appid: "945360".to_string(),
+            name: "Among Us".to_string(),
+            install_dir: PathBuf::from("/home/ogray/.local/share/Steam/steamapps/common/Among Us"),
+        }];
+        let reaper_exe = PathBuf::from("/home/ogray/.local/share/Steam/ubuntu12_32/reaper");
+        let cmd: Vec<std::ffi::OsString> = vec![
+            "/home/ogray/.local/share/Steam/ubuntu12_32/reaper".into(),
+            "SteamLaunch".into(),
+            "AppId=945360".into(),
+            "--".into(),
+            "/home/ogray/.local/share/Steam/steamapps/common/SteamLinuxRuntime_4/_v2-entry-point".into(),
+            "--verb=waitforexitandrun".into(),
+            "--".into(),
+            "/home/ogray/.local/share/Steam/steamapps/common/Proton - Experimental/proton".into(),
+            "waitforexitandrun".into(),
+            "/home/ogray/.local/share/Steam/steamapps/common/Among Us/Among Us.exe".into(),
+        ];
+        assert!(find_installed_game_for_exe_or_cmd(Some(&reaper_exe), &cmd, &games).is_none());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn ignores_a_pressure_vessel_wrapper_that_merely_inherited_the_proton_command() {
+        // Same real launch, one layer deeper: pressure-vessel's pv-adverb, buried behind a long
+        // run of its own sandbox-setup flags before the inherited proton command appears.
+        let games = vec![InstalledGame {
+            appid: "945360".to_string(),
+            name: "Among Us".to_string(),
+            install_dir: PathBuf::from("/home/ogray/.local/share/Steam/steamapps/common/Among Us"),
+        }];
+        let pv_adverb_exe =
+            PathBuf::from("/usr/lib/pressure-vessel/from-host/libexec/steam-runtime-tools-0/pv-adverb");
+        let cmd: Vec<std::ffi::OsString> = vec![
+            "/usr/lib/pressure-vessel/from-host/libexec/steam-runtime-tools-0/pv-adverb".into(),
+            "--prefix=/usr/lib/pressure-vessel/from-host".into(),
+            "--generate-locales".into(),
+            "--fd".into(),
+            "11".into(),
+            "--regenerate-ld.so-cache".into(),
+            "/var/pressure-vessel/ldso".into(),
+            "--overrides-path".into(),
+            "/usr/lib/pressure-vessel/overrides".into(),
+            "--assign-fd=1=3".into(),
+            "--assign-fd=2=4".into(),
+            "--".into(),
+            "/home/ogray/.local/share/Steam/steamapps/common/Proton - Experimental/proton".into(),
+            "waitforexitandrun".into(),
+            "/home/ogray/.local/share/Steam/steamapps/common/Among Us/Among Us.exe".into(),
+        ];
+        assert!(find_installed_game_for_exe_or_cmd(Some(&pv_adverb_exe), &cmd, &games).is_none());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn matches_the_real_python3_proton_process_specifically() {
+        // The actual process this is all meant to identify: python3 running the proton script
+        // directly, with nothing ahead of it but the interpreter -- captured from the same real
+        // launch as the two wrapper tests above.
+        let games = vec![InstalledGame {
+            appid: "945360".to_string(),
+            name: "Among Us".to_string(),
+            install_dir: PathBuf::from("/home/ogray/.local/share/Steam/steamapps/common/Among Us"),
+        }];
+        let python_exe = PathBuf::from("/usr/bin/python3.11");
+        let cmd: Vec<std::ffi::OsString> = vec![
+            "python3".into(),
+            "/home/ogray/.local/share/Steam/steamapps/common/Proton - Experimental/proton".into(),
+            "waitforexitandrun".into(),
+            "/home/ogray/.local/share/Steam/steamapps/common/Among Us/Among Us.exe".into(),
         ];
         let (found, matched_path) = find_installed_game_for_exe_or_cmd(Some(&python_exe), &cmd, &games).unwrap();
         assert_eq!(found.appid, "945360");

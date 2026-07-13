@@ -203,11 +203,11 @@ async function loadNewGamesView() {
         <span>${g.hours}h · ${g.session_count} session${g.session_count === 1 ? '' : 's'}. This game is already marked as ${escapeHtml(g.replay_of.status || 'finished')}</span>
       </div>
       <p class="muted" style="font-size:0.85rem;margin:0.25rem 0;">Logging to the most recent entry will remove its end date and return it to "In Progress" status.</p>
+      <div class="pending-status"></div>
       <div class="pending-actions">
         <button type="button" class="newgame-continue">Log to most recent entry</button>
         <button type="button" class="newgame-replay">Create and log to new entry (replay)</button>
         <button type="button" class="pending-delete newgame-dismiss">Dismiss</button>
-        <span class="pending-status"></span>
       </div>
     </div>
   ` : `
@@ -217,11 +217,11 @@ async function loadNewGamesView() {
         <span><strong>Hours:</strong> ${g.hours}h</span>
         <span><strong>Sessions:</strong> ${g.session_count}</span>
       </div>
+      <div class="pending-status"></div>
       <div class="pending-actions">
         <button type="button" class="newgame-create">Create New</button>
         <button type="button" class="newgame-map">Map to Existing</button>
         <button type="button" class="pending-delete newgame-dismiss">Dismiss</button>
-        <span class="pending-status"></span>
       </div>
       <div class="newgame-create-panel" hidden>
         <p class="newgame-lookup-status muted" hidden></p>

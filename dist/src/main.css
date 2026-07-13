@@ -179,7 +179,8 @@ input#mappingsSearch { width: 100%; padding-right: 0.35rem; box-sizing: border-b
 .pending-error { font-size: 0.82rem; color: var(--error); margin-bottom: 0.35rem; }
 .pending-actions { display: flex; align-items: center; gap: 0.5rem; }
 .pending-actions button { margin: 0; padding: 0.25rem 0.7rem; font-size: 0.85rem; }
-.pending-status { font-size: 0.82rem; color: var(--muted); }
+.pending-status { font-size: 0.82rem; color: var(--muted); margin-bottom: 0.25rem; }
+.pending-status:empty { display: none; }
 /* New Games view — reuses .pending-* above for the card/list chrome */
 #newGamesView { width: 100%; max-width: none; display: flex; flex-direction: column; height: calc(100vh - 2rem); }
 #newGamesView .mappings-footer { padding-top: 0.5rem; }

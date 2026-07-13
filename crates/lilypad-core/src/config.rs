@@ -122,6 +122,16 @@ pub struct ReplayOf {
     pub status: Option<String>,
 }
 
+/// One individual real-world play session accumulated into a `PendingGameSubmission`, with the
+/// actual date it happened on -- kept separate (rather than only ever summed into a running
+/// total) so resolving the pending item can log each one as its own FrogLog session with its
+/// real date, instead of merging everything into a single entry dated "today".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingGameSessionEntry {
+    pub date: String,
+    pub hours: f64,
+}
+
 /// A completed play session for a Steam game that isn't in the user's FrogLog library yet
 /// (see `monitor::run_poll_loop`'s `on_unmapped_session_ended`). Not a "failed submission" like
 /// `PendingSession` — this is a game that was never submitted at all, waiting to be resolved
@@ -131,7 +141,11 @@ pub struct ReplayOf {
 pub struct PendingGameSubmission {
     pub appid: String,
     pub title: String,
+    /// Running total across `sessions` -- kept as its own field (rather than always
+    /// recomputed) purely so existing display code didn't need to change when `sessions` was
+    /// added; always kept in lockstep with it by `record_pending_game_submission`.
     pub hours: f64,
+    /// Always equal to `sessions.len()`, for the same reason as `hours` above.
     pub session_count: u32,
     pub first_seen_secs: u64,
     pub last_session_secs: u64,
@@ -147,6 +161,15 @@ pub struct PendingGameSubmission {
     /// entries persisted before this field existed.
     #[serde(default)]
     pub replay_of: Option<ReplayOf>,
+    /// Each individual real-world play session that's been accumulated, in the order recorded
+    /// -- resolving this pending item logs each of these as its own FrogLog session (see
+    /// `resolve_as_new`/`resolve_as_existing`/`resolve_as_replay`), rather than merging them
+    /// into a single entry. Defaults to empty for entries persisted before this field existed
+    /// (which then resolve as zero sessions logged rather than silently losing the total --
+    /// acceptable since this only affects a pending item that was already sitting unresolved
+    /// across an app update, and its `hours`/`session_count` remain visible either way).
+    #[serde(default)]
+    pub sessions: Vec<PendingGameSessionEntry>,
 }
 
 pub fn pending_game_submissions_path() -> PathBuf {
@@ -182,6 +205,8 @@ pub fn record_pending_game_submission(appid: &str, title: &str, exe_name: &str, 
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let session_entry = PendingGameSessionEntry { date: today, hours };
 
     let total_hours = if let Some(existing) = items.iter_mut().find(|i| i.appid == appid) {
         existing.hours += hours;
@@ -190,6 +215,7 @@ pub fn record_pending_game_submission(appid: &str, title: &str, exe_name: &str, 
         existing.title = title.to_string();
         existing.exe_name = exe_name.to_string();
         existing.replay_of = replay_of;
+        existing.sessions.push(session_entry);
         existing.hours
     } else {
         items.push(PendingGameSubmission {
@@ -201,6 +227,7 @@ pub fn record_pending_game_submission(appid: &str, title: &str, exe_name: &str, 
             last_session_secs: now_secs,
             exe_name: exe_name.to_string(),
             replay_of,
+            sessions: vec![session_entry],
         });
         hours
     };

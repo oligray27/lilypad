@@ -129,9 +129,22 @@ pub fn handle_session_ended(
     let hours = round_hours(duration_secs);
 
     if is_notes_type {
-        // Show a notification with an "Add Notes" action. `wait_for_action` blocks
-        // until the user clicks it, dismisses the notification, or it times out —
-        // any outcome other than the click means "go ahead and auto-submit".
+        // Show a notification with an "Add Notes" action, then wait up to the notification's
+        // own timeout for the user to click it before auto-submitting. 5 seconds matches
+        // Windows' toast, which sets no explicit duration/scenario and so falls back to the
+        // OS's default "short" banner display time (~5s, vs. ~25s for `duration="long"`, which
+        // isn't set there).
+        //
+        // `wait_for_action` only resolves once the notification server actually reports the
+        // banner closing (a NotificationClosed/ActionInvoked signal over D-Bus) -- unlike
+        // Windows' toast API, which guarantees that callback fires when its timeout elapses,
+        // Linux notification daemons aren't required to honor the requested timeout at all (the
+        // freedesktop.org spec explicitly allows a server to ignore it), and GNOME Shell in
+        // particular is known not to send it until the user actually interacts with the
+        // notification when it has action buttons. Relying on `wait_for_action` alone left this
+        // thread blocked indefinitely and auto-submit never happening. Race it against our own
+        // timer instead, so auto-submit always fires on schedule regardless of whether the
+        // notification server ever reports the banner closing.
         std::thread::spawn(move || {
             let title = mapping.title.clone().unwrap_or_else(|| mapping.process.clone());
             let time_str = format_duration(duration_secs);
@@ -141,25 +154,26 @@ pub fn handle_session_ended(
                 .summary("Session Auto-Submitting")
                 .body(&format!("{title} ({time_str})"))
                 .action("add_notes", "Add Notes")
-                .timeout(notify_rust::Timeout::Milliseconds(20_000))
+                .timeout(notify_rust::Timeout::Milliseconds(5_000))
                 .show();
 
-            let add_notes_clicked = std::rc::Rc::new(std::cell::Cell::new(false));
-            match notification {
+            let add_notes_clicked = match notification {
                 Ok(handle) => {
-                    let flag = std::rc::Rc::clone(&add_notes_clicked);
-                    handle.wait_for_action(move |action| {
-                        if action == "add_notes" {
-                            flag.set(true);
-                        }
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        handle.wait_for_action(move |action| {
+                            let _ = tx.send(action == "add_notes");
+                        });
                     });
+                    matches!(rx.recv_timeout(std::time::Duration::from_millis(5_500)), Ok(true))
                 }
                 Err(e) => {
                     log::warn!("[LilyPad] auto-submit notification failed: {e}");
+                    false
                 }
-            }
+            };
 
-            if add_notes_clicked.get() {
+            if add_notes_clicked {
                 let _ = app_tx.send_blocking(AppAction::ShowSessionPopup(SessionEndedData {
                     process_name,
                     mapping,
@@ -169,12 +183,17 @@ pub fn handle_session_ended(
                 return;
             }
 
-            submit_now(&auth, &mapping, hours, duration_secs, &refresh_tray);
+            // Matches the Tauri build: a live/session game that's already had its "Add Notes"
+            // toast shown gets no further notification on success, only on failure (see
+            // `submit_now`'s `notify_on_success`) -- Windows never had one here either.
+            submit_now(&auth, &mapping, hours, duration_secs, &refresh_tray, false);
         });
     } else {
-        // Regular games: silent auto-submit (no notes support).
+        // Regular games: silent auto-submit (no notes support), but do confirm success --
+        // matches the Tauri build's regular-game path, which shows "Session Auto-Submitted"
+        // here specifically (unlike the live/session path above).
         std::thread::spawn(move || {
-            submit_now(&auth, &mapping, hours, duration_secs, &refresh_tray);
+            submit_now(&auth, &mapping, hours, duration_secs, &refresh_tray, true);
         });
     }
 }
@@ -182,8 +201,10 @@ pub fn handle_session_ended(
 /// Submits a session/hours update immediately, falling back to the pending
 /// queue on failure so the play time isn't lost. Runs on a background thread.
 /// `hours` is the value sent to the API (rounded); `duration_secs` is only used
-/// for the notification's display text.
-fn submit_now(auth: &AuthConfig, mapping: &ProcessMapping, hours: f64, duration_secs: f64, refresh_tray: &RefreshTray) {
+/// for the notification's display text. `notify_on_success` controls whether a
+/// "Session Auto-Submitted" notification fires on success -- always shown for a failure either
+/// way, but on success it should only fire for the regular-game path (see call sites).
+fn submit_now(auth: &AuthConfig, mapping: &ProcessMapping, hours: f64, duration_secs: f64, refresh_tray: &RefreshTray, notify_on_success: bool) {
     let client = client_for(auth);
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
     let title = mapping.title.clone().unwrap_or_else(|| mapping.process.clone());
@@ -214,7 +235,9 @@ fn submit_now(auth: &AuthConfig, mapping: &ProcessMapping, hours: f64, duration_
 
     match result {
         Ok(_) => {
-            notify::show("Session Auto-Submitted", &format!("{title} ({})", format_duration(duration_secs)));
+            if notify_on_success {
+                notify::show("Session Auto-Submitted", &format!("{title} ({})", format_duration(duration_secs)));
+            }
         }
         Err(e) => {
             let mut sessions = lilypad_core::config::load_pending_sessions();
