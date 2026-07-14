@@ -2698,6 +2698,7 @@ dependencies = [
  "env_logger",
  "glib 0.22.8",
  "gtk4",
+ "image",
  "ksni",
  "libadwaita",
  "lilypad-core",

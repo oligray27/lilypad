@@ -1,15 +1,30 @@
 //! Thin notify-rust wrapper. Errors are logged, never propagated — a failed
 //! notification shouldn't interrupt tracking.
 
+/// Resolves to an absolute path to the icon shipped alongside the running binary
+/// (`usr/share/icons/hicolor/128x128/apps/<name>.png` next to `usr/bin/`) when one exists —
+/// true for .deb/.rpm installs and for an AppImage's own AppDir — falling back to the bare
+/// freedesktop icon name otherwise. The notification daemon resolves a bare name via the
+/// *system* icon theme, which is empty for an AppImage that isn't integrated via appimaged/
+/// AppImageLauncher, so a bare name silently shows a generic icon instead of LilyPad's; an
+/// absolute path sidesteps that lookup entirely.
+fn icon_ref(name: &str) -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
+        .map(|bin_dir| bin_dir.join(format!("../share/icons/hicolor/128x128/apps/{name}.png")))
+        .filter(|p| p.exists())
+        .and_then(|p| p.canonicalize().ok())
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| name.to_string())
+}
+
 pub fn show(summary: &str, body: &str) {
     if let Err(e) = notify_rust::Notification::new()
         .summary(summary)
         .body(body)
         .appname("LilyPad")
-        // Freedesktop icon name, matching the hicolor icon installed by packaging
-        // (crates/lilypad-gtk/data + Cargo.toml deb/rpm assets) — notify-rust
-        // doesn't infer this from appname, it has to be set explicitly.
-        .icon("uk.co.froglog.lilypad")
+        .icon(&icon_ref("uk.co.froglog.lilypad"))
         .show()
     {
         log::warn!("[LilyPad] notification failed: {e}");
@@ -30,7 +45,7 @@ pub fn show_with_action(summary: &str, body: &str, action_label: &str, on_action
             .summary(&summary)
             .body(&body)
             .appname("LilyPad")
-            .icon("uk.co.froglog.lilypad")
+            .icon(&icon_ref("uk.co.froglog.lilypad"))
             .action("default", &action_label)
             .show()
         {

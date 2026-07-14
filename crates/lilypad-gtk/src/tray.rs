@@ -9,6 +9,24 @@
 use crate::state::AppState;
 use ksni::menu::StandardItem;
 use ksni::{blocking::TrayMethods, MenuItem};
+use std::sync::LazyLock;
+
+/// Decodes an embedded PNG into the raw ARGB32 pixel data ksni transmits directly over D-Bus to
+/// the tray host, bypassing icon-theme name lookup entirely (see `icon_pixmap` below for why
+/// that lookup can't be relied on).
+fn load_icon(bytes: &[u8]) -> ksni::Icon {
+    let img = image::load_from_memory(bytes).expect("valid embedded tray icon");
+    let (width, height) = image::GenericImageView::dimensions(&img);
+    let mut data = img.into_rgba8().into_vec();
+    for pixel in data.chunks_exact_mut(4) {
+        pixel.rotate_right(1); // RGBA -> ARGB, network byte order
+    }
+    ksni::Icon {
+        width: width as i32,
+        height: height as i32,
+        data,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum TrayAction {
@@ -48,6 +66,21 @@ impl ksni::Tray for LilypadTray {
         } else {
             "uk.co.froglog.lilypad".into()
         }
+    }
+
+    /// Primary icon source: `icon_name` above only resolves if the tray host can find that name
+    /// in an installed icon theme, which isn't true for an unintegrated AppImage (no appimaged/
+    /// AppImageLauncher registering it system-wide) — it shows a generic/blank icon instead.
+    /// Embedding the actual pixels sidesteps icon-theme lookup completely, so the real LilyPad
+    /// icon shows regardless of how the app was installed.
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        static NORMAL: LazyLock<ksni::Icon> =
+            LazyLock::new(|| load_icon(include_bytes!("../../../src-tauri/icons/128x128.png")));
+        static TRACKING: LazyLock<ksni::Icon> =
+            LazyLock::new(|| load_icon(include_bytes!("../../../src-tauri/icons/128x128_nowplaying.png")));
+
+        let icon = if self.state.now_tracking_title().is_some() { &*TRACKING } else { &*NORMAL };
+        vec![icon.clone()]
     }
 
     fn tool_tip(&self) -> ksni::ToolTip {
