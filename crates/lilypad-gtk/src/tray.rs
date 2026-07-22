@@ -65,6 +65,11 @@ impl ksni::Tray for LilypadTray {
     fn menu(&self) -> Vec<MenuItem<Self>> {
         let mut items: Vec<MenuItem<Self>> = Vec::new();
 
+        // While tracking, the status/stop items are *prepended* to the normal menu rather
+        // than replacing it. Configure is safe to use mid-session: the active session's
+        // wait-thread holds its own clone of the ProcessMapping and the monitor skips all
+        // start-detection while a session is live, so mapping edits and library refreshes
+        // only affect future sessions, never the one in progress.
         if let Some(title) = self.state.now_tracking_title() {
             items.push(
                 StandardItem {
@@ -83,15 +88,9 @@ impl ksni::Tray for LilypadTray {
                 }
                 .into(),
             );
-            items.push(
-                StandardItem {
-                    label: "Logout".into(),
-                    activate: Box::new(|t: &mut Self| t.send(TrayAction::Logout)),
-                    ..Default::default()
-                }
-                .into(),
-            );
-        } else if self.state.logged_in() {
+        }
+
+        if self.state.logged_in() {
             items.push(
                 StandardItem {
                     label: "Configure…".into(),
@@ -138,7 +137,7 @@ impl ksni::Tray for LilypadTray {
                 }
                 .into(),
             );
-        } else {
+        } else if self.state.now_tracking_title().is_none() {
             items.push(
                 StandardItem {
                     label: "Login".into(),

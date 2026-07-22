@@ -572,15 +572,22 @@ fn handle_session_ended(
 
 fn build_tray_menu(app: &tauri::AppHandle, logged_in: bool, game_title: Option<String>) -> Result<Menu<Wry>, Box<dyn std::error::Error + Send + Sync>> {
     let quit_item = PredefinedMenuItem::quit(app, Some("Quit"))?;
-    if let Some(ref title) = game_title {
-        let status_item = MenuItemBuilder::with_id("tracking_status", format!("Now Tracking: {}", title))
-            .enabled(false)
-            .build(app)?;
-        let force_stop_item = MenuItemBuilder::with_id("force_stop_tracking", "Stop Tracking Current Session").build(app)?;
-        let logout_item = MenuItemBuilder::with_id("logout", "Logout").build(app)?;
-        let menu = Menu::with_items(app, &[&status_item, &force_stop_item, &logout_item, &quit_item])?;
-        Ok(menu)
-    } else if logged_in {
+    // While tracking, the status/stop items are *prepended* to the normal menu rather than
+    // replacing it. Configure (and everything reachable from it) is safe during a session:
+    // the active session's wait-thread holds its own clone of the ProcessMapping, and the
+    // monitor skips all start-detection while current_session is occupied, so mapping edits,
+    // library refreshes, and rescans can only affect *future* sessions, never the live one.
+    let tracking_items = if let Some(ref title) = game_title {
+        Some((
+            MenuItemBuilder::with_id("tracking_status", format!("Now Tracking: {}", title))
+                .enabled(false)
+                .build(app)?,
+            MenuItemBuilder::with_id("force_stop_tracking", "Stop Tracking Current Session").build(app)?,
+        ))
+    } else {
+        None
+    };
+    if logged_in {
         let assign_exes_item = MenuItemBuilder::with_id("assign_exes", "Configure...").build(app)?;
         let about_item = MenuItemBuilder::with_id("about", "About").build(app)?;
         let logout_item = MenuItemBuilder::with_id("logout", "Logout").build(app)?;
@@ -596,7 +603,12 @@ fn build_tray_menu(app: &tauri::AppHandle, logged_in: bool, game_title: Option<S
         } else {
             None
         };
-        let mut items: Vec<&dyn IsMenuItem<Wry>> = vec![&assign_exes_item];
+        let mut items: Vec<&dyn IsMenuItem<Wry>> = Vec::new();
+        if let Some((ref status_item, ref force_stop_item)) = tracking_items {
+            items.push(status_item);
+            items.push(force_stop_item);
+        }
+        items.push(&assign_exes_item);
         if let Some(ref item) = new_games_item {
             items.push(item);
         }
@@ -607,6 +619,10 @@ fn build_tray_menu(app: &tauri::AppHandle, logged_in: bool, game_title: Option<S
         items.push(&logout_item);
         items.push(&quit_item);
         let menu = Menu::with_items(app, &items)?;
+        Ok(menu)
+    } else if let Some((ref status_item, ref force_stop_item)) = tracking_items {
+        // Tracking without a login shouldn't happen, but keep the session controls reachable.
+        let menu = Menu::with_items(app, &[status_item, force_stop_item, &quit_item])?;
         Ok(menu)
     } else {
         let login_item = MenuItemBuilder::with_id("login", "Login").build(app)?;
