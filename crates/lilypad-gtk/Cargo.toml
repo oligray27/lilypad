@@ -25,6 +25,7 @@ log = "0.4"
 env_logger = "0.11"
 dirs = "5"
 chrono = "0.4"
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [package.metadata.deb]
 maintainer = "Oli Gray <kloat64@icloud.com>"

@@ -53,8 +53,11 @@ if [ ! -x "$LINUXDEPLOY" ]; then
   curl -L -o "$LINUXDEPLOY" https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
   chmod +x "$LINUXDEPLOY"
 fi
+# Mainline plugin (NOT the tauri-apps fork, which hardcodes `DEPLOY_GTK_VERSION=3` for
+# webkit2gtk/GTK3 apps and would silently mis-bundle this GTK4/libadwaita build, plus checks the
+# legacy `gtk-theme` gsetting instead of `color-scheme`/the appearance portal for dark mode).
 if [ ! -x "$LINUXDEPLOY_GTK" ]; then
-  curl -L -o "$LINUXDEPLOY_GTK" https://raw.githubusercontent.com/tauri-apps/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh
+  curl -L -o "$LINUXDEPLOY_GTK" https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh
   chmod +x "$LINUXDEPLOY_GTK"
 fi
 
