@@ -442,12 +442,7 @@ fn build_window(app: &adw::Application, state: AppState) {
                             if r < 0.01 { 0.01 } else { r }
                         };
                         lilypad_core::config::record_pending_game_submission(&appid, &title, &exe_name, hours, replay_of.clone());
-                        let total_mins = (duration_secs / 60.0).round() as u64;
-                        let time_str = if total_mins >= 60 {
-                            format!("{}h {}m", total_mins / 60, total_mins % 60)
-                        } else {
-                            format!("{total_mins}m")
-                        };
+                        let time_str = session_flow::format_duration(duration_secs);
                         let notif_body = if replay_of.is_some() {
                             format!("{title} ({time_str}) is marked as finished in FrogLog. Resolve?")
                         } else {

@@ -43,9 +43,11 @@ function showView(id, heightOrOpts) {
 }
 
 function formatDuration(secs) {
-  const h = Math.floor(secs / 3600);
-  const m = Math.floor((secs % 3600) / 60);
+  const totalMins = Math.round(secs / 60);
+  const h = Math.floor(totalMins / 60);
+  const m = totalMins % 60;
   if (h > 0) return `${h}h ${m}m`;
+  if (totalMins === 0) return '<1 min';
   return `${m} min`;
 }
 

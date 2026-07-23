@@ -369,6 +369,10 @@ impl FroglogClient {
         }
         let existing_hours = obj.get("hours_played").and_then(Self::num_from_value);
         obj.insert("session_tracking".to_string(), serde_json::json!(true));
+        // Anything LilyPad converts to session tracking gets public sessions by default --
+        // only on the initial flip (the early-return above means an already-tracked game's
+        // own sessions_public choice is never overridden).
+        obj.insert("sessions_public".to_string(), serde_json::json!(true));
         if let Some(h) = existing_hours {
             if h > 0.0 {
                 obj.insert("initial_session_hours".to_string(), serde_json::json!(h));

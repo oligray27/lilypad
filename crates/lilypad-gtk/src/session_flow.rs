@@ -36,12 +36,7 @@ pub fn round_hours(duration_secs: f64) -> f64 {
 }
 
 pub fn format_duration(duration_secs: f64) -> String {
-    let mins = (duration_secs / 60.0).round() as u64;
-    if mins >= 60 {
-        format!("{}h {}m", mins / 60, mins % 60)
-    } else {
-        format!("{mins}m")
-    }
+    lilypad_core::duration::format_session_duration(duration_secs)
 }
 
 pub(crate) fn client_for(auth: &AuthConfig) -> FroglogClient {

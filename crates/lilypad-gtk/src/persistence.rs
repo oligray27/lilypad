@@ -7,7 +7,7 @@ use crate::session_flow::{self, AppAction};
 use crate::state::AppState;
 use crate::tray::RefreshTray;
 use lilypad_core::config::{app_data_dir, ProcessMapping};
-use lilypad_core::monitor::ActiveSession;
+use lilypad_core::monitor::{wait_for_exit_with_relaunch_grace, ActiveSession};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
@@ -99,20 +99,11 @@ pub fn recover_on_startup(state: AppState, refresh_tray: RefreshTray, app_tx: as
         });
         refresh_tray();
 
+        let process_name = persisted.process.clone();
         std::thread::spawn(move || {
-            let mut sys2 = System::new_all();
-            let deadline = Instant::now() + Duration::from_secs(10);
-            loop {
-                sys2.refresh_processes(ProcessesToUpdate::All);
-                if let Some(proc) = sys2.process(pid) {
-                    proc.wait();
-                    break;
-                }
-                if Instant::now() > deadline {
-                    break;
-                }
-                std::thread::sleep(Duration::from_secs(1));
-            }
+            // Shared with live tracking: adopts a same-named relaunch (e.g. a self-restarting
+            // game) into this same session instead of ending it early.
+            wait_for_exit_with_relaunch_grace(pid, &process_name);
             let duration_secs = SystemTime::now().duration_since(saved_wall).unwrap_or_default().as_secs_f64();
             let _ = std::fs::remove_file(&path);
             *state.current_session.write().unwrap() = None;

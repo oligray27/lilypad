@@ -60,6 +60,7 @@ pub fn resolve_as_new(state: &AppState, appid: &str, igdb_title: &str) -> Result
     obj.insert("is_public".to_string(), serde_json::json!(true));
     // Session-tracked, matching how LilyPad actually recorded this play time.
     obj.insert("session_tracking".to_string(), serde_json::json!(true));
+    obj.insert("sessions_public".to_string(), serde_json::json!(true));
     // Start date is when LilyPad first saw this game being played, not today.
     if let Some(start_date) = chrono::DateTime::from_timestamp(entry.first_seen_secs as i64, 0)
         .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
@@ -142,6 +143,9 @@ pub fn resolve_as_replay(state: &AppState, appid: &str) -> Result<serde_json::Va
     }
     obj.insert("dnf".to_string(), serde_json::json!(false));
     obj.insert("session_tracking".to_string(), serde_json::json!(true));
+    // Public sessions regardless of what the old entry had -- LilyPad-created games
+    // default to public session tracking.
+    obj.insert("sessions_public".to_string(), serde_json::json!(true));
     obj.insert("replay".to_string(), serde_json::json!(true));
     if let Some(start_date) = chrono::DateTime::from_timestamp(entry.first_seen_secs as i64, 0)
         .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())

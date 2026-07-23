@@ -73,22 +73,8 @@ fn run_unmapped_wait_thread(
     on_unmapped_session_ended: Arc<dyn Fn(String, String, String, f64, Option<ResolvedLibraryGame>) + Send + Sync>,
 ) {
     std::thread::spawn(move || {
-        let mut system = System::new_all();
-        let wait_start = Instant::now();
-        const DISCOVER_TIMEOUT: Duration = Duration::from_secs(5);
-
-        loop {
-            system.refresh_processes(ProcessesToUpdate::All);
-            if let Some(process) = system.process(pid) {
-                process.wait();
-                break;
-            }
-            if wait_start.elapsed() > DISCOVER_TIMEOUT {
-                break;
-            }
-            std::thread::sleep(Duration::from_secs(1));
-        }
-        let duration_secs = started_at.elapsed().as_secs_f64();
+        let exited_at = wait_for_exit_with_relaunch_grace(pid, &exe_name);
+        let duration_secs = exited_at.saturating_duration_since(started_at).as_secs_f64();
         currently_tracking.write().unwrap().remove(&appid);
         last_ended_unmapped.write().unwrap().insert(appid.clone(), Instant::now());
         on_unmapped_session_ended(title, appid, exe_name, duration_secs, replay_of);
@@ -454,6 +440,156 @@ fn pick_mapping(candidates: &[ProcessMapping], window_titles: &[String]) -> Opti
 /// starting a phantom second session, e.g. javaw.exe relaunching during Minecraft mod pack close).
 const POST_SESSION_COOLDOWN: Duration = Duration::from_secs(15);
 
+/// Games whose exe carries a UAC elevation manifest actually run twice: the unelevated process
+/// exits the instant the prompt is accepted, and the elevated copy relaunches right after.
+/// Ending the session on that first exit produced a junk seconds-long session followed by a
+/// second tracked session for the same sitting. The tell for "this exit is an elevation
+/// handoff, not the user quitting" is NOT session length (users legitimately log in for
+/// well under a minute just to check a shop) — it's `consent.exe`, the process Windows runs
+/// for exactly as long as a UAC prompt is on screen. So: a same-named successor already
+/// running at exit is adopted instantly (the blocking `ShellExecuteEx` pattern spawns the
+/// elevated copy before the stub finishes exiting), and only while consent.exe is alive do we
+/// keep waiting for one to appear (the fire-and-exit launcher pattern, where nothing is
+/// running while the user reads the prompt). No prompt on screen means every session —
+/// however short — ends with zero added delay. On Linux consent.exe never exists, so this
+/// whole mechanism is inert there (UAC is a Windows concept).
+///
+/// `UAC_PROMPT_WAIT_CAP` bounds the consent.exe wait (secure-desktop auto-deny is 2 minutes;
+/// slack on top). `POST_PROMPT_SCAN` keeps scanning briefly after the prompt closes, covering
+/// the accept case where the elevated process takes a moment to appear. The only lingering
+/// cost: if the session's own exit coincides with an unrelated app's UAC prompt, the end
+/// report waits for that prompt to resolve — rare, and the reported duration is unaffected.
+const UAC_PROMPT_WAIT_CAP: Duration = Duration::from_secs(150);
+const POST_PROMPT_SCAN: Duration = Duration::from_secs(3);
+
+/// True while a UAC prompt is on screen (consent.exe alive). Always false on non-Windows.
+fn uac_prompt_active(system: &System) -> bool {
+    system
+        .processes()
+        .values()
+        .any(|p| p.name().to_string_lossy().eq_ignore_ascii_case("consent.exe"))
+}
+
+/// Whether `process`'s resolved exe name or reported comm/name matches `process_name`
+/// case-insensitively — the same "is this the process we're tracking" test used both to
+/// detect a still-alive pid after an untrustworthy `wait()` return and to spot a same-named
+/// successor process (UAC elevation relaunch / self-restart).
+fn process_matches_name(process: &sysinfo::Process, process_name: &str) -> bool {
+    let exe_matches = process
+        .exe()
+        .and_then(|path| path.file_name().and_then(|n| n.to_str()))
+        .is_some_and(|e| e.eq_ignore_ascii_case(process_name));
+    exe_matches || process.name().to_string_lossy().eq_ignore_ascii_case(process_name)
+}
+
+/// Blocks until the given PID *and any same-named successor process* have exited; returns the
+/// moment the last of them was seen exiting (so callers can exclude any trailing successor
+/// scan from the session's duration). Successor adoption is what keeps a UAC-elevation
+/// relaunch inside one session instead of splitting it in two (see the comment above
+/// `UAC_PROMPT_WAIT_CAP` for the full picture).
+pub fn wait_for_exit_with_relaunch_grace(initial_pid: Pid, process_name: &str) -> Instant {
+    const DISCOVER_TIMEOUT: Duration = Duration::from_secs(5);
+    let mut system = System::new_all();
+    let mut pid = initial_pid;
+    loop {
+        // Wait for the current pid, with the discover timeout for pids that vanish before
+        // sysinfo ever sees them (same semantics the wait threads always had).
+        //
+        // `Process::wait()` itself cannot be trusted on its own: it needs process-handle
+        // rights that a UAC-elevated or anticheat-protected game (e.g. AC Shadows) never
+        // grants a non-elevated LilyPad, and in that case it *returns immediately* while the
+        // game is still running -- which is exactly how sessions got chopped into a churn of
+        // short segments (end -> 15s cooldown -> re-detect -> end -> ...). Process
+        // *enumeration* works regardless of handle rights, so every wait() return is verified
+        // against a fresh process list; if the pid is still there under the same name, fall
+        // back to plain existence polling.
+        let discover_start = Instant::now();
+        let mut warned_unwaitable = false;
+        loop {
+            system.refresh_processes(ProcessesToUpdate::All);
+            let Some(process) = system.process(pid) else {
+                if discover_start.elapsed() > DISCOVER_TIMEOUT {
+                    break;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+                continue;
+            };
+            process.wait();
+            system.refresh_processes(ProcessesToUpdate::All);
+            // Same-name requirement doubles as the pid-reuse guard during polling: a recycled
+            // pid belonging to some unrelated process must read as "our process exited".
+            let still_running = system
+                .process(pid)
+                .is_some_and(|p| process_matches_name(p, process_name));
+            if !still_running {
+                break;
+            }
+            if !warned_unwaitable {
+                warned_unwaitable = true;
+                log::info!(
+                    "[LilyPad] {} (pid {:?}) can't be waited on directly (likely UAC-elevated or anticheat-protected) -- falling back to existence polling",
+                    process_name, pid
+                );
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+        let exited_at = Instant::now();
+
+        // Successor scan: does a same-named process (by resolved exe name or comm, mirroring
+        // the poll loop's own matching) exist to adopt this session? Ends after the first
+        // pass unless a UAC prompt is up (or just closed) — see UAC_PROMPT_WAIT_CAP's doc.
+        let mut prompt_seen = false;
+        let mut prompt_gone_at: Option<Instant> = None;
+        let successor = loop {
+            system.refresh_processes(ProcessesToUpdate::All);
+            let found = system.processes().iter().find_map(|(p2, proc)| {
+                if *p2 == pid || proc.thread_kind().is_some() {
+                    return None;
+                }
+                process_matches_name(proc, process_name).then_some(*p2)
+            });
+            if found.is_some() {
+                break found;
+            }
+            if uac_prompt_active(&system) {
+                prompt_seen = true;
+                prompt_gone_at = None;
+                if exited_at.elapsed() > UAC_PROMPT_WAIT_CAP {
+                    break None;
+                }
+            } else if !prompt_seen {
+                // No prompt involved: one scan is all a normal exit gets — no added delay.
+                break None;
+            } else {
+                // Prompt just closed (accepted or denied): scan briefly for the elevated copy.
+                let gone_at = *prompt_gone_at.get_or_insert_with(Instant::now);
+                if gone_at.elapsed() > POST_PROMPT_SCAN {
+                    break None;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        };
+        match successor {
+            Some(next) => {
+                log::info!(
+                    "[LilyPad] {} (pid {:?}) exited but relaunched as pid {:?} (UAC elevation or self-restart) -- session continues",
+                    process_name, pid, next
+                );
+                pid = next;
+            }
+            None => {
+                if prompt_seen {
+                    log::info!(
+                        "[LilyPad] {} (pid {:?}) exited; a UAC prompt came and went with no same-named relaunch -- ending session",
+                        process_name, pid
+                    );
+                }
+                return exited_at;
+            }
+        }
+    }
+}
+
 /// Active session: we're currently tracking this process.
 #[derive(Debug, Clone)]
 pub struct ActiveSession {
@@ -464,7 +600,8 @@ pub struct ActiveSession {
     pub started_at: Instant,
 }
 
-/// Block until process exits (using sysinfo Process::wait), then send session-ended data on the channel.
+/// Block until the process (and any same-named UAC/self-restart successor — see
+/// `wait_for_exit_with_relaunch_grace`) exits, then send session-ended data on the channel.
 fn run_wait_thread(
     pid: Pid,
     process_name: String,
@@ -473,25 +610,9 @@ fn run_wait_thread(
     sender: mpsc::Sender<(String, ProcessMapping, f64)>,
 ) {
     std::thread::spawn(move || {
-        let mut system = System::new_all();
-        let wait_start = Instant::now();
-        const DISCOVER_TIMEOUT: Duration = Duration::from_secs(5);
-
-        loop {
-            system.refresh_processes(ProcessesToUpdate::All);
-            if let Some(process) = system.process(pid) {
-                process.wait();
-                let duration_secs = started_at.elapsed().as_secs_f64();
-                let _ = sender.send((process_name, mapping, duration_secs));
-                break;
-            }
-            if wait_start.elapsed() > DISCOVER_TIMEOUT {
-                let duration_secs = started_at.elapsed().as_secs_f64();
-                let _ = sender.send((process_name, mapping, duration_secs));
-                break;
-            }
-            std::thread::sleep(Duration::from_secs(1));
-        }
+        let exited_at = wait_for_exit_with_relaunch_grace(pid, &process_name);
+        let duration_secs = exited_at.saturating_duration_since(started_at).as_secs_f64();
+        let _ = sender.send((process_name, mapping, duration_secs));
     });
 }
 

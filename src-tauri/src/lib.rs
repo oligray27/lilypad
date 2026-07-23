@@ -1,4 +1,4 @@
-use lilypad_core::{api, config, library_match, local_games, monitor, steam};
+use lilypad_core::{api, config, duration, library_match, local_games, monitor, steam};
 
 use api::FroglogClient;
 use config::{AuthConfig, ExcludedApp, ProcessMapConfig, ProcessMapping, PendingSession, WatchedDirectory, auth_config_path, process_map_path_for_auth, load_pending_sessions, save_pending_sessions};
@@ -209,6 +209,43 @@ struct PersistedSession {
     started_at_secs: u64,
 }
 
+/// Escapes text interpolated into a Windows toast's XML payload. Game titles (arbitrary
+/// user/IGDB text) and formatted durations (e.g. "<1m") both go straight into `<text>...</text>`
+/// nodes below -- an unescaped `<`, `&`, or `>` makes `XmlDocument::LoadXml` fail, which makes
+/// the whole toast function return before ever calling `notifier.Show()`. In
+/// `show_auto_submit_toast` that silent bailout is worse than a missing toast: it drops both
+/// oneshot senders, and `tokio::select!`'s `_ = submit_rx` arm fires on ANY completion of that
+/// future including the resulting "sender dropped" error, so auto-submit fires immediately and
+/// silently with no toast and no chance to add notes.
+#[cfg(windows)]
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+#[cfg(all(test, windows))]
+mod xml_escape_tests {
+    use super::xml_escape;
+
+    #[test]
+    fn escapes_the_sub_minute_duration_marker() {
+        // The regression this exists for: "<1m" broke toast XML and silently killed the
+        // whole notification (see xml_escape's doc comment).
+        assert_eq!(xml_escape("<1m"), "&lt;1m");
+    }
+
+    #[test]
+    fn escapes_all_xml_metacharacters() {
+        assert_eq!(xml_escape("A & B"), "A &amp; B");
+        assert_eq!(xml_escape("<tag>"), "&lt;tag&gt;");
+        assert_eq!(xml_escape(r#"say "hi""#), "say &quot;hi&quot;");
+        assert_eq!(xml_escape("it's"), "it&apos;s");
+    }
+}
+
 /// Send a Windows toast notification with an "Add Notes" action button for live/session auto-submit.
 /// Clicking the action button cancels the auto-submit and opens the session popup.
 /// When the toast is dismissed/expires, submit_tx fires to trigger auto-submit.
@@ -226,8 +263,8 @@ fn show_auto_submit_toast(
     use windows::Foundation::TypedEventHandler;
     use windows::UI::Notifications::{ToastDismissedEventArgs, ToastNotification, ToastNotificationManager};
 
-    let title_owned = title_str.to_string();
-    let time_owned = time_str.to_string();
+    let title_owned = xml_escape(title_str);
+    let time_owned = xml_escape(time_str);
     let submit_tx_arc = Arc::new(std::sync::Mutex::new(Some(submit_tx)));
     std::thread::spawn(move || {
         unsafe {
@@ -304,7 +341,7 @@ fn show_pending_game_toast(body: &str, app: tauri::AppHandle) {
     use windows::Foundation::TypedEventHandler;
     use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
 
-    let body_owned = body.to_string();
+    let body_owned = xml_escape(body);
     std::thread::spawn(move || {
         unsafe {
             let _ = windows::Win32::System::Com::CoInitializeEx(
@@ -420,8 +457,7 @@ fn handle_session_ended(
             // Live/session: show toast with "Add Notes" button; auto-submit when toast is dismissed.
             if is_notes_type {
                 let title_str = mapping.title.as_deref().unwrap_or_else(|| mapping.process.as_str()).to_string();
-                let total_mins = (duration_secs / 60.0).round() as u64;
-                let time_str = if total_mins >= 60 { format!("{}h {}m", total_mins / 60, total_mins % 60) } else { format!("{}m", total_mins) };
+                let time_str = duration::format_session_duration(duration_secs);
                 let session_data = serde_json::json!({
                     "processName": process_name,
                     "mapping": {
@@ -512,10 +548,7 @@ fn handle_session_ended(
             });
             let submitted = rx.await.unwrap_or(false);
             let title_str = mapping.title.as_deref().unwrap_or_else(|| mapping.process.as_str()).to_string();
-            let total_mins = (duration_secs / 60.0).round() as u64;
-            let disp_h = total_mins / 60;
-            let disp_m = total_mins % 60;
-            let time_str = if disp_h > 0 { format!("{}h {}m", disp_h, disp_m) } else { format!("{}m", disp_m) };
+            let time_str = duration::format_session_duration(duration_secs);
             if submitted {
                 let _ = app.notification().builder()
                     .title("Session Auto-Submitted")
@@ -882,6 +915,7 @@ fn resolve_pending_game_as_new(
     // sessions, not a single running total) — hours go in via add_game_session below rather
     // than hours_played, same as a session-tracked game's aggregate is always computed.
     obj.insert("session_tracking".to_string(), serde_json::json!(true));
+    obj.insert("sessions_public".to_string(), serde_json::json!(true));
     // Start date is when LilyPad first saw this game being played, not today (when the user
     // finally got around to resolving it) — first_seen_secs is exactly that.
     if let Some(start_date) = chrono::DateTime::from_timestamp(entry.first_seen_secs as i64, 0)
@@ -970,6 +1004,9 @@ fn resolve_pending_game_as_replay(
     }
     obj.insert("dnf".to_string(), serde_json::json!(false));
     obj.insert("session_tracking".to_string(), serde_json::json!(true));
+    // Public sessions regardless of what the old entry had -- LilyPad-created games
+    // default to public session tracking.
+    obj.insert("sessions_public".to_string(), serde_json::json!(true));
     obj.insert("replay".to_string(), serde_json::json!(true));
     if let Some(start_date) = chrono::DateTime::from_timestamp(entry.first_seen_secs as i64, 0)
         .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
@@ -1677,17 +1714,9 @@ pub fn run() {
                         let process_name_w = persisted.process.clone();
                         let saved_secs = persisted.started_at_secs;
                         std::thread::spawn(move || {
-                            let mut sys2 = System::new_all();
-                            let deadline = Instant::now() + Duration::from_secs(10);
-                            loop {
-                                sys2.refresh_processes(ProcessesToUpdate::All);
-                                if let Some(proc) = sys2.process(pid) {
-                                    proc.wait();
-                                    break;
-                                }
-                                if Instant::now() > deadline { break; }
-                                std::thread::sleep(Duration::from_secs(1));
-                            }
+                            // Handles unwaitable (UAC-elevated/anticheat) processes and
+                            // elevation relaunches the same way live tracking does.
+                            monitor::wait_for_exit_with_relaunch_grace(pid, &process_name_w);
                             let duration_secs = SystemTime::now()
                                 .duration_since(SystemTime::UNIX_EPOCH + Duration::from_secs(saved_secs))
                                 .unwrap_or_default()
@@ -1794,8 +1823,7 @@ pub fn run() {
                         let hours = { let r = (raw_hours * 100.0).round() / 100.0; if r < 0.01 { 0.01 } else { r } };
                         let replay_of = replay_of.map(|r| config::ReplayOf { id: r.id, game_type: r.game_type, title: r.title, status: r.status });
                         config::record_pending_game_submission(&appid, &title, &exe_name, hours, replay_of.clone());
-                        let total_mins = (duration_secs / 60.0).round() as u64;
-                        let time_str = if total_mins >= 60 { format!("{}h {}m", total_mins / 60, total_mins % 60) } else { format!("{}m", total_mins) };
+                        let time_str = duration::format_session_duration(duration_secs);
                         let body = if replay_of.is_some() {
                             format!("{title} ({time_str}) is marked as finished in FrogLog. Resolve?")
                         } else {
