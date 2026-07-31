@@ -4,4 +4,5 @@ pub mod duration;
 pub mod library_match;
 pub mod local_games;
 pub mod monitor;
+pub mod session_persistence;
 pub mod steam;

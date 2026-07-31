@@ -50,10 +50,12 @@ pub(crate) fn client_for(auth: &AuthConfig) -> FroglogClient {
     c
 }
 
-/// Reports "now playing" to FrogLog when a tracked session starts, if the user
-/// has online presence enabled. Fire-and-forget on a background thread, same
-/// as the corresponding `clear_now_playing` call in `handle_session_ended`.
-pub fn handle_session_started(state: &AppState, mapping: &ProcessMapping) {
+/// Reports "now playing" to FrogLog when a tracked session starts, if the user has online
+/// presence enabled, and starts the periodic heartbeat that keeps that presence fresh and
+/// bounds crash-recovery's duration if LilyPad (or the PC) goes away mid-session — see
+/// `lilypad_core::session_persistence`. Fire-and-forget on a background thread, same as the
+/// corresponding `clear_now_playing` call in `handle_session_ended`.
+pub fn handle_session_started(state: &AppState, process_name: &str, mapping: &ProcessMapping) {
     let share_now_playing = state.process_map.read().unwrap().share_now_playing;
     if !share_now_playing {
         return;
@@ -61,10 +63,23 @@ pub fn handle_session_started(state: &AppState, mapping: &ProcessMapping) {
     let auth = state.auth.read().unwrap().clone();
     let mapping = mapping.clone();
     let started_at_iso = chrono::Utc::now().to_rfc3339();
+
+    let auth_hb = auth.clone();
+    let mapping_hb = mapping.clone();
+    let started_at_iso_hb = started_at_iso.clone();
     std::thread::spawn(move || {
         let client = client_for(&auth);
         let _ = client.set_now_playing(mapping.froglog_id, mapping.r#type.clone(), mapping.title.clone(), Some(started_at_iso));
     });
+
+    lilypad_core::session_persistence::spawn_session_heartbeat(
+        move || client_for(&auth_hb),
+        state.process_map.clone(),
+        state.current_session.clone(),
+        process_name.to_string(),
+        mapping_hb,
+        started_at_iso_hb,
+    );
 }
 
 /// Entry point called whenever a tracked session ends (normal exit or a

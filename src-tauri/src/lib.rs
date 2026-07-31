@@ -1,4 +1,4 @@
-use lilypad_core::{api, config, duration, library_match, local_games, monitor, steam};
+use lilypad_core::{api, config, duration, library_match, local_games, monitor, session_persistence, steam};
 
 use api::FroglogClient;
 use config::{AuthConfig, ExcludedApp, ProcessMapConfig, ProcessMapping, PendingSession, WatchedDirectory, auth_config_path, process_map_path_for_auth, load_pending_sessions, save_pending_sessions};
@@ -8,8 +8,7 @@ use steam::InstalledGame;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::sync::RwLock;
-use std::time::{Duration, Instant, SystemTime};
-use sysinfo::{ProcessesToUpdate, System};
+use std::time::Duration;
 use tauri::menu::{IsMenuItem, Menu, MenuItemBuilder, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{Emitter, Manager, WindowEvent};
@@ -196,17 +195,6 @@ fn refresh_library_index_state(state: &AppState) {
     let wishlist = client.get_wishlist().unwrap_or_default();
     let live_service = client.get_live_service_games().unwrap_or_default();
     *state.library_index_arc.write().unwrap() = LibraryIndex::build(&games, &wishlist, &live_service);
-}
-
-/// Persisted to disk when a session starts; cleared when it ends normally.
-/// Survives LilyPad crashes so sessions can be recovered on next launch.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PersistedSession {
-    process: String,
-    game_type: String,
-    froglog_id: i32,
-    title: Option<String>,
-    started_at_secs: u64,
 }
 
 /// Escapes text interpolated into a Windows toast's XML payload. Game titles (arbitrary
@@ -1602,9 +1590,7 @@ pub fn run() {
                             // Clear in-memory session
                             *state.current_session_arc.write().unwrap() = None;
                             // Delete persisted session file
-                            if let Ok(data_dir) = app.path().app_data_dir() {
-                                let _ = std::fs::remove_file(data_dir.join("active-session.json"));
-                            }
+                            session_persistence::clear_persisted_session();
                             // Always show the popup (never auto-submit on force stop —
                             // user is likely correcting a bad mapping)
                             let auth = state.auth.read().unwrap().clone();
@@ -1673,66 +1659,41 @@ pub fn run() {
                 });
             }
 
-            // Path used to persist the active session across crashes/restarts.
-            let session_path = app_handle.path().app_data_dir()
-                .map(|d| d.join("active-session.json"))
-                .unwrap_or_else(|_| std::path::PathBuf::from("active-session.json"));
-
-            // Recover any session that was interrupted by a LilyPad crash or driver restart.
-            if let Ok(json) = std::fs::read_to_string(&session_path) {
-                if let Ok(persisted) = serde_json::from_str::<PersistedSession>(&json) {
-                    let saved_wall = SystemTime::UNIX_EPOCH + Duration::from_secs(persisted.started_at_secs);
-                    let duration_so_far = SystemTime::now().duration_since(saved_wall).unwrap_or_default();
-                    let recovery_mapping = ProcessMapping {
-                        process: persisted.process.clone(),
-                        r#type: persisted.game_type.clone(),
-                        froglog_id: persisted.froglog_id,
-                        title: persisted.title.clone(),
-                        title_filter: None,
-                    };
-
-                    let mut sys = System::new_all();
-                    sys.refresh_processes(ProcessesToUpdate::All);
-                    let still_running_pid = sys.processes().iter().find_map(|(pid, p)| {
-                        let exe_name = p.exe()
-                            .and_then(|path| path.file_name().and_then(|n| n.to_str().map(String::from)))
-                            .unwrap_or_else(|| p.name().to_string_lossy().into_owned());
-                        if exe_name.eq_ignore_ascii_case(&persisted.process) { Some(*pid) } else { None }
-                    });
-
-                    if let Some(pid) = still_running_pid {
-                        // Game still running — restore the session with the correct original start time.
-                        let started_at = Instant::now().checked_sub(duration_so_far).unwrap_or_else(Instant::now);
-                        *current_session.write().unwrap() = Some(ActiveSession {
-                            process_name: persisted.process.clone(),
-                            mapping: recovery_mapping.clone(),
-                            started_at,
-                        });
-                        let session_path_w = session_path.clone();
-                        let current_session_w = Arc::clone(&current_session);
-                        let handle_w = app_handle.clone();
-                        let process_name_w = persisted.process.clone();
-                        let saved_secs = persisted.started_at_secs;
-                        std::thread::spawn(move || {
-                            // Handles unwaitable (UAC-elevated/anticheat) processes and
-                            // elevation relaunches the same way live tracking does.
-                            monitor::wait_for_exit_with_relaunch_grace(pid, &process_name_w);
-                            let duration_secs = SystemTime::now()
-                                .duration_since(SystemTime::UNIX_EPOCH + Duration::from_secs(saved_secs))
-                                .unwrap_or_default()
-                                .as_secs_f64();
-                            let _ = std::fs::remove_file(&session_path_w);
-                            *current_session_w.write().unwrap() = None;
-                            handle_session_ended(handle_w, process_name_w, recovery_mapping, duration_secs);
-                        });
-                    } else {
-                        // Game already gone — report the session immediately.
-                        let _ = std::fs::remove_file(&session_path);
-                        handle_session_ended(app_handle.clone(), persisted.process, recovery_mapping, duration_so_far.as_secs_f64());
-                    }
-                }
+            // Recover any session that was interrupted by a LilyPad crash, driver restart, or a
+            // full PC shutdown/reboot -- session_persistence bounds the recovered duration to the
+            // last confirmed-alive heartbeat rather than "now" when the process is gone, so
+            // downtime never gets billed as play time.
+            {
+                let current_session_recover = Arc::clone(&current_session);
+                let handle_restored = app_handle.clone();
+                let handle_ended = app_handle.clone();
+                session_persistence::recover_on_startup(
+                    current_session_recover,
+                    move |mapping, started_at_iso| {
+                        let _ = update_tray_state(&handle_restored);
+                        let (auth, process_map, current_session_hb) = {
+                            let state = handle_restored.state::<AppState>();
+                            let auth = state.auth.read().unwrap().clone();
+                            let process_map = Arc::clone(&state.process_map_arc);
+                            let current_session_hb = Arc::clone(&state.current_session_arc);
+                            (auth, process_map, current_session_hb)
+                        };
+                        session_persistence::spawn_session_heartbeat(
+                            move || api_client(&auth).unwrap_or_else(|| FroglogClient::new(String::new())),
+                            process_map,
+                            current_session_hb,
+                            mapping.process.clone(),
+                            mapping,
+                            started_at_iso,
+                        );
+                    },
+                    move |process_name, mapping, duration_secs| {
+                        handle_session_ended(handle_ended, process_name, mapping, duration_secs);
+                    },
+                );
             }
 
+            let current_session_for_heartbeat = Arc::clone(&current_session);
             run_poll_loop(
                 config,
                 current_session,
@@ -1741,22 +1702,10 @@ pub fn run() {
                 2,
                 {
                     let handle = app_handle.clone();
-                    let session_path_start = session_path.clone();
+                    let current_session_hb = current_session_for_heartbeat;
                     move |process_name, mapping: ProcessMapping| {
-                        // Persist session start so it survives a LilyPad crash.
-                        let secs = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs();
-                        if let Ok(json) = serde_json::to_string(&PersistedSession {
-                            process: mapping.process.clone(),
-                            game_type: mapping.r#type.clone(),
-                            froglog_id: mapping.froglog_id,
-                            title: mapping.title.clone(),
-                            started_at_secs: secs,
-                        }) {
-                            if let Some(parent) = session_path_start.parent() {
-                                let _ = std::fs::create_dir_all(parent);
-                            }
-                            let _ = std::fs::write(&session_path_start, json);
-                        }
+                        // Persist session start so it survives a LilyPad crash/PC shutdown.
+                        session_persistence::persist_session_start(&mapping);
                         let game_name = mapping.title.as_deref().unwrap_or_else(|| process_name.as_str());
                         let _ = handle.notification().builder()
                             .title("Tracking Started")
@@ -1770,6 +1719,9 @@ pub fn run() {
                             (auth_guard.clone(), map_guard.share_now_playing)
                         };
                         if share_now_playing {
+                            let auth_hb = auth.clone();
+                            let mapping_hb = mapping.clone();
+                            let started_at_iso_hb = started_at_iso.clone();
                             std::thread::spawn(move || {
                                 if let Some(client) = api_client(&auth) {
                                     let _ = client.set_now_playing(
@@ -1780,6 +1732,18 @@ pub fn run() {
                                     );
                                 }
                             });
+                            let process_map_hb = {
+                                let state = handle.state::<AppState>();
+                                Arc::clone(&state.process_map_arc)
+                            };
+                            session_persistence::spawn_session_heartbeat(
+                                move || api_client(&auth_hb).unwrap_or_else(|| FroglogClient::new(String::new())),
+                                process_map_hb,
+                                Arc::clone(&current_session_hb),
+                                process_name,
+                                mapping_hb,
+                                started_at_iso_hb,
+                            );
                         }
                         // Update tray to now-tracking state
                         let handle_tray = handle.clone();
@@ -1789,10 +1753,9 @@ pub fn run() {
                     }
                 },
                 {
-                    let session_path_end = session_path.clone();
                     let force_stopped_end = Arc::clone(&state.force_stopped_process);
                     move |process_name, mapping, duration_secs| {
-                        let _ = std::fs::remove_file(&session_path_end);
+                        session_persistence::clear_persisted_session();
                         // If force-stopped, clear the flag but skip handle_session_ended
                         // (it was already called from the tray handler)
                         let was_force_stopped = {

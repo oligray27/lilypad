@@ -1,12 +1,12 @@
 use crate::monitor_glue::{self, MonitorEvent};
 use crate::notify;
-use crate::persistence;
 use crate::session_flow::{self, AppAction};
 use crate::state::AppState;
 use crate::tray::{self, LilypadTray, TrayAction};
 use crate::views;
 use adw::prelude::*;
 use lilypad_core::config::{auth_config_path, AuthConfig};
+use lilypad_core::session_persistence;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -325,7 +325,7 @@ fn build_window(app: &adw::Application, state: AppState) {
                         if let Some((process_name, mapping, duration_secs)) = session_info {
                             *state.force_stopped_process.write().unwrap() = Some(process_name.clone());
                             *state.current_session.write().unwrap() = None;
-                            persistence::clear_persisted_session();
+                            session_persistence::clear_persisted_session();
                             session_flow::handle_session_ended(
                                 state.clone(),
                                 refresh_tray.clone(),
@@ -373,7 +373,39 @@ fn build_window(app: &adw::Application, state: AppState) {
     // Recover a session interrupted by a crash/restart, before the monitor starts
     // polling (so it sees current_session already populated and doesn't try to
     // start tracking the same still-running process as if it were new).
-    persistence::recover_on_startup(state.clone(), refresh_tray.clone(), app_tx.clone());
+    {
+        let state_restored = state.clone();
+        let refresh_tray_restored = refresh_tray.clone();
+        let state_ended = state.clone();
+        let refresh_tray_ended = refresh_tray.clone();
+        let app_tx_ended = app_tx.clone();
+        session_persistence::recover_on_startup(
+            state.current_session.clone(),
+            move |mapping, started_at_iso| {
+                refresh_tray_restored();
+                let auth = state_restored.auth.read().unwrap().clone();
+                session_persistence::spawn_session_heartbeat(
+                    move || session_flow::client_for(&auth),
+                    state_restored.process_map.clone(),
+                    state_restored.current_session.clone(),
+                    mapping.process.clone(),
+                    mapping,
+                    started_at_iso,
+                );
+            },
+            move |process_name, mapping, duration_secs| {
+                session_flow::handle_session_ended(
+                    state_ended,
+                    refresh_tray_ended,
+                    app_tx_ended,
+                    process_name,
+                    mapping,
+                    duration_secs,
+                    false,
+                );
+            },
+        );
+    }
 
     // Refresh the installed-Steam-games scan and the FrogLog library index
     // periodically in the background, so newly installed games or newly logged
@@ -397,9 +429,9 @@ fn build_window(app: &adw::Application, state: AppState) {
         async move {
             while let Ok(event) = mon_rx.recv().await {
                 match event {
-                    MonitorEvent::SessionStarted { mapping, .. } => {
-                        persistence::persist_session_start(&mapping);
-                        session_flow::handle_session_started(&state, &mapping);
+                    MonitorEvent::SessionStarted { process_name, mapping } => {
+                        session_persistence::persist_session_start(&mapping);
+                        session_flow::handle_session_started(&state, &process_name, &mapping);
                         let name = mapping.title.clone().unwrap_or(mapping.process.clone());
                         notify::show("Tracking Started", &name);
                         refresh_tray();
@@ -409,7 +441,7 @@ fn build_window(app: &adw::Application, state: AppState) {
                         mapping,
                         duration_secs,
                     } => {
-                        persistence::clear_persisted_session();
+                        session_persistence::clear_persisted_session();
                         // A process that was force-stopped is still running; the monitor
                         // will report its real exit later. That was already handled
                         // synchronously by the force-stop tray action, so skip it here.
