@@ -87,14 +87,45 @@ impl LibraryIndex {
         let mut by_appid = HashMap::new();
         let mut by_id = HashMap::new();
 
-        // Keeps the highest-`id` (most recently created) row for a given key, regardless of
-        // what order `games`/`live_service` happen to arrive in -- `GET /games` sorts by
-        // `start_date DESC`, so a replay's fresh entry is actually iterated *before* the older
-        // entry it replayed, and a plain `insert` would let that older row win the overwrite
-        // and silently become "the" entry for a shared appid (see `resolve_by_appid`).
-        fn insert_newest(map: &mut HashMap<String, ResolvedLibraryGame>, key: String, candidate: ResolvedLibraryGame) {
+        // Ranks candidates for a shared appid/titleId by status rather than just "most
+        // recently created" -- two (or more) rows can legitimately share the same platform
+        // id (e.g. the FrogLog import conflict UI's "Create new entry" choice), and an
+        // actively in-progress entry should always win auto-tracking over some other row
+        // that merely happens to share the id, regardless of which was created later.
+        // Mirrors the same tie-break in the backend's findLibraryGameBySteamAppId
+        // (steamLibraryMatch.js) et al.: In Progress > Dormant > Imported > blank/unset,
+        // then session-tracked before not, then highest id last.
+        fn status_priority(status: &Option<String>) -> u8 {
+            match status.as_deref().map(str::to_lowercase).as_deref() {
+                Some("in progress") => 1,
+                Some("dormant") => 2,
+                Some("imported") => 3,
+                _ => 4,
+            }
+        }
+
+        fn is_preferred(candidate: &ResolvedLibraryGame, existing: &ResolvedLibraryGame) -> bool {
+            let candidate_priority = status_priority(&candidate.status);
+            let existing_priority = status_priority(&existing.status);
+            if candidate_priority != existing_priority {
+                return candidate_priority < existing_priority;
+            }
+            let candidate_tracked = candidate.game_type == "session";
+            let existing_tracked = existing.game_type == "session";
+            if candidate_tracked != existing_tracked {
+                return candidate_tracked && !existing_tracked;
+            }
+            candidate.id > existing.id
+        }
+
+        // `GET /games` sorts by `start_date DESC`, so a replay's fresh entry is actually
+        // iterated *before* the older entry it replayed -- a plain `insert` would let that
+        // older row win the overwrite and silently become "the" entry for a shared appid
+        // (see `resolve_by_appid`), so every candidate is ranked via `is_preferred` above
+        // regardless of iteration order.
+        fn insert_preferred(map: &mut HashMap<String, ResolvedLibraryGame>, key: String, candidate: ResolvedLibraryGame) {
             match map.get(&key) {
-                Some(existing) if existing.id >= candidate.id => {}
+                Some(existing) if !is_preferred(&candidate, existing) => {}
                 _ => {
                     map.insert(key, candidate);
                 }
@@ -111,7 +142,7 @@ impl LibraryIndex {
                 steam_appids.insert(appid.clone());
                 if let Some(title) = &g.title {
                     let game_type = if g.session_tracking.unwrap_or(false) { "session" } else { "regular" };
-                    insert_newest(&mut by_appid, appid, ResolvedLibraryGame { id: g.id, game_type: game_type.to_string(), title: title.clone(), status: g.status.clone() });
+                    insert_preferred(&mut by_appid, appid, ResolvedLibraryGame { id: g.id, game_type: game_type.to_string(), title: title.clone(), status: g.status.clone() });
                 }
             }
         }
@@ -130,7 +161,7 @@ impl LibraryIndex {
             if let Some(appid) = steam_app_id_str(&l.steam_app_id) {
                 steam_appids.insert(appid.clone());
                 if let Some(title) = &l.title {
-                    insert_newest(&mut by_appid, appid, ResolvedLibraryGame { id: l.id, game_type: "live".to_string(), title: title.clone(), status: None });
+                    insert_preferred(&mut by_appid, appid, ResolvedLibraryGame { id: l.id, game_type: "live".to_string(), title: title.clone(), status: None });
                 }
             }
         }
@@ -239,6 +270,22 @@ mod tests {
         let index = LibraryIndex::build(&games, &[], &[]);
         let resolved = index.resolve_by_appid("235460").unwrap();
         assert_eq!(resolved.id, 7);
+    }
+
+    #[test]
+    fn resolve_by_appid_prefers_in_progress_over_a_higher_id_imported_duplicate() {
+        // The exact scenario that motivated the status-priority tie-break: a manually
+        // tracked, actively in-progress entry (lower id) must keep winning auto-tracking
+        // over a freshly created duplicate that merely happens to share the same appid
+        // (e.g. from the FrogLog import conflict UI's "Create new entry" choice) with a
+        // higher id but a less-committed "Imported" status.
+        let games = vec![
+            sample_game_with_status(9298, "Stellar Blade", 3489700, false, Some("In Progress")),
+            sample_game_with_status(9536, "Stellar Blade", 3489700, false, Some("Imported")),
+        ];
+        let index = LibraryIndex::build(&games, &[], &[]);
+        let resolved = index.resolve_by_appid("3489700").unwrap();
+        assert_eq!(resolved.id, 9298);
     }
 
     #[test]
