@@ -1,7 +1,7 @@
 //! Matching a detected game (Steam appid + title) against the user's existing FrogLog
 //! library (`games` + `wishlist`), to decide whether it's worth notifying about.
 
-use crate::api::{Game, LiveServiceGame, WishlistItem};
+use crate::api::{Game, LiveServiceGame, PlatformLink, WishlistItem};
 use std::collections::{HashMap, HashSet};
 
 /// Lowercases, strips punctuation, and strips common edition suffixes so titles that
@@ -42,6 +42,29 @@ fn steam_app_id_str(v: &Option<serde_json::Value>) -> Option<String> {
     })
 }
 
+fn igdb_id_i64(v: &Option<serde_json::Value>) -> Option<i64> {
+    v.as_ref().and_then(|v| v.as_i64())
+}
+
+/// Resolves a `games`/`live_service_games` row's Steam appid, preferring the
+/// `game_platform_links`-shaped `steam` entry over the legacy flat `steam_app_id` scalar
+/// column when both are present. Game-identity redesign, Phase 2's "port
+/// platform_key/external_id matching" — this crate previously read `steam_app_id` only,
+/// which will silently stop resolving anything the moment the backend's eventual Phase 3
+/// cutover drops that column from `games` (see `Game::platform_links`'s doc comment).
+/// Reading `platform_links` first, with the scalar column as a fallback, means this
+/// crate keeps working across that cutover without needing a synchronized LilyPad release.
+fn resolve_steam_appid(steam_app_id: &Option<serde_json::Value>, platform_links: &Option<Vec<PlatformLink>>) -> Option<String> {
+    if let Some(links) = platform_links {
+        if let Some(link) = links.iter().find(|l| l.platform_key == "steam") {
+            if let Some(id) = steam_app_id_str(&link.external_id) {
+                return Some(id);
+            }
+        }
+    }
+    steam_app_id_str(steam_app_id)
+}
+
 /// A `games` or `live_service` entry the monitor can confidently auto-link a detected exe to
 /// (i.e. create a `ProcessMapping` for without asking the user) — resolved by exact Steam
 /// appid only. Wishlist entries are deliberately excluded: there's no way to log hours against
@@ -56,6 +79,9 @@ pub struct ResolvedLibraryGame {
     /// finished state. Used to decide whether relaunching this appid should silently resume
     /// tracking, or should be treated as a possible replay (see `is_finished_status`).
     pub status: Option<String>,
+    /// This row's `igdb_id`, when known — carried through so a caller that resolved via
+    /// `resolve_by_igdb_id` doesn't need a second lookup just to get it back.
+    pub igdb_id: Option<i64>,
 }
 
 /// Whether a `games` row's status represents a "done with this" state — relaunching an appid
@@ -66,18 +92,23 @@ pub fn is_finished_status(status: &Option<String>) -> bool {
 }
 
 /// Index of everything already in the user's FrogLog library, built once and refreshed
-/// periodically. Three queries: `contains` (is this title/appid known at all, informational),
+/// periodically. Four queries: `contains` (is this title/appid known at all, informational),
 /// `resolve_by_appid` (can we confidently auto-link this exe to an existing trackable entry —
-/// only true for an exact appid match against `games`/`live_service`), and `resolve_by_id`
+/// only true for an exact appid match against `games`/`live_service`), `resolve_by_id`
 /// (what's the current state of a `games` row a `ProcessMapping` already points at, regardless
 /// of whether it has a Steam appid at all — used to decide whether an *existing* mapping should
-/// still be trusted, see `monitor::check_mapped_game_needs_replay_prompt`).
+/// still be trusted, see `monitor::check_mapped_game_needs_replay_prompt`), and
+/// `resolve_by_igdb_id` (same idea as `resolve_by_appid`, but keyed on IGDB's numeric id
+/// instead of a Steam appid — this crate's own detection never produces an igdb_id on its
+/// own, so this tier only ever gets consulted from a flow that already fetched one over the
+/// network for another reason, e.g. `resolve_pending_game_as_new`'s post-search-confirm check).
 #[derive(Debug, Default, Clone)]
 pub struct LibraryIndex {
     steam_appids: HashSet<String>,
     normalized_titles: HashSet<String>,
     by_appid: HashMap<String, ResolvedLibraryGame>,
     by_id: HashMap<i32, ResolvedLibraryGame>,
+    by_igdb_id: HashMap<i64, ResolvedLibraryGame>,
 }
 
 impl LibraryIndex {
@@ -86,6 +117,7 @@ impl LibraryIndex {
         let mut normalized_titles = HashSet::new();
         let mut by_appid = HashMap::new();
         let mut by_id = HashMap::new();
+        let mut by_igdb_id = HashMap::new();
 
         // Ranks candidates for a shared appid/titleId by status rather than just "most
         // recently created" -- two (or more) rows can legitimately share the same platform
@@ -120,10 +152,11 @@ impl LibraryIndex {
 
         // `GET /games` sorts by `start_date DESC`, so a replay's fresh entry is actually
         // iterated *before* the older entry it replayed -- a plain `insert` would let that
-        // older row win the overwrite and silently become "the" entry for a shared appid
-        // (see `resolve_by_appid`), so every candidate is ranked via `is_preferred` above
-        // regardless of iteration order.
-        fn insert_preferred(map: &mut HashMap<String, ResolvedLibraryGame>, key: String, candidate: ResolvedLibraryGame) {
+        // older row win the overwrite and silently become "the" entry for a shared appid/
+        // igdb_id (see `resolve_by_appid`/`resolve_by_igdb_id`), so every candidate is ranked
+        // via `is_preferred` above regardless of iteration order. Generic over the key type so
+        // the same ranking logic backs both `by_appid` (String) and `by_igdb_id` (i64).
+        fn insert_preferred<K: std::hash::Hash + Eq>(map: &mut HashMap<K, ResolvedLibraryGame>, key: K, candidate: ResolvedLibraryGame) {
             match map.get(&key) {
                 Some(existing) if !is_preferred(&candidate, existing) => {}
                 _ => {
@@ -133,17 +166,22 @@ impl LibraryIndex {
         }
 
         for g in games {
+            let igdb_id = igdb_id_i64(&g.igdb_id);
             if let Some(title) = &g.title {
                 normalized_titles.insert(normalize_title(title));
                 let game_type = if g.session_tracking.unwrap_or(false) { "session" } else { "regular" };
-                by_id.insert(g.id, ResolvedLibraryGame { id: g.id, game_type: game_type.to_string(), title: title.clone(), status: g.status.clone() });
+                by_id.insert(g.id, ResolvedLibraryGame { id: g.id, game_type: game_type.to_string(), title: title.clone(), status: g.status.clone(), igdb_id });
             }
-            if let Some(appid) = steam_app_id_str(&g.steam_app_id) {
+            if let Some(appid) = resolve_steam_appid(&g.steam_app_id, &g.platform_links) {
                 steam_appids.insert(appid.clone());
                 if let Some(title) = &g.title {
                     let game_type = if g.session_tracking.unwrap_or(false) { "session" } else { "regular" };
-                    insert_preferred(&mut by_appid, appid, ResolvedLibraryGame { id: g.id, game_type: game_type.to_string(), title: title.clone(), status: g.status.clone() });
+                    insert_preferred(&mut by_appid, appid, ResolvedLibraryGame { id: g.id, game_type: game_type.to_string(), title: title.clone(), status: g.status.clone(), igdb_id });
                 }
+            }
+            if let (Some(iid), Some(title)) = (igdb_id, &g.title) {
+                let game_type = if g.session_tracking.unwrap_or(false) { "session" } else { "regular" };
+                insert_preferred(&mut by_igdb_id, iid, ResolvedLibraryGame { id: g.id, game_type: game_type.to_string(), title: title.clone(), status: g.status.clone(), igdb_id });
             }
         }
         for w in wishlist {
@@ -153,20 +191,26 @@ impl LibraryIndex {
             if let Some(title) = &w.title {
                 normalized_titles.insert(normalize_title(title));
             }
+            // No by_igdb_id entry for wishlist -- same reasoning as by_appid always excluding
+            // it: there's no way to log hours (or resolve a replay) against a wishlist item.
         }
         for l in live_service {
+            let igdb_id = igdb_id_i64(&l.igdb_id);
             if let Some(title) = &l.title {
                 normalized_titles.insert(normalize_title(title));
             }
             if let Some(appid) = steam_app_id_str(&l.steam_app_id) {
                 steam_appids.insert(appid.clone());
                 if let Some(title) = &l.title {
-                    insert_preferred(&mut by_appid, appid, ResolvedLibraryGame { id: l.id, game_type: "live".to_string(), title: title.clone(), status: None });
+                    insert_preferred(&mut by_appid, appid, ResolvedLibraryGame { id: l.id, game_type: "live".to_string(), title: title.clone(), status: None, igdb_id });
                 }
+            }
+            if let (Some(iid), Some(title)) = (igdb_id, &l.title) {
+                insert_preferred(&mut by_igdb_id, iid, ResolvedLibraryGame { id: l.id, game_type: "live".to_string(), title: title.clone(), status: None, igdb_id });
             }
         }
 
-        Self { steam_appids, normalized_titles, by_appid, by_id }
+        Self { steam_appids, normalized_titles, by_appid, by_id, by_igdb_id }
     }
 
     pub fn contains(&self, appid: &str, title: &str) -> bool {
@@ -175,6 +219,18 @@ impl LibraryIndex {
 
     pub fn resolve_by_appid(&self, appid: &str) -> Option<&ResolvedLibraryGame> {
         self.by_appid.get(appid)
+    }
+
+    /// igdb_id match, any status -- mirrors the backend's `findGameByIgdbId`
+    /// (`gameIdentity.js`). Unlike `resolve_by_appid`, this crate's own detection never
+    /// produces an igdb_id on its own (Steam manifests and watched-directory folders give a
+    /// Steam appid or a synthetic local id, never an IGDB id), so this is only ever useful
+    /// from a caller that already resolved one over the network for its own reasons --
+    /// currently just `resolve_pending_game_as_new`'s post-IGDB-search-confirm check, never
+    /// the ambient per-poll-tick detection loop (ambient detection making its own IGDB calls
+    /// is exactly what the game-identity redesign plan's LilyPad note says not to do).
+    pub fn resolve_by_igdb_id(&self, igdb_id: i64) -> Option<&ResolvedLibraryGame> {
+        self.by_igdb_id.get(&igdb_id)
     }
 
     /// Current state of a `games` row by its FrogLog id, regardless of whether it has a Steam
@@ -204,6 +260,19 @@ mod tests {
     }
 
     fn sample_game_with_status(id: i32, title: &str, appid: i64, session_tracking: bool, status: Option<&str>) -> Game {
+        sample_game_full(id, title, Some(appid), session_tracking, status, None, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sample_game_full(
+        id: i32,
+        title: &str,
+        appid: Option<i64>,
+        session_tracking: bool,
+        status: Option<&str>,
+        igdb_id: Option<i64>,
+        platform_links: Option<Vec<PlatformLink>>,
+    ) -> Game {
         Game {
             id,
             title: Some(title.to_string()),
@@ -223,7 +292,9 @@ mod tests {
             status: status.map(|s| s.to_string()),
             forklift_certified: None,
             session_tracking: Some(session_tracking),
-            steam_app_id: Some(serde_json::json!(appid)),
+            steam_app_id: appid.map(|a| serde_json::json!(a)),
+            igdb_id: igdb_id.map(|i| serde_json::json!(i)),
+            platform_links,
         }
     }
 
@@ -290,32 +361,58 @@ mod tests {
 
     #[test]
     fn resolve_by_id_works_without_a_steam_appid() {
-        let games = vec![Game {
-            id: 99,
-            title: Some("Manually Added Game".to_string()),
-            hours_played: None,
-            description: None,
-            img: None,
-            platform: None,
-            genre: None,
-            dev: None,
-            studio_country: None,
-            start_date: None,
-            end_date: None,
-            rating: None,
-            dnf: None,
-            is_public: None,
-            rel_date: None,
-            status: Some("Completed".to_string()),
-            forklift_certified: None,
-            session_tracking: Some(false),
-            steam_app_id: None,
-        }];
+        let games = vec![sample_game_full(99, "Manually Added Game", None, false, Some("Completed"), None, None)];
         let index = LibraryIndex::build(&games, &[], &[]);
         let resolved = index.resolve_by_id(99).unwrap();
         assert_eq!(resolved.title, "Manually Added Game");
         assert!(is_finished_status(&resolved.status));
         assert!(index.resolve_by_id(100).is_none());
+    }
+
+    #[test]
+    fn resolves_by_igdb_id() {
+        let games = vec![sample_game_full(5, "Hades II", Some(1145360), true, Some("In Progress"), Some(52014), None)];
+        let index = LibraryIndex::build(&games, &[], &[]);
+        let resolved = index.resolve_by_igdb_id(52014).unwrap();
+        assert_eq!(resolved.id, 5);
+        assert_eq!(resolved.game_type, "session");
+        assert!(!is_finished_status(&resolved.status));
+        assert!(index.resolve_by_igdb_id(999999).is_none());
+    }
+
+    #[test]
+    fn steam_appid_resolves_from_platform_links_with_no_scalar_column_at_all() {
+        // Forward-compat with the game-identity redesign's eventual Phase 3 cutover
+        // (dropping `games.steam_app_id` entirely) -- this must keep resolving purely off
+        // `platform_links` once the scalar column stops being sent at all.
+        let games = vec![sample_game_full(
+            8,
+            "Celeste",
+            None,
+            true,
+            Some("In Progress"),
+            None,
+            Some(vec![PlatformLink { platform_key: "steam".to_string(), external_id: Some(serde_json::json!("504230")), label: None }]),
+        )];
+        let index = LibraryIndex::build(&games, &[], &[]);
+        let resolved = index.resolve_by_appid("504230").unwrap();
+        assert_eq!(resolved.id, 8);
+    }
+
+    #[test]
+    fn steam_appid_prefers_platform_links_over_the_legacy_scalar_when_both_present() {
+        let games = vec![sample_game_full(
+            9,
+            "Celeste",
+            Some(999999), // legacy scalar -- should lose
+            true,
+            Some("In Progress"),
+            None,
+            Some(vec![PlatformLink { platform_key: "steam".to_string(), external_id: Some(serde_json::json!("504230")), label: None }]),
+        )];
+        let index = LibraryIndex::build(&games, &[], &[]);
+        assert!(index.resolve_by_appid("504230").is_some());
+        assert!(index.resolve_by_appid("999999").is_none());
     }
 
     #[test]
@@ -341,6 +438,7 @@ mod tests {
             id: 5,
             title: Some("Wishlisted Game".to_string()),
             steam_app_id: Some(serde_json::json!(111)),
+            igdb_id: None,
         }];
         let index = LibraryIndex::build(&[], &wishlist, &[]);
         assert!(index.contains("111", "anything"));

@@ -16,6 +16,19 @@ pub struct LoginResponse {
     pub username: Option<String>,
 }
 
+/// One row from the `game_platform_links` table (game-identity redesign, Phase 2) — the
+/// structural replacement for the flat `steam_app_id`/`psn_title_id`/etc. columns on the
+/// backend. Only ever present on `Game` (`games` is the only table this join covers, see
+/// `add_game_platform_links.sql`) — never `WishlistItem`/`LiveServiceGame`. Mirrors the
+/// exact JSON shape `GET /games` sends (routes/games.js's `platform_links` subquery).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PlatformLink {
+    pub platform_key: String,
+    pub external_id: Option<serde_json::Value>,
+    pub label: Option<String>,
+}
+
 /// API uses snake_case (see update_hours.py). We use snake_case so GET returns correct hours_played.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -41,6 +54,21 @@ pub struct Game {
     /// Steam appid, when this game was added via Steam sync or otherwise linked to a Steam
     /// store page. Arrives as a JSON number or numeric string depending on the pg column path.
     pub steam_app_id: Option<serde_json::Value>,
+    /// IGDB's real numeric id (game-identity redesign, Phase 1/2) — a much more precise
+    /// cross-platform match key than title or even `steam_app_id` alone (catches, e.g., the
+    /// same game already logged under a different platform with no Steam appid on record at
+    /// all). `#[serde(default)]` since this key didn't always exist on `GET /games`'s
+    /// response — keeps LilyPad working against a not-yet-upgraded backend deploy instead of
+    /// failing to parse the whole response over one new, optional field.
+    #[serde(default)]
+    pub igdb_id: Option<serde_json::Value>,
+    /// One row per platform actually linked to this playthrough — read preferentially over
+    /// `steam_app_id` above in `library_match.rs` (see `resolve_steam_appid`) so this crate
+    /// survives the game-identity redesign's eventual Phase 3 cutover (dropping the flat
+    /// `steam_app_id` column from `games` entirely) without needing a synchronized LilyPad
+    /// release. `#[serde(default)]` for the same "not-yet-upgraded backend" reason as `igdb_id`.
+    #[serde(default)]
+    pub platform_links: Option<Vec<PlatformLink>>,
 }
 
 /// Lighter "want to play" entry — same identity fields as `Game`, used to check whether a
@@ -51,6 +79,8 @@ pub struct WishlistItem {
     pub id: i32,
     pub title: Option<String>,
     pub steam_app_id: Option<serde_json::Value>,
+    #[serde(default)]
+    pub igdb_id: Option<serde_json::Value>,
 }
 
 // Backend returns snake_case. total_hours is SUM(DECIMAL) → string; session_count is COUNT() → bigint string.
@@ -62,6 +92,12 @@ pub struct LiveServiceGame {
     pub session_count: Option<serde_json::Value>,
     pub last_session_date: Option<String>,
     pub steam_app_id: Option<serde_json::Value>,
+    /// See `Game::igdb_id` — `live_service_games` gained the same column in Phase 1. No
+    /// `platform_links` equivalent: that table is scoped to `games` only (live-service
+    /// cross-platform linking is a deliberately deferred follow-up, see the game-identity
+    /// redesign plan's "what NOT to change").
+    #[serde(default)]
+    pub igdb_id: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]

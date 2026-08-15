@@ -893,11 +893,32 @@ fn resolve_pending_game_as_new(
         .fetch_game_details(&igdb_title)
         .unwrap_or_else(|_| serde_json::json!({ "title": igdb_title.clone() }));
     let obj = payload.as_object_mut().ok_or("Unexpected response shape")?;
+
+    // Game-identity redesign, LilyPad slice: if the confirmed IGDB title's igdb_id already
+    // matches an existing, not-yet-finished FrogLog entry -- e.g. the same game already
+    // logged from a different platform, with no Steam appid overlap at all, the exact case
+    // the appid-only `resolve_by_appid` tier in monitor.rs structurally can't see -- attach
+    // this session to it instead of silently creating a duplicate row. Mirrors that tier's
+    // own "not finished -> just resume" behavior (no confirmation prompt there either). A
+    // FINISHED match is deliberately left as today's behavior (falls through and creates a
+    // new entry -- the genuine-replay case): unlike ResultCard.jsx's web equivalent of this
+    // exact feature, there's no natural place for a mid-command confirmation prompt in this
+    // synchronous command model. Narrower scope, not an oversight -- mirrors the same trim
+    // already made for routes/wishlist.js's /move-to-games on the web side.
+    if let Some(igdb_id) = obj.get("igdb_id").and_then(|v| v.as_i64()) {
+        let matched = state.library_index_arc.read().unwrap().resolve_by_igdb_id(igdb_id).cloned();
+        if let Some(resolved) = matched {
+            if !library_match::is_finished_status(&resolved.status) {
+                resolve_existing_pending_impl(&state, &client, &auth, &appid, &resolved.game_type, resolved.id, &resolved.title)?;
+                return client.get_game_raw(resolved.id);
+            }
+        }
+    }
+
     // /search/fetch names this field "dev_country"; POST /games expects "studio_country".
     if let Some(country) = obj.remove("dev_country") {
         obj.insert("studio_country".to_string(), country);
     }
-    obj.insert("platform".to_string(), serde_json::json!("PC"));
     obj.insert("is_public".to_string(), serde_json::json!(true));
     // Session-tracked, matching how LilyPad actually recorded this play time (discrete
     // sessions, not a single running total) — hours go in via add_game_session below rather
@@ -914,8 +935,21 @@ fn resolve_pending_game_as_new(
     // Prefer our own detected Steam appid over whatever (possibly null) match IGDB found —
     // ours is known-accurate since it's literally how this session was detected. The backend
     // column is numeric, so parse it rather than sending the string appid as-is.
+    //
+    // The hardcoded "platform": "PC" this used to always send is now conditional: when a
+    // real Steam appid is present, the backend's own POST /games dual-write already creates
+    // a proper `game_platform_links` 'steam' row from it (see routes/games.js) -- a
+    // hardcoded "PC" alongside that is redundant noise on the legacy free-text `platform`
+    // scalar the game-identity redesign is deprecating, not something actively wrong, but
+    // worth not writing when there's a precise signal already covering it. Only a
+    // non-Steam detection (watched-directory game, synthetic `local:<path>` id) has no
+    // better signal to fall back on, so it still gets "PC" -- genuinely accurate for
+    // everything LilyPad can ever detect (a Windows/Linux desktop process monitor has no
+    // console-platform detection at all).
     if let Ok(appid_num) = entry.appid.parse::<i64>() {
         obj.insert("steam_app_id".to_string(), serde_json::json!(appid_num));
+    } else {
+        obj.insert("platform".to_string(), serde_json::json!("PC"));
     }
 
     let created = client.create_game(payload)?;
@@ -1053,6 +1087,34 @@ fn resolve_pending_game_as_existing(
     game_id: i32,
     game_title: String,
 ) -> Result<(), String> {
+    let auth = state.auth.read().unwrap();
+    let client = api_client(&auth).ok_or("Not logged in")?;
+    resolve_existing_pending_impl(&state, &client, &auth, &appid, &game_type, game_id, &game_title)
+}
+
+/// Shared body for "log a pending submission's accumulated hours against an existing
+/// games/live-service entry, then link the exe to it" -- extracted from
+/// `resolve_pending_game_as_existing` (user explicitly picked from the "Map to Existing"
+/// dropdown) so `resolve_pending_game_as_new`'s own igdb_id match check can reuse it too
+/// (attaching instead of creating a duplicate when the confirmed IGDB title already matches
+/// an existing, not-yet-finished entry -- see that function).
+///
+/// Takes an already-built `client`/`auth` rather than re-deriving them from `state.auth`
+/// itself, so a caller that already holds `state.auth`'s read guard (like
+/// `resolve_pending_game_as_new`) doesn't have to acquire a second one on the same thread --
+/// `std::sync::RwLock`'s same-thread reentrant-read behavior is explicitly unspecified/
+/// platform-dependent, and this project already hit a real self-deadlock from a very similar
+/// reentrant-lock mistake once (see the "already-owned auto-link" fix history for
+/// `process_map_arc` in `monitor.rs`).
+fn resolve_existing_pending_impl(
+    state: &AppState,
+    client: &FroglogClient,
+    auth: &AuthConfig,
+    appid: &str,
+    game_type: &str,
+    game_id: i32,
+    game_title: &str,
+) -> Result<(), String> {
     let pending = config::load_pending_game_submissions();
     let entry = pending
         .iter()
@@ -1060,8 +1122,6 @@ fn resolve_pending_game_as_existing(
         .ok_or("Pending submission not found")?
         .clone();
 
-    let auth = state.auth.read().unwrap();
-    let client = api_client(&auth).ok_or("Not logged in")?;
     // Anything mapped here should end up session-tracked, not "regular" (a single running
     // hours_played total) -- matches the silent already-owned auto-link path (see the comment
     // in monitor.rs). enable_session_tracking is idempotent and preserves any pre-existing hours
@@ -1094,7 +1154,7 @@ fn resolve_pending_game_as_existing(
     if let Err(e) = client.fix_imported_status_if_needed(game_id, &effective_game_type) {
         log::warn!("[LilyPad] failed to fix imported status: {e}");
     }
-    config::remove_pending_game_submission(&appid);
+    config::remove_pending_game_submission(appid);
 
     // Link the exe to this game so future sessions are tracked normally instead of falling
     // through detection again. Uses the existing game's own confirmed title (from the caller),
@@ -1102,11 +1162,11 @@ fn resolve_pending_game_as_existing(
     if !entry.exe_name.is_empty() {
         if let Err(e) = config::link_process_mapping(
             &state.process_map_arc,
-            &auth,
+            auth,
             entry.exe_name.clone(),
             effective_game_type,
             game_id,
-            Some(game_title),
+            Some(game_title.to_string()),
         ) {
             log::warn!("[LilyPad] failed to link exe to existing game: {e}");
         }
@@ -1116,7 +1176,7 @@ fn resolve_pending_game_as_existing(
     // exe shortly after resolving it here would still see the old Completed/DNF status and
     // prompt the replay question all over again instead of resuming normally. Matches the GTK
     // build's `resolve_as_existing`, which already does this.
-    refresh_library_index_state(&state);
+    refresh_library_index_state(state);
 
     Ok(())
 }

@@ -52,11 +52,29 @@ pub fn resolve_as_new(state: &AppState, appid: &str, igdb_title: &str) -> Result
         .fetch_game_details(igdb_title)
         .unwrap_or_else(|_| serde_json::json!({ "title": igdb_title }));
     let obj = payload.as_object_mut().ok_or("Unexpected response shape")?;
+
+    // Game-identity redesign, LilyPad slice: if the confirmed IGDB title's igdb_id already
+    // matches an existing, not-yet-finished FrogLog entry -- e.g. the same game already
+    // logged from a different platform, with no Steam appid overlap at all -- attach this
+    // session to it instead of silently creating a duplicate row. Mirrors the appid-only
+    // "already owned" auto-link's own "not finished -> just resume" behavior (no
+    // confirmation prompt there either, see monitor.rs). A FINISHED match is deliberately
+    // left as today's behavior (falls through and creates a new entry -- the genuine-replay
+    // case); ported from the Tauri build's identical check in `src-tauri/src/lib.rs`.
+    if let Some(igdb_id) = obj.get("igdb_id").and_then(|v| v.as_i64()) {
+        let matched = state.library_index.read().unwrap().resolve_by_igdb_id(igdb_id).cloned();
+        if let Some(resolved) = matched {
+            if !lilypad_core::library_match::is_finished_status(&resolved.status) {
+                resolve_as_existing(state, appid, &resolved.game_type, resolved.id, &resolved.title)?;
+                return client.get_game_raw(resolved.id);
+            }
+        }
+    }
+
     // /search/fetch names this field "dev_country"; POST /games expects "studio_country".
     if let Some(country) = obj.remove("dev_country") {
         obj.insert("studio_country".to_string(), country);
     }
-    obj.insert("platform".to_string(), serde_json::json!("PC"));
     obj.insert("is_public".to_string(), serde_json::json!(true));
     // Session-tracked, matching how LilyPad actually recorded this play time.
     obj.insert("session_tracking".to_string(), serde_json::json!(true));
@@ -68,8 +86,13 @@ pub fn resolve_as_new(state: &AppState, appid: &str, igdb_title: &str) -> Result
         obj.insert("start_date".to_string(), serde_json::json!(start_date));
     }
     // Prefer our own detected Steam appid over whatever (possibly null) match IGDB found.
+    // The hardcoded "platform": "PC" this used to always send is now conditional -- see the
+    // matching comment in the Tauri build's `resolve_pending_game_as_new` for why (redundant
+    // once a real Steam appid already drives a proper `game_platform_links` row server-side).
     if let Ok(appid_num) = entry.appid.parse::<i64>() {
         obj.insert("steam_app_id".to_string(), serde_json::json!(appid_num));
+    } else {
+        obj.insert("platform".to_string(), serde_json::json!("PC"));
     }
 
     let created = client.create_game(payload)?;
