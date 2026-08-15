@@ -471,6 +471,34 @@ impl FroglogClient {
         Ok(())
     }
 
+    /// Attaches a Steam appid to an existing game via PUT /games/{id}, so the backend's
+    /// own dual-write (`routes/games.js`'s `PUT /:id`, `if (steam_app_id) {
+    /// recordPlatformLink(...) }`) creates a real `game_platform_links` 'steam' row.
+    ///
+    /// REAL GAP FOUND LIVE (2026-08-15, testing vibefroggy's "Pokémon Pokopia" attach):
+    /// resolving a pending game submission against an *existing* FrogLog entry (either
+    /// via the manual "Map to Existing" picker, or the game-identity redesign's newer
+    /// automatic igdb_id-match attach) has never once recorded the Steam appid the
+    /// session was actually detected under -- logging the session against the right
+    /// entry was already correct, but the fact that this exact playthrough is *also* now
+    /// known to be on Steam was silently dropped every single time, since the "New
+    /// Games" feature first shipped. Not something the LilyPad slice of the game-identity
+    /// redesign introduced -- just newly noticed while manually testing it, since that's
+    /// the first time anyone tried this exact path against an entry with no Steam link
+    /// yet at all.
+    ///
+    /// Only sets it if the existing game has no `steam_app_id` of its own already --
+    /// never overwrites a different one (same caution this whole project applies
+    /// everywhere else it touches platform ids, the "LAW0298" bug class).
+    pub fn attach_steam_app_id_if_missing(&self, game_id: i32, appid: i64) -> Result<serde_json::Value, String> {
+        let mut obj = self.game_payload_base(game_id)?;
+        if obj.get("steam_app_id").and_then(Self::num_from_value).is_some() {
+            return Ok(serde_json::Value::Object(obj));
+        }
+        obj.insert("steam_app_id".to_string(), serde_json::json!(appid));
+        self.put_game(game_id, serde_json::Value::Object(obj))
+    }
+
     /// GET /games/{id}/sessions — raw session rows (id, date, hours, notes, ...).
     pub fn get_game_sessions(&self, game_id: i32) -> Result<Vec<serde_json::Value>, String> {
         let res = self

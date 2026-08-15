@@ -1138,6 +1138,15 @@ fn resolve_existing_pending_impl(
         if let Err(e) = client.resume_finished_game(game_id) {
             log::warn!("[LilyPad] failed to resume finished game: {e}");
         }
+        // Best-effort: if this pending submission was actually detected via a real
+        // Steam appid, make sure the existing game we're attaching to gains that link --
+        // see FroglogClient::attach_steam_app_id_if_missing's doc comment for why this
+        // was silently missing before. No-ops for a non-Steam (`local:<path>`) detection.
+        if let Ok(appid_num) = entry.appid.parse::<i64>() {
+            if let Err(e) = client.attach_steam_app_id_if_missing(game_id, appid_num) {
+                log::warn!("[LilyPad] failed to attach steam_app_id: {e}");
+            }
+        }
         "session".to_string()
     };
     let notes = Some("Logged from LilyPad's untracked-session detection".to_string());
