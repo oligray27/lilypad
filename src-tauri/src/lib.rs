@@ -935,21 +935,30 @@ fn resolve_pending_game_as_new(
     // Prefer our own detected Steam appid over whatever (possibly null) match IGDB found —
     // ours is known-accurate since it's literally how this session was detected. The backend
     // column is numeric, so parse it rather than sending the string appid as-is.
-    //
-    // The hardcoded "platform": "PC" this used to always send is now conditional: when a
-    // real Steam appid is present, the backend's own POST /games dual-write already creates
-    // a proper `game_platform_links` 'steam' row from it (see routes/games.js) -- a
-    // hardcoded "PC" alongside that is redundant noise on the legacy free-text `platform`
-    // scalar the game-identity redesign is deprecating, not something actively wrong, but
-    // worth not writing when there's a precise signal already covering it. Only a
-    // non-Steam detection (watched-directory game, synthetic `local:<path>` id) has no
-    // better signal to fall back on, so it still gets "PC" -- genuinely accurate for
-    // everything LilyPad can ever detect (a Windows/Linux desktop process monitor has no
-    // console-platform detection at all).
     if let Ok(appid_num) = entry.appid.parse::<i64>() {
         obj.insert("steam_app_id".to_string(), serde_json::json!(appid_num));
     } else {
-        obj.insert("platform".to_string(), serde_json::json!("PC"));
+        // Real bug found live 2026-08-18: `fetch_game_details`'s payload (via the backend's
+        // /search/fetch, GET above) resolves the confirmed IGDB title's OWN Steam SKU
+        // mapping -- "does this game happen to also be sold on Steam at all" -- entirely
+        // independent of how *this* session was actually detected. For the vast majority
+        // of commercial PC titles that answer is yes, so `obj` already carries a real
+        // `steam_app_id` at this point even for a non-Steam detection (a pirated copy,
+        // GOG/Epic/itch.io release, or any other watched-directory game with a synthetic
+        // `local:<path>` id) -- left alone, that stale id silently survived into the
+        // create payload below and gave a non-Steam play a real Steam platform link (and,
+        // with it, an active but permanently-empty Trophies tab, since there's no
+        // legitimate way to sync real Steam unlock data for a copy never actually
+        // launched through Steam). Explicitly cleared here, not just left un-set.
+        obj.remove("steam_app_id");
+        // `platform_chips` is POST /games' actual accepted mechanism as of 2026-08-18 --
+        // the plain `platform` string this used to send here had already gone silently
+        // dead by the time this ran (that route stopped reading it), so this is also a
+        // real functional fix, not just a rename.
+        obj.insert("platform_chips".to_string(), serde_json::json!(["PC (Non-Steam)"]));
+        // No legitimate way to sync real achievement data for a non-Steam detection --
+        // disabled by default rather than shipping an always-empty Trophies tab.
+        obj.insert("no_achievements".to_string(), serde_json::json!(true));
     }
 
     let created = client.create_game(payload)?;

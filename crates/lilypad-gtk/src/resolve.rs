@@ -85,14 +85,21 @@ pub fn resolve_as_new(state: &AppState, appid: &str, igdb_title: &str) -> Result
     {
         obj.insert("start_date".to_string(), serde_json::json!(start_date));
     }
-    // Prefer our own detected Steam appid over whatever (possibly null) match IGDB found.
-    // The hardcoded "platform": "PC" this used to always send is now conditional -- see the
-    // matching comment in the Tauri build's `resolve_pending_game_as_new` for why (redundant
-    // once a real Steam appid already drives a proper `game_platform_links` row server-side).
+    // Prefer our own detected Steam appid over whatever (possibly null) match IGDB found --
+    // see the matching comment in the Tauri build's `resolve_pending_game_as_new` for the
+    // real bug (found live 2026-08-18) this else branch fixes: `fetch_game_details`'s
+    // payload already carries IGDB's own "does this game happen to have a Steam SKU at
+    // all" mapping regardless of how this session was actually detected, so a non-Steam
+    // detection needs its `steam_app_id` explicitly cleared, not just left un-set, plus a
+    // `platform_chips` chip (the plain `platform` string this used to send had already gone
+    // silently dead server-side) and Trophies disabled by default (no legitimate way to
+    // sync real Steam unlock data for a copy never actually launched through Steam).
     if let Ok(appid_num) = entry.appid.parse::<i64>() {
         obj.insert("steam_app_id".to_string(), serde_json::json!(appid_num));
     } else {
-        obj.insert("platform".to_string(), serde_json::json!("PC"));
+        obj.remove("steam_app_id");
+        obj.insert("platform_chips".to_string(), serde_json::json!(["PC (Non-Steam)"]));
+        obj.insert("no_achievements".to_string(), serde_json::json!(true));
     }
 
     let created = client.create_game(payload)?;
