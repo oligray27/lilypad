@@ -1,6 +1,6 @@
 [package]
 name = "lilypad"
-version = "0.5.13"
+version = "0.5.14"
 description = "Froglog game time tracker - system tray app"
 edition = "2021"
 rust-version = "1.70"
