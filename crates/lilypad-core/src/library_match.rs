@@ -199,7 +199,13 @@ impl LibraryIndex {
             if let Some(title) = &l.title {
                 normalized_titles.insert(normalize_title(title));
             }
-            if let Some(appid) = steam_app_id_str(&l.steam_app_id) {
+            // Live-service platform-linking (2026-08-19): reads platform_links first now,
+            // same as the `games` loop above via resolve_steam_appid -- previously this
+            // called steam_app_id_str(&l.steam_app_id) directly, since LiveServiceGame had
+            // no platform_links field to prefer at all. Forward-compat with the eventual
+            // drop of live_service_games.steam_app_id, mirroring why the `games` side
+            // already reads this way.
+            if let Some(appid) = resolve_steam_appid(&l.steam_app_id, &l.platform_links) {
                 steam_appids.insert(appid.clone());
                 if let Some(title) = &l.title {
                     insert_preferred(&mut by_appid, appid, ResolvedLibraryGame { id: l.id, game_type: "live".to_string(), title: title.clone(), status: None, igdb_id });
@@ -443,5 +449,60 @@ mod tests {
         let index = LibraryIndex::build(&[], &wishlist, &[]);
         assert!(index.contains("111", "anything"));
         assert!(index.resolve_by_appid("111").is_none());
+    }
+
+    fn sample_live_service(id: i32, title: &str, appid: Option<i64>, platform_links: Option<Vec<PlatformLink>>) -> LiveServiceGame {
+        LiveServiceGame {
+            id,
+            title: Some(title.to_string()),
+            total_hours: None,
+            session_count: None,
+            last_session_date: None,
+            steam_app_id: appid.map(|a| serde_json::json!(a)),
+            igdb_id: None,
+            platform_links,
+        }
+    }
+
+    // Live-service platform-linking (2026-08-19) -- mirrors the two `games`-side tests
+    // above (steam_appid_resolves_from_platform_links_with_no_scalar_column_at_all /
+    // steam_appid_prefers_platform_links_over_the_legacy_scalar_when_both_present)
+    // exactly, now that LiveServiceGame carries the same platform_links field.
+    #[test]
+    fn live_service_steam_appid_resolves_from_platform_links_with_no_scalar_column_at_all() {
+        let live_service = vec![sample_live_service(
+            30,
+            "Destiny 2",
+            None,
+            Some(vec![PlatformLink { platform_key: "steam".to_string(), external_id: Some(serde_json::json!("1085660")), label: None }]),
+        )];
+        let index = LibraryIndex::build(&[], &[], &live_service);
+        let resolved = index.resolve_by_appid("1085660").unwrap();
+        assert_eq!(resolved.id, 30);
+        assert_eq!(resolved.game_type, "live");
+    }
+
+    #[test]
+    fn live_service_steam_appid_prefers_platform_links_over_the_legacy_scalar_when_both_present() {
+        let live_service = vec![sample_live_service(
+            31,
+            "Destiny 2",
+            Some(999999), // legacy scalar -- should lose
+            Some(vec![PlatformLink { platform_key: "steam".to_string(), external_id: Some(serde_json::json!("1085660")), label: None }]),
+        )];
+        let index = LibraryIndex::build(&[], &[], &live_service);
+        assert!(index.resolve_by_appid("1085660").is_some());
+        assert!(index.resolve_by_appid("999999").is_none());
+    }
+
+    #[test]
+    fn live_service_steam_appid_still_resolves_from_the_legacy_scalar_alone() {
+        // No platform_links at all (a not-yet-upgraded backend, or an LS row nothing has
+        // dual-written yet) -- must keep working exactly as before this change.
+        let live_service = vec![sample_live_service(32, "Fortnite", Some(1172470), None)];
+        let index = LibraryIndex::build(&[], &[], &live_service);
+        let resolved = index.resolve_by_appid("1172470").unwrap();
+        assert_eq!(resolved.id, 32);
+        assert_eq!(resolved.game_type, "live");
     }
 }

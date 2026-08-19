@@ -18,9 +18,12 @@ pub struct LoginResponse {
 
 /// One row from the `game_platform_links` table (game-identity redesign, Phase 2) — the
 /// structural replacement for the flat `steam_app_id`/`psn_title_id`/etc. columns on the
-/// backend. Only ever present on `Game` (`games` is the only table this join covers, see
-/// `add_game_platform_links.sql`) — never `WishlistItem`/`LiveServiceGame`. Mirrors the
-/// exact JSON shape `GET /games` sends (routes/games.js's `platform_links` subquery).
+/// backend. Present on both `Game` and `LiveServiceGame` (live-service platform-linking,
+/// 2026-08-19 — `game_platform_links` gained a `game_type` discriminator so one table
+/// covers both, see `add_game_platform_links_game_type.sql`); never `WishlistItem`,
+/// which has no such join at all. Mirrors the exact JSON shape `GET /games`/
+/// `GET /live-service` send (routes/games.js's and routes/liveservice.js's own
+/// `platform_links` subqueries).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct PlatformLink {
@@ -92,12 +95,20 @@ pub struct LiveServiceGame {
     pub session_count: Option<serde_json::Value>,
     pub last_session_date: Option<String>,
     pub steam_app_id: Option<serde_json::Value>,
-    /// See `Game::igdb_id` — `live_service_games` gained the same column in Phase 1. No
-    /// `platform_links` equivalent: that table is scoped to `games` only (live-service
-    /// cross-platform linking is a deliberately deferred follow-up, see the game-identity
-    /// redesign plan's "what NOT to change").
+    /// See `Game::igdb_id` — `live_service_games` gained the same column in Phase 1.
     #[serde(default)]
     pub igdb_id: Option<serde_json::Value>,
+    /// See `Game::platform_links` — `game_platform_links` was extended to cover
+    /// `live_service_games` too (live-service platform-linking, 2026-08-19; previously
+    /// this table was deliberately out of scope, see the game-identity redesign plan's
+    /// original "what NOT to change" note, now superseded). Read preferentially over
+    /// `steam_app_id` above in `library_match.rs` (`resolve_steam_appid`), same
+    /// forward-compat reasoning as `Game::platform_links` -- this crate survives the
+    /// eventual drop of `live_service_games.steam_app_id` without needing a second
+    /// synchronized LilyPad release. `#[serde(default)]` for the same "not-yet-upgraded
+    /// backend" reason as `igdb_id`.
+    #[serde(default)]
+    pub platform_links: Option<Vec<PlatformLink>>,
 }
 
 #[derive(Debug, Serialize)]
