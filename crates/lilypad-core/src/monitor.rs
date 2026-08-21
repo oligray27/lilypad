@@ -102,6 +102,49 @@ fn check_mapped_game_needs_replay_prompt(mapping: &ProcessMapping, library_index
     Some(resolved.clone())
 }
 
+/// Detects and repairs a `ProcessMapping` whose `games` row has vanished out from under it --
+/// far and away the most common cause is the website's "move to Live Service" action
+/// (`games.js`'s `move-to-live-service`/`bulk-move-to-live-service`), which deletes the old
+/// `games` row outright and creates a brand-new `live_service_games` row with a different id,
+/// with no way to notify LilyPad directly. Without this check, a mapping created back when the
+/// game was still "session"/"regular" keeps pointing at a dead id forever: `resolve_by_id` (used
+/// by `check_mapped_game_needs_replay_prompt` above) only ever reads `None` as "not finished, no
+/// replay prompt needed" and lets the stale mapping through, so the session tracks fine locally
+/// and then 404s the instant it tries to submit (`POST /games/{dead_id}/sessions`).
+///
+/// Re-resolves via the exe's Steam appid against the *current* `LibraryIndex`, whose
+/// `by_appid`/`by_igdb_id` maps (unlike `by_id`) span both `games` and `live_service_games` --
+/// the move carries the Steam link across into the new row's `game_platform_links`, so the same
+/// appid now resolves to the new id/type. Returns `None` (do nothing, proceed with the mapping
+/// as-is) when the mapping isn't orphaned at all, or when it is but nothing re-resolves (e.g. the
+/// game was deleted outright rather than moved, or it's a non-Steam install with no appid to key
+/// off) -- in the latter case the caller is stuck with a mapping that will keep failing to
+/// submit, but that's the pre-existing behavior, not something this makes worse.
+fn heal_orphaned_mapping(
+    mapping: &ProcessMapping,
+    exe_path: Option<&Path>,
+    cmd: &[std::ffi::OsString],
+    installed_games: &Arc<RwLock<Vec<InstalledGame>>>,
+    library_index: &LibraryIndex,
+) -> Option<ProcessMapping> {
+    if mapping.r#type.eq_ignore_ascii_case("live") {
+        return None; // live-service mappings have no games-table id to go stale.
+    }
+    if library_index.resolve_by_id(mapping.froglog_id).is_some() {
+        return None; // still resolves in `games` -- not orphaned.
+    }
+    let games = installed_games.read().unwrap();
+    let (found, _matched_path) = find_installed_game_for_exe_or_cmd(exe_path, cmd, &games)?;
+    let resolved = library_index.resolve_by_appid(&found.appid)?;
+    Some(ProcessMapping {
+        process: mapping.process.clone(),
+        r#type: resolved.game_type.clone(),
+        froglog_id: resolved.id,
+        title: Some(resolved.title.clone()),
+        title_filter: mapping.title_filter.clone(),
+    })
+}
+
 /// Starts tracking a play session for an already-mapped exe whose target game looks like an
 /// unacknowledged possible replay (see `check_mapped_game_needs_replay_prompt`), instead of the
 /// normal `on_session_started`/`on_session_ended` flow — reuses the same background wait-thread
@@ -754,6 +797,27 @@ fn try_run_wmi_watch(
                 }
                 let mapping = candidates.into_iter().next().unwrap();
                 let pid = Pid::from(event.process_id as usize);
+                let mapping = {
+                    let exe_path = {
+                        let mut sys = System::new();
+                        sys.refresh_processes(ProcessesToUpdate::Some(&[pid]));
+                        sys.process(pid).and_then(|p| p.exe().map(|p| p.to_path_buf()))
+                    };
+                    // WMI process-start events are Windows-only, where Proton/Wine doesn't
+                    // exist -- no command-line fallback is needed here, mirroring the
+                    // unmapped-detection call further up.
+                    match heal_orphaned_mapping(&mapping, exe_path.as_deref(), &[], &installed_games, &library_index.read().unwrap()) {
+                        Some(healed) => {
+                            log::info!(
+                                "[LilyPad] healed orphaned mapping for {}: {} #{} -> {} #{}",
+                                mapping.process, mapping.r#type, mapping.froglog_id, healed.r#type, healed.froglog_id
+                            );
+                            on_already_owned_game_needs_link(healed.clone());
+                            healed
+                        }
+                        None => mapping,
+                    }
+                };
                 if let Some(resolved) = check_mapped_game_needs_replay_prompt(&mapping, &library_index.read().unwrap()) {
                     start_replay_prompt_tracking(
                         pid,
@@ -788,6 +852,8 @@ fn try_run_wmi_watch(
                 let last_ended_clone = Arc::clone(&last_ended);
                 let force_stopped_clone = Arc::clone(&force_stopped_process);
                 let library_index_tf = Arc::clone(&library_index);
+                let installed_games_tf = Arc::clone(&installed_games);
+                let on_already_owned_tf = Arc::clone(&on_already_owned_game_needs_link);
                 let currently_tracking_unmapped_tf = Arc::clone(&currently_tracking_unmapped);
                 let last_ended_unmapped_tf = Arc::clone(&last_ended_unmapped);
                 let on_unmapped_session_ended_tf = Arc::clone(&on_unmapped_session_ended);
@@ -822,6 +888,22 @@ fn try_run_wmi_watch(
                         }
                         let window_titles = get_window_titles_for_pid(process_id);
                         if let Some(mapping) = pick_mapping(&candidates, &window_titles) {
+                            let exe_path = {
+                                let mut sys = System::new();
+                                sys.refresh_processes(ProcessesToUpdate::Some(&[pid]));
+                                sys.process(pid).and_then(|p| p.exe().map(|p| p.to_path_buf()))
+                            };
+                            let mapping = match heal_orphaned_mapping(&mapping, exe_path.as_deref(), &[], &installed_games_tf, &library_index_tf.read().unwrap()) {
+                                Some(healed) => {
+                                    log::info!(
+                                        "[LilyPad] healed orphaned mapping for {}: {} #{} -> {} #{}",
+                                        mapping.process, mapping.r#type, mapping.froglog_id, healed.r#type, healed.froglog_id
+                                    );
+                                    on_already_owned_tf(healed.clone());
+                                    healed
+                                }
+                                None => mapping,
+                            };
                             if let Some(resolved) = check_mapped_game_needs_replay_prompt(&mapping, &library_index_tf.read().unwrap()) {
                                 start_replay_prompt_tracking(
                                     pid,
@@ -1100,6 +1182,17 @@ pub fn run_poll_loop(
                                 candidates.into_iter().next()
                             };
                             if let Some(mapping) = mapping {
+                                let mapping = match heal_orphaned_mapping(&mapping, p.exe(), p.cmd(), &installed_games_poll, &library_index_poll.read().unwrap()) {
+                                    Some(healed) => {
+                                        log::info!(
+                                            "[LilyPad] healed orphaned mapping for {}: {} #{} -> {} #{}",
+                                            mapping.process, mapping.r#type, mapping.froglog_id, healed.r#type, healed.froglog_id
+                                        );
+                                        on_already_owned_poll(healed.clone());
+                                        healed
+                                    }
+                                    None => mapping,
+                                };
                                 if let Some(resolved) = check_mapped_game_needs_replay_prompt(&mapping, &library_index_poll.read().unwrap()) {
                                     start_replay_prompt_tracking(
                                         *pid,
@@ -1179,5 +1272,124 @@ mod tests {
         assert!(is_known_helper_process("eos.exe"));
         assert!(is_known_helper_process("EOS.exe"));
         assert!(is_known_helper_process("EOSBootstrapper.exe"));
+    }
+
+    fn sample_game(id: i32, title: &str, appid: i64, session_tracking: bool) -> crate::api::Game {
+        crate::api::Game {
+            id,
+            title: Some(title.to_string()),
+            hours_played: None,
+            description: None,
+            img: None,
+            platform: None,
+            genre: None,
+            dev: None,
+            studio_country: None,
+            start_date: None,
+            end_date: None,
+            rating: None,
+            dnf: None,
+            is_public: None,
+            rel_date: None,
+            status: None,
+            forklift_certified: None,
+            session_tracking: Some(session_tracking),
+            steam_app_id: Some(serde_json::json!(appid)),
+            igdb_id: None,
+            platform_links: None,
+        }
+    }
+
+    fn sample_live_service(id: i32, title: &str, appid: i64) -> crate::api::LiveServiceGame {
+        crate::api::LiveServiceGame {
+            id,
+            title: Some(title.to_string()),
+            total_hours: None,
+            session_count: None,
+            last_session_date: None,
+            steam_app_id: Some(serde_json::json!(appid)),
+            igdb_id: None,
+            platform_links: None,
+        }
+    }
+
+    #[test]
+    fn heals_a_mapping_whose_game_moved_from_games_to_live_service() {
+        // Mirrors the real bug: the website's "move to Live Service" action deletes the
+        // `games` row a `ProcessMapping` was pointing at and creates a new
+        // `live_service_games` row (different id), carrying the Steam appid across. The
+        // stale local mapping (still "session" type, still the old id) must be repointed
+        // at the new live-service id, not left to 404 on submit.
+        let games: Vec<crate::api::Game> = vec![];
+        let live_service = vec![sample_live_service(99, "Destiny 2", 1085660)];
+        let library_index = LibraryIndex::build(&games, &[], &live_service);
+
+        let mapping = ProcessMapping {
+            process: "destiny2.exe".to_string(),
+            r#type: "session".to_string(),
+            froglog_id: 5, // the old, now-deleted `games` id
+            title: Some("Destiny 2".to_string()),
+            title_filter: None,
+        };
+        let installed_games: Arc<RwLock<Vec<InstalledGame>>> = Arc::new(RwLock::new(vec![InstalledGame {
+            appid: "1085660".to_string(),
+            name: "Destiny 2".to_string(),
+            install_dir: std::path::PathBuf::from("C:/Games/Destiny 2"),
+        }]));
+        let exe_path = std::path::PathBuf::from("C:/Games/Destiny 2/destiny2.exe");
+
+        let healed = heal_orphaned_mapping(&mapping, Some(&exe_path), &[], &installed_games, &library_index)
+            .expect("orphaned mapping should heal to the new live-service entry");
+        assert_eq!(healed.r#type, "live");
+        assert_eq!(healed.froglog_id, 99);
+        assert_eq!(healed.process, "destiny2.exe");
+        assert_eq!(healed.title.as_deref(), Some("Destiny 2"));
+    }
+
+    #[test]
+    fn leaves_a_still_resolving_mapping_untouched() {
+        let games = vec![sample_game(5, "Destiny 2", 1085660, true)];
+        let library_index = LibraryIndex::build(&games, &[], &[]);
+        let mapping = ProcessMapping {
+            process: "destiny2.exe".to_string(),
+            r#type: "session".to_string(),
+            froglog_id: 5,
+            title: Some("Destiny 2".to_string()),
+            title_filter: None,
+        };
+        let installed_games: Arc<RwLock<Vec<InstalledGame>>> = Arc::new(RwLock::new(vec![]));
+        assert!(heal_orphaned_mapping(&mapping, None, &[], &installed_games, &library_index).is_none());
+    }
+
+    #[test]
+    fn leaves_a_live_type_mapping_untouched() {
+        // "live" mappings never had a `games`-table id to begin with -- resolve_by_id would
+        // never find them even when perfectly healthy, so healing must not even attempt it.
+        let library_index = LibraryIndex::build(&[], &[], &[]);
+        let mapping = ProcessMapping {
+            process: "destiny2.exe".to_string(),
+            r#type: "live".to_string(),
+            froglog_id: 99,
+            title: Some("Destiny 2".to_string()),
+            title_filter: None,
+        };
+        let installed_games: Arc<RwLock<Vec<InstalledGame>>> = Arc::new(RwLock::new(vec![]));
+        assert!(heal_orphaned_mapping(&mapping, None, &[], &installed_games, &library_index).is_none());
+    }
+
+    #[test]
+    fn leaves_a_genuinely_orphaned_mapping_untouched_when_nothing_resolves() {
+        // The game was deleted outright (not moved) -- no appid to re-resolve to, so healing
+        // must not fabricate a mapping.
+        let library_index = LibraryIndex::build(&[], &[], &[]);
+        let mapping = ProcessMapping {
+            process: "gone.exe".to_string(),
+            r#type: "regular".to_string(),
+            froglog_id: 5,
+            title: Some("Deleted Game".to_string()),
+            title_filter: None,
+        };
+        let installed_games: Arc<RwLock<Vec<InstalledGame>>> = Arc::new(RwLock::new(vec![]));
+        assert!(heal_orphaned_mapping(&mapping, None, &[], &installed_games, &library_index).is_none());
     }
 }

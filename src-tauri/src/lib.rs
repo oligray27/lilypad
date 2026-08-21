@@ -802,17 +802,45 @@ fn retry_pending_session(
 ) -> Result<(), String> {
     let mut sessions = load_pending_sessions();
     let idx = sessions.iter().position(|s| s.id == id).ok_or("Not found")?;
-    let s = sessions[idx].clone();
+    let mut s = sessions[idx].clone();
     let auth = state.auth.read().unwrap().clone();
     let client = api_client(&auth).ok_or("Not logged in")?;
-    let notes = Some(s.notes.filter(|n| !n.is_empty()).unwrap_or_else(|| "Session submitted from Pending Sessions".to_string()));
-    if s.game_type.eq_ignore_ascii_case("live") {
-        client.add_live_service_session(s.game_id, Some(s.date), Some(s.hours), notes, s.spoiler, s.is_public, None)?;
+    let notes = Some(s.notes.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| "Session submitted from Pending Sessions".to_string()));
+
+    let first_attempt = if s.game_type.eq_ignore_ascii_case("live") {
+        client.add_live_service_session(s.game_id, Some(s.date.clone()), Some(s.hours), notes.clone(), s.spoiler, s.is_public, None)
     } else if s.game_type.eq_ignore_ascii_case("session") {
-        client.add_game_session(s.game_id, Some(s.date), Some(s.hours), notes, s.spoiler, s.is_public, None)?;
+        client.add_game_session(s.game_id, Some(s.date.clone()), Some(s.hours), notes.clone(), s.spoiler, s.is_public, None)
     } else {
-        client.update_game_hours(s.game_id, s.hours)?;
+        client.update_game_hours(s.game_id, s.hours)
+    };
+
+    if let Err(first_err) = first_attempt {
+        // Orphaned-mapping recovery -- the queue-time equivalent of `monitor.rs`'s
+        // `heal_orphaned_mapping`. A "session"/"regular" entry that still 404s here most
+        // likely predates a website "move to Live Service": the `games` row it targeted is
+        // gone, but the move copies the title across verbatim into a new
+        // `live_service_games` row (see `games.js`'s `move-to-live-service`), so an exact
+        // title match there recovers it -- this command only ever has a title to go on
+        // (`PendingSession` was never given the Steam appid `heal_orphaned_mapping` uses,
+        // since the queue exists precisely for submissions that already have no live
+        // process/mapping context left). "live" entries never had a `games`-table id to
+        // begin with, so there's nothing to recover for them -- surface the original error.
+        if s.game_type.eq_ignore_ascii_case("live") {
+            return Err(first_err);
+        }
+        let live_games = client.get_live_service_games().map_err(|_| first_err.clone())?;
+        let matched = live_games.into_iter().find(|g| g.title.as_deref() == Some(s.title.as_str()));
+        let Some(g) = matched else { return Err(first_err) };
+        client.add_live_service_session(g.id, Some(s.date.clone()), Some(s.hours), notes, s.spoiler, s.is_public, None)?;
+        s.game_id = g.id;
+        s.game_type = "live".to_string();
+        log::info!(
+            "[LilyPad] recovered pending session {} ({}): {} #{} -> live #{}",
+            s.id, s.title, sessions[idx].game_type, sessions[idx].game_id, g.id
+        );
     }
+
     sessions.remove(idx);
     save_pending_sessions(&sessions);
     Ok(())
