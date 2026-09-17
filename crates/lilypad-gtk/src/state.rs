@@ -80,16 +80,34 @@ impl AppState {
     /// (`resolve.rs`), so a game just created/mapped doesn't still look "not in my library" to
     /// the next detection attempt for up to 5 minutes (the periodic refresh interval) --
     /// mirrors `refresh_installed_games`'s immediate-refresh-after-mutation pattern.
-    pub fn refresh_library_index(&self) {
+    /// Returns whether the library could actually be consulted, so a caller about to decide
+    /// a game is unlisted can decline to guess when it could not.
+    pub fn refresh_library_index(&self) -> bool {
         let auth = self.auth.read().unwrap().clone();
         if auth.token.is_none() {
-            return;
+            return false;
         }
         let client = crate::session_flow::client_for(&auth);
-        let games = client.get_games().unwrap_or_default();
-        let wishlist = client.get_wishlist().unwrap_or_default();
-        let live_service = client.get_live_service_games().unwrap_or_default();
+        // Every fetch must succeed. `unwrap_or_default()` on a failed request built an *empty*
+        // index and replaced a good one with it, at which point every game the user owns reads
+        // as unknown and is filed as a New Game. A stale index is strictly better: it can only
+        // miss games added since the last good refresh.
+        let (games, wishlist, live_service) = match (
+            client.get_games(),
+            client.get_wishlist(),
+            client.get_live_service_games(),
+        ) {
+            (Ok(games), Ok(wishlist), Ok(live_service)) => (games, wishlist, live_service),
+            _ => {
+                log::warn!(
+                    "[LilyPad] could not refresh the library; keeping the previous copy rather \
+                     than treating every owned game as new"
+                );
+                return false;
+            }
+        };
         *self.library_index.write().unwrap() =
             lilypad_core::library_match::LibraryIndex::build(&games, &wishlist, &live_service);
+        true
     }
 }

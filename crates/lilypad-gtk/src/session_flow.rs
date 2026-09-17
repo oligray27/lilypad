@@ -55,11 +55,14 @@ pub(crate) fn client_for(auth: &AuthConfig) -> FroglogClient {
 /// bounds crash-recovery's duration if LilyPad (or the PC) goes away mid-session — see
 /// `lilypad_core::session_persistence`. Fire-and-forget on a background thread, same as the
 /// corresponding `clear_now_playing` call in `handle_session_ended`.
+///
+/// The heartbeat starts regardless of the presence setting: only its remote half is about
+/// presence (and `spawn_session_heartbeat` gates that itself, re-reading the setting each
+/// tick so a mid-session toggle is honoured). Its local half is the crash-recovery
+/// alive-checkpoint, and skipping that used to leave `last_alive_secs` pinned at the session
+/// start time, so a session recovered with presence off was credited ~0 hours.
 pub fn handle_session_started(state: &AppState, process_name: &str, mapping: &ProcessMapping) {
     let share_now_playing = state.process_map.read().unwrap().share_now_playing;
-    if !share_now_playing {
-        return;
-    }
     let auth = state.auth.read().unwrap().clone();
     let mapping = mapping.clone();
     let started_at_iso = chrono::Utc::now().to_rfc3339();
@@ -67,10 +70,12 @@ pub fn handle_session_started(state: &AppState, process_name: &str, mapping: &Pr
     let auth_hb = auth.clone();
     let mapping_hb = mapping.clone();
     let started_at_iso_hb = started_at_iso.clone();
-    std::thread::spawn(move || {
-        let client = client_for(&auth);
-        let _ = client.set_now_playing(mapping.froglog_id, mapping.r#type.clone(), mapping.title.clone(), Some(started_at_iso));
-    });
+    if share_now_playing {
+        std::thread::spawn(move || {
+            let client = client_for(&auth);
+            let _ = client.set_now_playing(mapping.froglog_id, mapping.r#type.clone(), mapping.title.clone(), Some(started_at_iso));
+        });
+    }
 
     lilypad_core::session_persistence::spawn_session_heartbeat(
         move || client_for(&auth_hb),

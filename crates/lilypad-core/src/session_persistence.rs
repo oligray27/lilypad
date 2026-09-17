@@ -147,6 +147,7 @@ pub fn recover_on_startup(
         froglog_id: persisted.froglog_id,
         title: persisted.title.clone(),
         title_filter: None,
+        exe_path: None,
     };
 
     let mut sys = System::new_all();
@@ -171,6 +172,8 @@ pub fn recover_on_startup(
         *current_session.write().unwrap() = Some(ActiveSession {
             process_name: persisted.process.clone(),
             mapping: mapping.clone(),
+            pid,
+            started_at_secs: crate::monitor::process_start_time(pid),
             started_at,
         });
 

@@ -17,14 +17,21 @@ if (!isDevServer) {
 const VIEW_SIZE = {
   loginView: { width: 560, height: 328 },
   mainView: { width: 550, height: 444 },
-  mappingsView: { width: 642, height: 760 },
+  mappingsView: { width: 642, height: 780 },
   sessionView: { width: 440, height: 165 },
   pendingView: { width: 550, height: 480 },
   watchedDirsView: { width: 550, height: 480 },
   excludedGamesView: { width: 550, height: 480 },
 };
 
+// The view currently on screen, so a sub-view's Back button can return to wherever it was opened
+// from. Pending Submissions and New Games are each reachable three ways — the About page's
+// notice, the Configure page's notice, and their tray items — so any fixed destination is wrong
+// for at least one of them. Back used to send Pending Submissions to About regardless.
+let currentView = null;
+
 function showView(id, heightOrOpts) {
+  currentView = id;
   document.querySelectorAll('[data-view]').forEach((el) => {
     el.hidden = el.id !== id;
   });
@@ -75,10 +82,26 @@ async function onLogin(e) {
 
 // Main view (about screen) — shows pending submissions notice if any exist
 async function loadMainView() {
-  const sessions = await invoke('get_pending_sessions').catch(() => []);
   const notice = $('pendingNotice');
   if (!notice) return;
   notice.hidden = false;
+
+  // A session store that cannot be written takes priority over the queue count: it means
+  // sessions are not being recorded durably, which a "no pending submissions" tick would
+  // otherwise hide behind a reassuring message.
+  const storage = await invoke('session_storage_status').catch(() => null);
+  if (storage && (storage.error || !storage.available)) {
+    notice.style.color = 'crimson';
+    notice.innerHTML = `&#9888; ${escapeHtml(storage.error || 'Session storage unavailable')}`;
+    return;
+  }
+  if (storage && storage.unowned) {
+    notice.style.color = 'darkorange';
+    notice.innerHTML = `&#9888; ${storage.unowned} recovered session${storage.unowned > 1 ? 's' : ''} from an earlier version could not be matched to an account and will not be submitted.`;
+    return;
+  }
+
+  const sessions = await invoke('get_pending_sessions').catch(() => []);
   if (sessions.length) {
     notice.style.color = 'darkorange';
     notice.innerHTML = `&#9888; ${sessions.length} pending submission${sessions.length > 1 ? 's' : ''} — <a href="#" id="pendingNoticeLink">View</a>`;
@@ -86,8 +109,7 @@ async function loadMainView() {
     if (link) {
       link.addEventListener('click', (e) => {
         e.preventDefault();
-        showView('pendingView');
-        loadPendingView();
+        openSubView('pendingView', loadPendingView);
       });
     }
   } else {
@@ -698,7 +720,7 @@ async function loadMappingsView() {
       mNotice.style.color = 'darkorange';
       mNotice.innerHTML = `&#9888; ${pendingSessions.length} pending submission${pendingSessions.length > 1 ? 's' : ''} — <a href="#" id="mappingsPendingLink">View</a>`;
       const link = $('mappingsPendingLink');
-      if (link) link.addEventListener('click', (e) => { e.preventDefault(); showView('pendingView'); loadPendingView(); });
+      if (link) link.addEventListener('click', (e) => { e.preventDefault(); openSubView('pendingView', loadPendingView); });
     } else {
       mNotice.style.color = '';
       mNotice.innerHTML = '&#10003; No pending submissions';
@@ -713,7 +735,7 @@ async function loadMappingsView() {
       nNotice.style.color = 'darkorange';
       nNotice.innerHTML = `&#9888; ${newGames.length} game${newGames.length > 1 ? 's' : ''} detected that ${newGames.length > 1 ? "aren't" : "isn't"} in FrogLog yet. <a href="#" id="mappingsNewGamesLink">View</a>`;
       const link = $('mappingsNewGamesLink');
-      if (link) link.addEventListener('click', (e) => { e.preventDefault(); showView('newGamesView'); loadNewGamesView(); });
+      if (link) link.addEventListener('click', (e) => { e.preventDefault(); openSubView('newGamesView', loadNewGamesView); });
     } else {
       nNotice.style.color = '';
       nNotice.innerHTML = '&#10003; No games detected outside FrogLog';
@@ -1032,6 +1054,28 @@ async function doApply() {
         }, 3000);
     }
 }
+// Where Pending Submissions / New Games were opened from, so Back returns there. Defaults to
+// Configure: the tray items open these views with no previous screen behind them, and Configure
+// is where they conceptually belong.
+let subViewOrigin = 'mappingsView';
+
+/// Opens one of the sub-views, remembering what it was opened from.
+function openSubView(id, load) {
+  subViewOrigin = currentView === 'mainView' ? 'mainView' : 'mappingsView';
+  showView(id);
+  load();
+}
+
+function goBackFromSubView() {
+  if (subViewOrigin === 'mainView') {
+    showView('mainView');
+    loadMainView();
+  } else {
+    showView('mappingsView');
+    loadMappingsView();
+  }
+}
+
 // Post-play popup (shown when session-ended fires)
 let pendingSession = null;
 
@@ -1043,6 +1087,14 @@ function roundHoursForFroglog(hours) {
 
 function showPostPlay(data) {
   pendingSession = data;
+  // A fresh session gets a fresh button. Without this the in-flight guard from the previous
+  // submission persists and the next session can never be submitted at all.
+  submitInFlight = false;
+  const submitBtn = document.querySelector('#sessionView button[type="submit"]');
+  if (submitBtn) {
+    submitBtn.disabled = false;
+    submitBtn.textContent = 'Submit to FrogLog';
+  }
   const mapping = data.mapping || {};
   const title = mapping.title || `Game #${mapping.froglogId || ''}`;
   $('sessionHeader').textContent = data.forced ? 'Session Ended (Forced)' : 'Session Ended';
@@ -1058,9 +1110,15 @@ function showPostPlay(data) {
   showView('sessionView', { height: hasNotes ? 284 : 155 });
 }
 
+// Guards against a second submit while the first is still in flight. A submission is a network
+// round trip that can take seconds, and the button stays clickable throughout; without this,
+// an impatient double-click sends the session twice. The server now deduplicates on sync_ref so
+// the damage is bounded, but the UI should not be sending requests it knows are redundant.
+let submitInFlight = false;
+
 async function onSubmitSession(e) {
   e.preventDefault();
-  if (!pendingSession) return;
+  if (!pendingSession || submitInFlight) return;
   const mapping = pendingSession.mapping || {};
   const gameId = mapping.froglogId;
   const gameType = mapping.type || 'regular';
@@ -1072,6 +1130,12 @@ async function onSubmitSession(e) {
   errEl.textContent = '';
   const rawHours = (pendingSession.durationSecs || 0) / 3600;
   const hours = roundHoursForFroglog(rawHours);
+  const submitBtn = e.target && e.target.querySelector('button[type="submit"]');
+  submitInFlight = true;
+  if (submitBtn) {
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Submitting…';
+  }
   try {
     const result = await invoke('submit_session', {
       gameType,
@@ -1081,10 +1145,18 @@ async function onSubmitSession(e) {
       spoiler,
       isPublic,
       title: (pendingSession.mapping && pendingSession.mapping.title) || null,
+      // Settles the durable session record this popup was opened for, rather than the popup
+      // owning the session itself. Absent for a session recorded before this build.
+      ledgerId: pendingSession.ledgerId || null,
     });
     if (result && result.queued) {
+      // Queued is terminal for this popup: the session is safely recorded and now belongs to
+      // Pending Submissions. Re-enabling Submit would invite the user to fire a second request
+      // at something already queued, so the button stays out of action.
       errEl.style.color = 'orange';
       errEl.textContent = 'Submission failed, session saved to Pending Submissions. Re-login or check your connection, then retry from the tray.';
+      if (submitBtn) submitBtn.textContent = 'Queued';
+      pendingSession = null;
       invoke('refresh_tray_menu').catch(() => {});
       return;
     }
@@ -1092,18 +1164,39 @@ async function onSubmitSession(e) {
     pendingSession = null;
     invoke('hide_window').catch(() => {});
   } catch (err) {
+    // A thrown error means the command itself failed rather than the submission being queued,
+    // so the session is still this popup's to deal with — allow another attempt.
     errEl.textContent = String(err);
+    submitInFlight = false;
+    if (submitBtn) {
+      submitBtn.disabled = false;
+      submitBtn.textContent = 'Submit to FrogLog';
+    }
   }
 }
 
 function onSkipSession() {
+  // Declining a session discards its durable record. Without this it stayed in the "ended but
+  // not submitted" state and turned up in Pending Submissions as if it were a failed one.
+  const ledgerId = (pendingSession && pendingSession.ledgerId) || null;
   pendingSession = null;
-  invoke('hide_window').catch(() => {});
+  invoke('discard_session', { ledgerId })
+    .catch((e) => console.warn('[LilyPad] could not discard session:', e))
+    .finally(() => {
+      invoke('refresh_tray_menu').catch(() => {});
+      invoke('hide_window').catch(() => {});
+    });
 }
 
 // Session-ended event from backend
 listen('session-ended', (event) => {
   showPostPlay(event.payload);
+});
+
+// A write to the durable session store failed. Surface it rather than letting the app carry on
+// looking healthy while sessions are not being recorded.
+listen('storage-error', () => {
+  loadMainView().catch(() => {});
 });
 
 // Tray "Configure…" opens window and asks frontend to show mappings view
@@ -1120,12 +1213,14 @@ listen('show-main', () => {
 
 // Tray "Pending Submissions" opens pending view
 listen('show-pending', () => {
+  subViewOrigin = 'mappingsView';
   showView('pendingView');
   loadPendingView();
 });
 
 // Tray "New Games" (or the "Session Recorded" notification button) opens the New Games view
 listen('show-new-games', () => {
+  subViewOrigin = 'mappingsView';
   showView('newGamesView');
   loadNewGamesView();
 });
@@ -1188,8 +1283,12 @@ app.innerHTML = `
       <p id="mappingsPendingNotice" class="pending-notice" hidden></p>
       <p id="mappingsNewGamesNotice" class="pending-notice" hidden></p>
       <p class="muted">Type the executable name (e.g. <code>game.exe</code>) in the exe column. Once a session ends, LilyPad will prompt you to log the session.</p>
-      <label class="mappings-auto-submit-label"><input type="checkbox" id="mappingsAutoSubmitRegular" /> Auto-submit regular game sessions</label>
-      <label class="mappings-auto-submit-label"><input type="checkbox" id="mappingsAutoSubmitSession" /> Auto-submit session-tracked game sessions</label>
+      <!-- Named after what the game is and what actually gets sent, not after LilyPad's
+           internal "regular"/"session"/"live" type names. The first one deliberately says play
+           time rather than sessions: a game without session tracking has no sessions to log,
+           so that submission only adds hours to the game's total (see update_game_hours). -->
+      <label class="mappings-auto-submit-label"><input type="checkbox" id="mappingsAutoSubmitRegular" /> Auto-submit play time to games without session tracking</label>
+      <label class="mappings-auto-submit-label"><input type="checkbox" id="mappingsAutoSubmitSession" /> Auto-submit sessions to games with session tracking</label>
       <label class="mappings-auto-submit-label"><input type="checkbox" id="mappingsAutoSubmitLive" /> Auto-submit live service sessions</label>
       <label class="mappings-auto-submit-label"><input type="checkbox" id="shareNowPlaying" /> Enable online presence on FrogLog</label>
       <label class="mappings-auto-submit-label"><input type="checkbox" id="detectUnmappedGames" /> Detect games not in your FrogLog library</label>
@@ -1296,8 +1395,15 @@ $('mappingsPrev').addEventListener('click', () => { mappingsPage--; renderMappin
 $('mappingsNext').addEventListener('click', () => { mappingsPage++; renderMappingsTable(); });
 $('mappingsSearch').addEventListener('input', (e) => { mappingsSearch = e.target.value; mappingsPage = 0; renderMappingsTable(); });
 $('mappingsApply').addEventListener('click', doApply);
-function saveAutoSubmit() {
-  invoke('save_auto_submit', { regular: !!$('mappingsAutoSubmitRegular').checked, live: !!$('mappingsAutoSubmitLive').checked, session: !!$('mappingsAutoSubmitSession').checked }).catch(() => {});
+async function saveAutoSubmit() {
+  try {
+    await invoke('save_auto_submit', { regular: !!$('mappingsAutoSubmitRegular').checked, live: !!$('mappingsAutoSubmitLive').checked, session: !!$('mappingsAutoSubmitSession').checked });
+    const mc = await invoke('get_process_mappings');
+    const liveEl = $('mappingsAutoSubmitLive');
+    const sessionEl = $('mappingsAutoSubmitSession');
+    if (liveEl) liveEl.checked = !!mc.auto_submit_live;
+    if (sessionEl) sessionEl.checked = !!mc.auto_submit_session;
+  } catch (_) {}
 }
 function saveShareNowPlaying() {
   const share = !!$('shareNowPlaying').checked;
@@ -1326,8 +1432,8 @@ $('watchedDirsAdd').addEventListener('click', async () => {
   loadWatchedDirectories();
 });
 $('mainOpenConfigure').addEventListener('click', () => { showView('mappingsView'); loadMappingsView(); });
-$('pendingBack').addEventListener('click', () => { showView('mainView'); loadMainView(); });
-$('newGamesBack').addEventListener('click', () => { showView('mappingsView'); loadMappingsView(); });
+$('pendingBack').addEventListener('click', goBackFromSubView);
+$('newGamesBack').addEventListener('click', goBackFromSubView);
 $('mappingsOpenWatchedDirs').addEventListener('click', () => {
   showView('watchedDirsView');
   loadWatchedDirectories();

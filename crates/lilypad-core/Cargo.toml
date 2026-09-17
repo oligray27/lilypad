@@ -1,6 +1,6 @@
 [package]
 name = "lilypad-core"
-version = "0.5.15"
+version = "0.6.0"
 description = "Shared Froglog API client, config, and process-monitor logic for Lilypad (Windows/Tauri and Linux/GTK)"
 edition = "2021"
 rust-version = "1.70"
@@ -13,13 +13,23 @@ sysinfo = "0.31"
 reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
 dirs = "5"
 chrono = "0.4"
+rusqlite = { version = "0.32", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]
-wmi = "0.14"
+# `wmi` was dropped with the Win32_ProcessStartTrace subscription: that event class is
+# administrator-only, so it never worked in an unelevated install and the process scan was always
+# doing the detection. See the module docs in monitor.rs.
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Registry",
+    # OpenProcess/WaitForSingleObject, for waiting on a real SYNCHRONIZE handle rather than
+    # inferring exit from process enumeration -- see monitor::wait_for_process_exit.
+    "Win32_System_Threading",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

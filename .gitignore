@@ -13,3 +13,5 @@ update_hours.py
 
 # Local env
 .env
+IMPLEMENTATION_NOTES.md
+PLAN.md

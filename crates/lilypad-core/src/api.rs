@@ -139,6 +139,75 @@ pub struct FroglogClient {
     client: reqwest::blocking::Client,
 }
 
+/// What a failed request means for whether retrying it can ever work.
+///
+/// Every request in this client reports failures as a `String`, and changing that would ripple
+/// through both frontends -- the GTK one pipes `Result<_, String>` through typed channels -- so
+/// the status code is carried *in* the message by `http_error` and recovered here. Stringly, but
+/// contained in one place and tested, rather than a type change across ~29 call sites, half of
+/// which cannot be compiler-checked on this host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiFailure {
+    /// The token is rejected. Retrying unchanged cannot work; it needs a fresh login.
+    Unauthorized,
+    /// The target is gone. For a session submit this is the orphaned-mapping case -- the game
+    /// was deleted or moved between types -- and is worth trying to recover from, not retrying.
+    NotFound,
+    /// The server already holds this submission (a `sync_ref` replay). Not a failure: the work
+    /// is done, and retrying would only ask again.
+    AlreadySubmitted,
+    /// Asked to slow down. The same request should succeed later, untouched.
+    RateLimited,
+    /// The request itself is unacceptable. Retrying it identically will fail identically.
+    Rejected,
+    /// Network, timeout, or a server-side fault. Worth retrying unchanged.
+    Transient,
+}
+
+impl ApiFailure {
+    /// Whether retrying the identical request could plausibly succeed later.
+    pub fn is_worth_retrying(self) -> bool {
+        matches!(self, Self::RateLimited | Self::Transient)
+    }
+
+    /// Classifies an error message produced by this client.
+    pub fn classify(error: &str) -> Self {
+        // `http_error` formats every HTTP failure as "<status>: <message>".
+        if let Some(status) = error
+            .split(':')
+            .next()
+            .and_then(|code| code.trim().parse::<u16>().ok())
+        {
+            return match status {
+                401 | 403 => Self::Unauthorized,
+                404 => Self::NotFound,
+                409 => Self::AlreadySubmitted,
+                408 | 429 => Self::RateLimited,
+                500..=599 => Self::Transient,
+                _ => Self::Rejected,
+            };
+        }
+        // Not an HTTP response at all. "Not logged in" is raised locally when no token exists,
+        // and must not be mistaken for something a retry could fix.
+        if error.eq_ignore_ascii_case("Not logged in") || error.contains("Unauthorized") {
+            return Self::Unauthorized;
+        }
+        // Everything else reaching here is a transport failure from reqwest -- connection
+        // refused, DNS, TLS, the 15s timeout -- all of which are worth retrying.
+        Self::Transient
+    }
+}
+
+/// Renders an HTTP failure so its status survives into the error message, which is what
+/// `ApiFailure::classify` reads back. Prefer this over ad-hoc formatting.
+fn http_error(status: reqwest::StatusCode, body: Option<serde_json::Value>) -> String {
+    let message = body
+        .as_ref()
+        .and_then(|b| b["error"].as_str())
+        .unwrap_or_else(|| status.canonical_reason().unwrap_or("Request failed"));
+    format!("{}: {}", status.as_u16(), message)
+}
+
 impl FroglogClient {
     pub fn new(base_url: String) -> Self {
         Self {
@@ -211,7 +280,7 @@ impl FroglogClient {
             .send()
             .map_err(|e: reqwest::Error| e.to_string())?;
         if res.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err("Unauthorized".to_string());
+            return Err(http_error(reqwest::StatusCode::UNAUTHORIZED, None));
         }
         if !res.status().is_success() {
             let body = res.text().unwrap_or_default();
@@ -219,6 +288,32 @@ impl FroglogClient {
             return Err(err["error"].as_str().unwrap_or("Request failed").to_string());
         }
         res.json().map_err(|e: reqwest::Error| e.to_string())
+    }
+
+    /// The authenticated account's own username, from `GET /users/me`.
+    ///
+    /// Used to backfill `AuthConfig::username` for logins that predate it being stored, so those
+    /// installs get a stable account key without the user having to log out and back in — which
+    /// would lose their process-map file, since logout clears the auth the migration keys off.
+    pub fn get_username(&self) -> Result<String, String> {
+        let res = self
+            .client
+            .get(self.url("/users/me"))
+            .headers(self.headers())
+            .send()
+            .map_err(|e: reqwest::Error| e.to_string())?;
+        if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(http_error(reqwest::StatusCode::UNAUTHORIZED, None));
+        }
+        if !res.status().is_success() {
+            return Err(http_error(res.status(), None));
+        }
+        let body: serde_json::Value = res.json().map_err(|e: reqwest::Error| e.to_string())?;
+        body["username"]
+            .as_str()
+            .filter(|u| !u.trim().is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| "Response contained no username".to_string())
     }
 
     pub fn get_games(&self) -> Result<Vec<Game>, String> {
@@ -236,11 +331,12 @@ impl FroglogClient {
             .send()
             .map_err(|e: reqwest::Error| e.to_string())?;
         if res.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err("Unauthorized".to_string());
+            return Err(http_error(reqwest::StatusCode::UNAUTHORIZED, None));
         }
         if !res.status().is_success() {
-            let err: serde_json::Value = res.json().unwrap_or_default();
-            return Err(err["error"].as_str().unwrap_or("Request failed").to_string());
+            let status = res.status();
+            let body: serde_json::Value = res.json().unwrap_or_default();
+            return Err(http_error(status, Some(body)));
         }
         res.json().map_err(|e: reqwest::Error| e.to_string())
     }
@@ -253,11 +349,12 @@ impl FroglogClient {
             .send()
             .map_err(|e: reqwest::Error| e.to_string())?;
         if res.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err("Unauthorized".to_string());
+            return Err(http_error(reqwest::StatusCode::UNAUTHORIZED, None));
         }
         if !res.status().is_success() {
-            let err: serde_json::Value = res.json().unwrap_or_default();
-            return Err(err["error"].as_str().unwrap_or("Request failed").to_string());
+            let status = res.status();
+            let body: serde_json::Value = res.json().unwrap_or_default();
+            return Err(http_error(status, Some(body)));
         }
         res.json().map_err(|e: reqwest::Error| e.to_string())
     }
@@ -281,11 +378,12 @@ impl FroglogClient {
             .send()
             .map_err(|e: reqwest::Error| e.to_string())?;
         if res.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err("Unauthorized".to_string());
+            return Err(http_error(reqwest::StatusCode::UNAUTHORIZED, None));
         }
         if !res.status().is_success() {
-            let err: serde_json::Value = res.json().unwrap_or_default();
-            return Err(err["error"].as_str().unwrap_or("Request failed").to_string());
+            let status = res.status();
+            let body: serde_json::Value = res.json().unwrap_or_default();
+            return Err(http_error(status, Some(body)));
         }
         res.json().map_err(|e: reqwest::Error| e.to_string())
     }
@@ -309,11 +407,12 @@ impl FroglogClient {
             .send()
             .map_err(|e: reqwest::Error| e.to_string())?;
         if res.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err("Unauthorized".to_string());
+            return Err(http_error(reqwest::StatusCode::UNAUTHORIZED, None));
         }
         if !res.status().is_success() {
-            let err: serde_json::Value = res.json().unwrap_or_default();
-            return Err(err["error"].as_str().unwrap_or("Request failed").to_string());
+            let status = res.status();
+            let body: serde_json::Value = res.json().unwrap_or_default();
+            return Err(http_error(status, Some(body)));
         }
         res.json().map_err(|e: reqwest::Error| e.to_string())
     }
@@ -354,7 +453,7 @@ impl FroglogClient {
             .send()
             .map_err(|e: reqwest::Error| e.to_string())?;
         if res.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err("Unauthorized".to_string());
+            return Err(http_error(reqwest::StatusCode::UNAUTHORIZED, None));
         }
         if !res.status().is_success() {
             let status = res.status();
@@ -519,11 +618,12 @@ impl FroglogClient {
             .send()
             .map_err(|e: reqwest::Error| e.to_string())?;
         if res.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err("Unauthorized".to_string());
+            return Err(http_error(reqwest::StatusCode::UNAUTHORIZED, None));
         }
         if !res.status().is_success() {
-            let err: serde_json::Value = res.json().unwrap_or_default();
-            return Err(err["error"].as_str().unwrap_or("Request failed").to_string());
+            let status = res.status();
+            let body: serde_json::Value = res.json().unwrap_or_default();
+            return Err(http_error(status, Some(body)));
         }
         res.json().map_err(|e: reqwest::Error| e.to_string())
     }
@@ -537,11 +637,12 @@ impl FroglogClient {
             .send()
             .map_err(|e: reqwest::Error| e.to_string())?;
         if res.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err("Unauthorized".to_string());
+            return Err(http_error(reqwest::StatusCode::UNAUTHORIZED, None));
         }
         if !res.status().is_success() {
-            let err: serde_json::Value = res.json().unwrap_or_default();
-            return Err(err["error"].as_str().unwrap_or("Request failed").to_string());
+            let status = res.status();
+            let body: serde_json::Value = res.json().unwrap_or_default();
+            return Err(http_error(status, Some(body)));
         }
         res.json().map_err(|e: reqwest::Error| e.to_string())
     }
@@ -557,14 +658,15 @@ impl FroglogClient {
             .send()
             .map_err(|e: reqwest::Error| e.to_string())?;
         if res.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err("Unauthorized".to_string());
+            return Err(http_error(reqwest::StatusCode::UNAUTHORIZED, None));
         }
         if res.status() == reqwest::StatusCode::NOT_FOUND {
             return Err("not_found".to_string());
         }
         if !res.status().is_success() {
-            let err: serde_json::Value = res.json().unwrap_or_default();
-            return Err(err["error"].as_str().unwrap_or("Request failed").to_string());
+            let status = res.status();
+            let body: serde_json::Value = res.json().unwrap_or_default();
+            return Err(http_error(status, Some(body)));
         }
         res.json().map_err(|e: reqwest::Error| e.to_string())
     }
@@ -581,11 +683,12 @@ impl FroglogClient {
             .send()
             .map_err(|e: reqwest::Error| e.to_string())?;
         if res.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err("Unauthorized".to_string());
+            return Err(http_error(reqwest::StatusCode::UNAUTHORIZED, None));
         }
         if !res.status().is_success() {
-            let err: serde_json::Value = res.json().unwrap_or_default();
-            return Err(err["error"].as_str().unwrap_or("Request failed").to_string());
+            let status = res.status();
+            let body: serde_json::Value = res.json().unwrap_or_default();
+            return Err(http_error(status, Some(body)));
         }
         res.json().map_err(|e: reqwest::Error| e.to_string())
     }
@@ -600,14 +703,15 @@ impl FroglogClient {
             .send()
             .map_err(|e: reqwest::Error| e.to_string())?;
         if res.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err("Unauthorized".to_string());
+            return Err(http_error(reqwest::StatusCode::UNAUTHORIZED, None));
         }
         if res.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
             return Err("Rate limited: too many games created this hour".to_string());
         }
         if !res.status().is_success() {
-            let err: serde_json::Value = res.json().unwrap_or_default();
-            return Err(err["error"].as_str().unwrap_or("Request failed").to_string());
+            let status = res.status();
+            let body: serde_json::Value = res.json().unwrap_or_default();
+            return Err(http_error(status, Some(body)));
         }
         res.json().map_err(|e: reqwest::Error| e.to_string())
     }
@@ -629,7 +733,7 @@ impl FroglogClient {
             .send()
             .map_err(|e: reqwest::Error| e.to_string())?;
         if res.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err("Unauthorized".to_string());
+            return Err(http_error(reqwest::StatusCode::UNAUTHORIZED, None));
         }
         if !res.status().is_success() {
             let err: serde_json::Value = res.json().unwrap_or_default();
@@ -650,7 +754,7 @@ impl FroglogClient {
             .send()
             .map_err(|e: reqwest::Error| e.to_string())?;
         if res.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err("Unauthorized".to_string());
+            return Err(http_error(reqwest::StatusCode::UNAUTHORIZED, None));
         }
         if !res.status().is_success() {
             let err: serde_json::Value = res.json().unwrap_or_default();
@@ -672,7 +776,7 @@ impl FroglogClient {
             .send()
             .map_err(|e: reqwest::Error| e.to_string())?;
         if res.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err("Unauthorized".to_string());
+            return Err(http_error(reqwest::StatusCode::UNAUTHORIZED, None));
         }
         if !res.status().is_success() {
             let err: serde_json::Value = res.json().unwrap_or_default();
@@ -682,5 +786,70 @@ impl FroglogClient {
         let json = res.json().map_err(|e: reqwest::Error| e.to_string())?;
         log::info!("[LilyPad] set_show_current_session success: {:?}", json);
         Ok(json)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The classifier reads a status code back out of an error message, so the format
+    /// `http_error` writes and the format `classify` parses have to stay in step. If these two
+    /// ever drift, every failure silently becomes `Transient` and retries for ever.
+    #[test]
+    fn http_failures_are_classified_by_their_status() {
+        let cases = [
+            (reqwest::StatusCode::UNAUTHORIZED, ApiFailure::Unauthorized),
+            (reqwest::StatusCode::FORBIDDEN, ApiFailure::Unauthorized),
+            (reqwest::StatusCode::NOT_FOUND, ApiFailure::NotFound),
+            (reqwest::StatusCode::CONFLICT, ApiFailure::AlreadySubmitted),
+            (reqwest::StatusCode::TOO_MANY_REQUESTS, ApiFailure::RateLimited),
+            (reqwest::StatusCode::BAD_REQUEST, ApiFailure::Rejected),
+            (reqwest::StatusCode::UNPROCESSABLE_ENTITY, ApiFailure::Rejected),
+            (reqwest::StatusCode::INTERNAL_SERVER_ERROR, ApiFailure::Transient),
+            (reqwest::StatusCode::BAD_GATEWAY, ApiFailure::Transient),
+        ];
+        for (status, expected) in cases {
+            let rendered = http_error(status, None);
+            assert_eq!(
+                ApiFailure::classify(&rendered), expected,
+                "{status} rendered as {rendered:?} classified wrongly",
+            );
+        }
+        // A server-supplied message must not displace the code that precedes it.
+        let body = serde_json::json!({ "error": "Session with this sync_ref is already being created" });
+        assert_eq!(
+            ApiFailure::classify(&http_error(reqwest::StatusCode::CONFLICT, Some(body))),
+            ApiFailure::AlreadySubmitted
+        );
+    }
+
+    /// Failures that never reached the server at all.
+    #[test]
+    fn local_and_transport_failures_are_classified_without_a_status() {
+        // Raised locally when there is no token; a retry cannot fix it.
+        assert_eq!(ApiFailure::classify("Not logged in"), ApiFailure::Unauthorized);
+        // Real reqwest transport text, which is worth retrying unchanged.
+        assert_eq!(
+            ApiFailure::classify("error sending request for url (https://api.froglog.co.uk/api/games/1/sessions)"),
+            ApiFailure::Transient
+        );
+        assert_eq!(ApiFailure::classify("operation timed out"), ApiFailure::Transient);
+    }
+
+    /// Only these two are worth handing back to the retry queue; the rest need a human or are
+    /// already done.
+    #[test]
+    fn only_transient_failures_are_worth_retrying() {
+        assert!(ApiFailure::Transient.is_worth_retrying());
+        assert!(ApiFailure::RateLimited.is_worth_retrying());
+        for settled in [
+            ApiFailure::Unauthorized,
+            ApiFailure::NotFound,
+            ApiFailure::AlreadySubmitted,
+            ApiFailure::Rejected,
+        ] {
+            assert!(!settled.is_worth_retrying(), "{settled:?} should not be retried blindly");
+        }
     }
 }

@@ -32,6 +32,7 @@ pub fn start(state: &AppState, tx: async_channel::Sender<MonitorEvent>) {
     let tx_ended = tx.clone();
     let tx_unmapped = tx;
     let state_for_link = state.clone();
+    let state_for_library_refresh = state.clone();
     run_poll_loop(
         state.process_map.clone(),
         state.current_session.clone(),
@@ -53,6 +54,18 @@ pub fn start(state: &AppState, tx: async_channel::Sender<MonitorEvent>) {
         },
         state.installed_games.clone(),
         state.library_index.clone(),
+        // Called when a running game looks absent from the library, before that is taken as
+        // fact: the cache refreshes on a timer, so a game added on the website minutes ago would
+        // otherwise be filed as a New Game the user already owns.
+        {
+            let state = state_for_library_refresh;
+            move || state.refresh_library_index()
+        },
+        // The GTK frontend has not been migrated to the durable session ledger -- it still runs
+        // on `session_persistence` and the JSON queues -- so it has nothing to record at the
+        // start of an unmapped session. Deliberately a no-op rather than an omission; the Tauri
+        // frontend uses this to make an interrupted unmapped session recoverable.
+        |_start| {},
         move |title, appid, exe_name, duration_secs, replay_of| {
             let _ = tx_unmapped.send_blocking(MonitorEvent::UnmappedGameSessionEnded {
                 title,

@@ -1,4 +1,12 @@
-//! Process monitor: WMI event-based start detection (Windows), poll-based fallback.
+//! Process monitor: a periodic scan of running processes.
+//!
+//! This used to try WMI `Win32_ProcessStartTrace` first, treating the scan as a fallback. That
+//! event class derives from `Win32_SystemTrace` and is restricted to administrators, so
+//! subscribing returned `WBEM_E_ACCESS_DENIED` (0x80041003) in every normal installation --
+//! LilyPad is never elevated, since an installed app runs as the user and its autostart entry
+//! cannot elevate without prompting on every boot. The WMI path therefore never ran, and the
+//! scan has always been the real detection mechanism. The dead branch, and its duplicate copy of
+//! the mapped-session detection logic, were removed rather than left to be maintained twice.
 
 use crate::config::{ProcessMapConfig, ProcessMapping};
 use crate::library_match::{is_finished_status, LibraryIndex, ResolvedLibraryGame};
@@ -52,6 +60,21 @@ fn is_known_helper_process(exe_name: &str) -> bool {
     HELPER_EXE_NAMES.contains(&exe_name.to_lowercase().as_str())
 }
 
+/// An unmapped game's session, reported as it starts. Grouped into a struct rather than added as
+/// more positional parameters: the ended callback is already five untyped `String`s and a float,
+/// and this one carries process identity that is easy to transpose by accident.
+#[derive(Debug, Clone)]
+pub struct UnmappedSessionStart {
+    pub title: String,
+    pub appid: String,
+    pub exe_name: String,
+    pub pid: Pid,
+    /// The OS process start time; with the pid this identifies the instance, so recovery can
+    /// tell the process it was tracking from a relaunch that reused its pid.
+    pub process_started_at_secs: Option<u64>,
+    pub replay_of: Option<ResolvedLibraryGame>,
+}
+
 /// Blocks until the given PID exits, then fires `on_unmapped_session_ended(title, appid,
 /// exe_name, duration_secs, replay_of)`, releases the appid from `currently_tracking` so a
 /// later relaunch of the same game starts a fresh tracked session, and records the appid's end
@@ -70,8 +93,20 @@ fn run_unmapped_wait_thread(
     replay_of: Option<ResolvedLibraryGame>,
     currently_tracking: Arc<RwLock<HashSet<String>>>,
     last_ended_unmapped: Arc<RwLock<HashMap<String, Instant>>>,
+    on_unmapped_session_started: Arc<dyn Fn(UnmappedSessionStart) + Send + Sync>,
     on_unmapped_session_ended: Arc<dyn Fn(String, String, String, f64, Option<ResolvedLibraryGame>) + Send + Sync>,
 ) {
+    // Announced before the wait begins, so a frontend can record the session durably while it is
+    // still running. Previously an unmapped game was only reported once it had *ended*, so a
+    // crash mid-play lost the whole session -- there was never a record of it.
+    on_unmapped_session_started(UnmappedSessionStart {
+        title: title.clone(),
+        appid: appid.clone(),
+        exe_name: exe_name.clone(),
+        pid,
+        process_started_at_secs: process_start_time(pid),
+        replay_of: replay_of.clone(),
+    });
     std::thread::spawn(move || {
         let exited_at = wait_for_exit_with_relaunch_grace(pid, &exe_name);
         let duration_secs = exited_at.saturating_duration_since(started_at).as_secs_f64();
@@ -142,6 +177,7 @@ fn heal_orphaned_mapping(
         froglog_id: resolved.id,
         title: Some(resolved.title.clone()),
         title_filter: mapping.title_filter.clone(),
+        exe_path: None,
     })
 }
 
@@ -162,6 +198,7 @@ fn start_replay_prompt_tracking(
     resolved: ResolvedLibraryGame,
     currently_tracking_unmapped: &Arc<RwLock<HashSet<String>>>,
     last_ended_unmapped: &Arc<RwLock<HashMap<String, Instant>>>,
+    on_unmapped_session_started: &Arc<dyn Fn(UnmappedSessionStart) + Send + Sync>,
     on_unmapped_session_ended: &Arc<dyn Fn(String, String, String, f64, Option<ResolvedLibraryGame>) + Send + Sync>,
 ) -> bool {
     let synthetic_appid = format!("mapped:{}", mapping.froglog_id);
@@ -182,6 +219,7 @@ fn start_replay_prompt_tracking(
         Some(resolved),
         Arc::clone(currently_tracking_unmapped),
         Arc::clone(last_ended_unmapped),
+        Arc::clone(on_unmapped_session_started),
         Arc::clone(on_unmapped_session_ended),
     );
     true
@@ -215,6 +253,9 @@ fn maybe_start_unmapped_tracking(
     config: &Arc<RwLock<ProcessMapConfig>>,
     currently_tracking: &Arc<RwLock<HashSet<String>>>,
     last_ended_unmapped: &Arc<RwLock<HashMap<String, Instant>>>,
+    last_library_refresh: &Arc<RwLock<HashMap<String, Instant>>>,
+    refresh_library_index: &Arc<dyn Fn() -> bool + Send + Sync>,
+    on_unmapped_session_started: &Arc<dyn Fn(UnmappedSessionStart) + Send + Sync>,
     on_unmapped_session_ended: &Arc<dyn Fn(String, String, String, f64, Option<ResolvedLibraryGame>) + Send + Sync>,
     on_already_owned_game_needs_link: &Arc<dyn Fn(ProcessMapping) + Send + Sync>,
 ) -> Option<ProcessMapping> {
@@ -242,6 +283,44 @@ fn maybe_start_unmapped_tracking(
         let le = last_ended_unmapped.read().unwrap();
         if let Some(last_time) = le.get(&found.appid) {
             if last_time.elapsed() < POST_SESSION_COOLDOWN {
+                return None;
+            }
+        }
+    }
+
+    // Before concluding this game is not in the library, make sure the library we are consulting
+    // is current. The cache refreshes on a five-minute timer, so a game added on the website
+    // minutes ago is still absent from it -- and the consequence is not a delay but a wrong
+    // answer: the game is filed as a New Game the user already owns, which they then have to
+    // resolve by hand. Refreshing only at this decision point keeps the cost off the common path,
+    // and the rate limit stops a genuinely unknown game refreshing on every launch.
+    if library_index.read().unwrap().resolve_by_appid(&found.appid).is_none() {
+        let due = last_library_refresh
+            .read()
+            .unwrap()
+            .get(&found.appid)
+            .is_none_or(|at| at.elapsed() >= LIBRARY_RECHECK_COOLDOWN);
+        if due {
+            last_library_refresh
+                .write()
+                .unwrap()
+                .insert(found.appid.clone(), Instant::now());
+            log::info!(
+                "[LilyPad] {} (appid {}) is not in the cached library; refreshing before treating \
+                 it as a new game",
+                found.name, found.appid
+            );
+            // A refresh that fails means the library could not be consulted at all. Declaring the
+            // game new on that basis would file something the user already owns into the New
+            // Games queue for them to clear by hand -- so decline to decide, and let a later tick
+            // try again once the network is back. Skipping costs the session; guessing costs the
+            // user's trust in the queue.
+            if !refresh_library_index() {
+                log::warn!(
+                    "[LilyPad] could not check the library for {} (appid {}); not tracking it this \
+                     time rather than filing a game that may already be owned",
+                    found.name, found.appid
+                );
                 return None;
             }
         }
@@ -285,6 +364,9 @@ fn maybe_start_unmapped_tracking(
                 froglog_id: resolved.id,
                 title: Some(resolved.title.clone()),
                 title_filter: None,
+                // Recorded the first time this mapping actually tracks a session, where the
+                // running process's real path is known.
+                exe_path: None,
             };
             on_already_owned_game_needs_link(mapping.clone());
             return Some(mapping);
@@ -311,6 +393,7 @@ fn maybe_start_unmapped_tracking(
         replay_of,
         Arc::clone(currently_tracking),
         Arc::clone(last_ended_unmapped),
+        Arc::clone(on_unmapped_session_started),
         Arc::clone(on_unmapped_session_ended),
     );
     None
@@ -483,6 +566,16 @@ fn pick_mapping(candidates: &[ProcessMapping], window_titles: &[String]) -> Opti
 /// starting a phantom second session, e.g. javaw.exe relaunching during Minecraft mod pack close).
 const POST_SESSION_COOLDOWN: Duration = Duration::from_secs(15);
 
+/// Minimum gap between on-demand library refreshes for the *same* game.
+///
+/// Keyed per appid rather than globally: a global gap meant a genuinely unlisted game refreshed
+/// the whole library once a minute for as long as it ran -- roughly 120 redundant fetches over a
+/// two-hour session, none of which could find anything, since the game only appears once the user
+/// resolves it. Per-game with a long gap keeps the valuable case (a game added on the website
+/// shortly before launch is found immediately) while the five-minute periodic refresh covers
+/// anything added later.
+const LIBRARY_RECHECK_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+
 /// Games whose exe carries a UAC elevation manifest actually run twice: the unelevated process
 /// exits the instant the prompt is accepted, and the elevated copy relaunches right after.
 /// Ending the session on that first exit produced a junk seconds-long session followed by a
@@ -505,6 +598,82 @@ const POST_SESSION_COOLDOWN: Duration = Duration::from_secs(15);
 const UAC_PROMPT_WAIT_CAP: Duration = Duration::from_secs(150);
 const POST_PROMPT_SCAN: Duration = Duration::from_secs(3);
 
+/// Anti-cheat launchers produce the same split session as UAC elevation, but with no
+/// `consent.exe` to key off. For Honor is the observed case: `forhonor.exe` starts, runs about
+/// four seconds, exits as EAC takes over, and the *real* `forhonor.exe` appears roughly sixteen
+/// seconds later. The original single-pass successor scan looked once, at the instant of exit,
+/// found nothing, and ended the session -- producing a junk four-second session followed by a
+/// separate real one.
+///
+/// Fall Guys uses EAC too and never showed this, because its launcher and game are different
+/// executables (`start_protected_game.exe` -> `FallGuys_client_game.exe`), so the handoff never
+/// looks like one process exiting. The tell is not the anti-cheat, it is a same-named relaunch.
+///
+/// The tell used here is that the segment which just ended was *short*. That is deliberately
+/// weaker than the `consent.exe` signal and is used only to decide whether to keep **looking**,
+/// never to conclude a handoff happened: if no successor appears, the session still ends with
+/// its true duration. `exited_at` is captured before the scan, so the recorded duration is
+/// unaffected either way -- the only cost is that a genuinely short session has its *end report*
+/// delayed by up to `HANDOFF_SCAN`.
+///
+/// This is why the earlier note here rejected session length as a tell. That objection was about
+/// using length to *classify* the exit, which would have mis-ended real short sessions; using it
+/// to extend the search does not.
+/// Sized from what a launcher stub actually is, not from what a short play session might be.
+/// For Honor's two stubs ran 4.8s and 9.0s; a handoff is over in seconds. The first cut used
+/// 60s, which made *every* sub-minute session wait out `HANDOFF_SCAN` before its end was
+/// reported -- a real 34-second session took 64 seconds to show its post-play notification.
+/// Fifteen seconds still covers a handoff comfortably while leaving ordinary short sessions
+/// ending instantly.
+const HANDOFF_SEGMENT_MAX: Duration = Duration::from_secs(15);
+const HANDOFF_SCAN: Duration = Duration::from_secs(30);
+
+/// How often the successor scan re-checks the process list.
+const SCAN_TICK: Duration = Duration::from_millis(300);
+
+/// How long the successor scan keeps looking for a same-named relaunch after a process exits.
+///
+/// Extracted from the scan loop so the decision table is explicit and testable without a clock:
+/// it takes elapsed durations rather than reading one. The rules, in priority order:
+///
+/// 1. A UAC prompt is on screen -- keep looking up to `UAC_PROMPT_WAIT_CAP`.
+/// 2. A prompt has been and gone -- keep looking for `POST_PROMPT_SCAN` after it closed.
+/// 3. The segment that just ended was short -- keep looking up to `HANDOFF_SCAN`
+///    (the anti-cheat/launcher handoff case).
+/// 4. Otherwise -- a normal exit after a real session. Stop immediately, adding no delay.
+struct RelaunchScan {
+    segment_was_short: bool,
+    prompt_seen: bool,
+    since_prompt_gone: Duration,
+}
+
+impl RelaunchScan {
+    /// `segment` is how long the process that just exited was running -- measured *before* the
+    /// scan starts, so the scan's own duration cannot count towards it.
+    fn new(segment: Duration) -> Self {
+        Self {
+            segment_was_short: segment < HANDOFF_SEGMENT_MAX,
+            prompt_seen: false,
+            since_prompt_gone: Duration::ZERO,
+        }
+    }
+
+    /// `true` to keep scanning. `tick` is how long the caller waits between calls.
+    fn keep_scanning(&mut self, prompt_active: bool, since_exit: Duration, tick: Duration) -> bool {
+        if prompt_active {
+            self.prompt_seen = true;
+            self.since_prompt_gone = Duration::ZERO;
+            return since_exit <= UAC_PROMPT_WAIT_CAP;
+        }
+        if self.prompt_seen {
+            let gone_for = self.since_prompt_gone;
+            self.since_prompt_gone += tick;
+            return gone_for <= POST_PROMPT_SCAN;
+        }
+        self.segment_was_short && since_exit <= HANDOFF_SCAN
+    }
+}
+
 /// True while a UAC prompt is on screen (consent.exe alive). Always false on non-Windows.
 fn uac_prompt_active(system: &System) -> bool {
     system
@@ -525,6 +694,132 @@ fn process_matches_name(process: &sysinfo::Process, process_name: &str) -> bool 
     exe_matches || process.name().to_string_lossy().eq_ignore_ascii_case(process_name)
 }
 
+/// The same test, additionally requiring the process to be *the same executable on disk* when
+/// the original's path is known.
+///
+/// A bare name match cannot tell two installs apart. Plenty of games ship a `launcher.exe`,
+/// `start.exe` or `game.exe`, so a session whose process exits while an unrelated game with an
+/// identically-named binary happens to be running would adopt that other game's process and keep
+/// billing time to the wrong entry — phase 3's "two same-named games cannot be silently
+/// attributed to one another".
+///
+/// Falls back to name-only when either path is unavailable: `exe()` can be empty for a process
+/// whose path cannot be read, and refusing to match then would break adoption entirely rather
+/// than making it stricter.
+fn process_matches_identity(
+    process: &sysinfo::Process,
+    process_name: &str,
+    expected_exe: Option<&Path>,
+) -> bool {
+    if !process_matches_name(process, process_name) {
+        return false;
+    }
+    match (expected_exe, process.exe()) {
+        (Some(expected), Some(actual)) => paths_equal(expected, actual),
+        _ => true,
+    }
+}
+
+/// Compares two executable paths for "same file on disk". Case-insensitive on Windows, where
+/// the same binary is routinely reported with different casing.
+fn paths_equal(a: &Path, b: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        a.as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&b.as_os_str().to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        a == b
+    }
+}
+
+/// How a process's exit was observed. Logged so that "LilyPad could not wait on this game" is a
+/// recorded fact with a cause, rather than something inferred from a generic early return.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WaitMechanism {
+    /// Waited on a real `SYNCHRONIZE` handle. The kernel signalled the exit, so this is
+    /// authoritative: no enumeration cross-check is needed or performed.
+    Handle,
+    /// No handle could be opened, so exit was inferred from the process disappearing from
+    /// enumeration. Carries why the handle was refused.
+    Polling { reason: String },
+}
+
+/// Opens a `SYNCHRONIZE` handle for `pid`, or reports why Windows refused.
+///
+/// A refusal here is the *only* sound basis for claiming a game cannot be waited on: it comes
+/// with a real Win32 error code. `ERROR_ACCESS_DENIED` is what an elevated or protected process
+/// actually produces. Previously the claim was inferred from `sysinfo`'s `wait()` returning
+/// while the process was still listed, which is far more often just exit teardown -- the process
+/// object outlives the last handle closing, so a correct wait routinely looks "untrustworthy"
+/// for a moment. That inference libelled ordinary games (see the Besiege/Fishlike entries in
+/// `PLAN.md`); this does not.
+#[cfg(windows)]
+fn open_wait_handle(pid: Pid) -> Result<windows::Win32::Foundation::HANDLE, String> {
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE};
+    unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, usize::from(pid) as u32) }.map_err(|e| {
+        match e.code().0 as u32 {
+            // 0x80070005 -- the genuine "elevated or protected" case.
+            0x8007_0005 => "access denied; the game is running elevated or is protected".to_string(),
+            // 0x80070057 -- the pid is already gone, so there is nothing to wait on.
+            0x8007_0057 => "the process no longer exists".to_string(),
+            _ => format!("{e}"),
+        }
+    })
+}
+
+/// Blocks on a `SYNCHRONIZE` handle until the process exits. `true` once it has.
+#[cfg(windows)]
+fn wait_on_handle(handle: windows::Win32::Foundation::HANDLE) -> bool {
+    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+    let result = unsafe { WaitForSingleObject(handle, INFINITE) };
+    unsafe { let _ = CloseHandle(handle); }
+    result == WAIT_OBJECT_0
+}
+
+/// Blocks until `pid` exits, reporting which mechanism established that.
+///
+/// Prefers a native handle wait; falls back to existence polling only when Windows actually
+/// refuses a handle, and says why. `DISCOVER_TIMEOUT` bounds the case of a pid that vanishes
+/// before it is ever observed.
+fn wait_for_process_exit(
+    system: &mut System,
+    pid: Pid,
+    process_name: &str,
+    expected_exe: Option<&Path>,
+    discover_timeout: Duration,
+) -> WaitMechanism {
+    #[cfg(windows)]
+    let polling_reason = match open_wait_handle(pid) {
+        Ok(handle) => {
+            if wait_on_handle(handle) {
+                return WaitMechanism::Handle;
+            }
+            "the handle wait failed".to_string()
+        }
+        Err(reason) => reason,
+    };
+    #[cfg(not(windows))]
+    let polling_reason = "not supported on this platform".to_string();
+
+    // Existence polling. The identity requirement doubles as the pid-reuse guard: a recycled
+    // pid belonging to an unrelated process must read as "our process exited".
+    let discover_start = Instant::now();
+    loop {
+        system.refresh_processes(ProcessesToUpdate::All);
+        match system.process(pid) {
+            Some(process) if process_matches_identity(process, process_name, expected_exe) => {}
+            // Never seen at all: give it a moment to appear before concluding it is gone.
+            None if discover_start.elapsed() <= discover_timeout => {}
+            _ => return WaitMechanism::Polling { reason: polling_reason },
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
 /// Blocks until the given PID *and any same-named successor process* have exited; returns the
 /// moment the last of them was seen exiting (so callers can exclude any trailing successor
 /// scan from the session's duration). Successor adoption is what keeps a UAC-elevation
@@ -534,89 +829,85 @@ pub fn wait_for_exit_with_relaunch_grace(initial_pid: Pid, process_name: &str) -
     const DISCOVER_TIMEOUT: Duration = Duration::from_secs(5);
     let mut system = System::new_all();
     let mut pid = initial_pid;
+
+    // The executable this session is actually tracking, read once while the process is still
+    // alive. Everything below matches against *this file on disk*, not merely its name, so a
+    // same-named binary from another game's install directory cannot be adopted as a successor
+    // or mistaken for our still-running process. `None` when the path cannot be read, in which
+    // case matching falls back to the name alone as before.
+    system.refresh_processes(ProcessesToUpdate::Some(&[initial_pid]));
+    let expected_exe = system
+        .process(initial_pid)
+        .and_then(|p| p.exe().map(|path| path.to_path_buf()));
+    if expected_exe.is_none() {
+        log::debug!(
+            "[LilyPad] {process_name} (pid {initial_pid:?}) has no readable executable path; \
+             successor matching falls back to the process name alone"
+        );
+    }
+
     loop {
-        // Wait for the current pid, with the discover timeout for pids that vanish before
-        // sysinfo ever sees them (same semantics the wait threads always had).
-        //
-        // `Process::wait()` itself cannot be trusted on its own: it needs process-handle
-        // rights that a UAC-elevated or anticheat-protected game (e.g. AC Shadows) never
-        // grants a non-elevated LilyPad, and in that case it *returns immediately* while the
-        // game is still running -- which is exactly how sessions got chopped into a churn of
-        // short segments (end -> 15s cooldown -> re-detect -> end -> ...). Process
-        // *enumeration* works regardless of handle rights, so every wait() return is verified
-        // against a fresh process list; if the pid is still there under the same name, fall
-        // back to plain existence polling.
-        let discover_start = Instant::now();
-        let mut warned_unwaitable = false;
-        loop {
-            system.refresh_processes(ProcessesToUpdate::All);
-            let Some(process) = system.process(pid) else {
-                if discover_start.elapsed() > DISCOVER_TIMEOUT {
-                    break;
-                }
-                std::thread::sleep(Duration::from_secs(1));
-                continue;
-            };
-            process.wait();
-            system.refresh_processes(ProcessesToUpdate::All);
-            // Same-name requirement doubles as the pid-reuse guard during polling: a recycled
-            // pid belonging to some unrelated process must read as "our process exited".
-            let still_running = system
-                .process(pid)
-                .is_some_and(|p| process_matches_name(p, process_name));
-            if !still_running {
-                break;
-            }
-            if !warned_unwaitable {
-                warned_unwaitable = true;
-                log::info!(
-                    "[LilyPad] {} (pid {:?}) can't be waited on directly (likely UAC-elevated or anticheat-protected) -- falling back to existence polling",
-                    process_name, pid
-                );
-            }
-            std::thread::sleep(Duration::from_secs(2));
+        // When *this* pid started being waited on. Reset per adopted successor, so "was the
+        // segment short?" asks about the process that just exited, not the whole session: a
+        // four-second launcher stub is short, the real game it hands off to is not.
+        let segment_started = Instant::now();
+
+        // A native handle wait is authoritative -- the kernel signals the exit -- so nothing is
+        // cross-checked against enumeration afterwards. That check is what used to produce the
+        // "can't be waited on directly (likely UAC-elevated or anticheat-protected)" line for
+        // perfectly ordinary games: a process object stays enumerable through teardown, so a
+        // correct wait looks untrustworthy for a moment at exit. Polling is now entered only
+        // when Windows actually refuses a handle, and the refusal is reported with its cause.
+        match wait_for_process_exit(&mut system, pid, process_name, expected_exe.as_deref(), DISCOVER_TIMEOUT) {
+            WaitMechanism::Handle => log::debug!(
+                "[LilyPad] {process_name} (pid {pid:?}) exit observed by handle wait"
+            ),
+            WaitMechanism::Polling { reason } => log::info!(
+                "[LilyPad] {process_name} (pid {pid:?}) could not be waited on ({reason}) \
+                 -- exit observed by existence polling instead"
+            ),
         }
         let exited_at = Instant::now();
 
         // Successor scan: does a same-named process (by resolved exe name or comm, mirroring
-        // the poll loop's own matching) exist to adopt this session? Ends after the first
-        // pass unless a UAC prompt is up (or just closed) — see UAC_PROMPT_WAIT_CAP's doc.
-        let mut prompt_seen = false;
-        let mut prompt_gone_at: Option<Instant> = None;
+        // the poll loop's own matching) exist to adopt this session? A long segment ending gets
+        // a single pass and no added delay. The scan is extended while a UAC prompt is up or
+        // just closed (see UAC_PROMPT_WAIT_CAP), and after a short segment, which is the
+        // anti-cheat launcher-handoff case (see HANDOFF_SEGMENT_MAX).
+        // Captured before the scan: using `segment_started.elapsed()` afterwards would fold the
+        // scan's own 30 seconds into the reported figure, and previously did.
+        let segment = segment_started.elapsed();
+        let mut scan = RelaunchScan::new(segment);
+        let segment_was_short = scan.segment_was_short;
         let successor = loop {
             system.refresh_processes(ProcessesToUpdate::All);
             let found = system.processes().iter().find_map(|(p2, proc)| {
                 if *p2 == pid || proc.thread_kind().is_some() {
                     return None;
                 }
-                process_matches_name(proc, process_name).then_some(*p2)
+                process_matches_identity(proc, process_name, expected_exe.as_deref()).then_some(*p2)
             });
             if found.is_some() {
                 break found;
             }
-            if uac_prompt_active(&system) {
-                prompt_seen = true;
-                prompt_gone_at = None;
-                if exited_at.elapsed() > UAC_PROMPT_WAIT_CAP {
-                    break None;
-                }
-            } else if !prompt_seen {
-                // No prompt involved: one scan is all a normal exit gets — no added delay.
+            if !scan.keep_scanning(uac_prompt_active(&system), exited_at.elapsed(), SCAN_TICK) {
                 break None;
-            } else {
-                // Prompt just closed (accepted or denied): scan briefly for the elevated copy.
-                let gone_at = *prompt_gone_at.get_or_insert_with(Instant::now);
-                if gone_at.elapsed() > POST_PROMPT_SCAN {
-                    break None;
-                }
             }
-            std::thread::sleep(Duration::from_millis(300));
+            std::thread::sleep(SCAN_TICK);
         };
+        let prompt_seen = scan.prompt_seen;
         match successor {
             Some(next) => {
+                let cause = if prompt_seen {
+                    "UAC elevation"
+                } else if segment_was_short {
+                    "launcher/anti-cheat handoff"
+                } else {
+                    "self-restart"
+                };
                 log::info!(
-                    "[LilyPad] {} (pid {:?}) exited but relaunched as pid {:?} (UAC elevation or self-restart) -- session continues",
-                    process_name, pid, next
+                    "[LilyPad] {} (pid {:?}) exited after {:?} but relaunched as pid {:?} ({cause}) -- session continues",
+                    process_name, pid, segment, next
                 );
                 pid = next;
             }
@@ -626,11 +917,28 @@ pub fn wait_for_exit_with_relaunch_grace(initial_pid: Pid, process_name: &str) -
                         "[LilyPad] {} (pid {:?}) exited; a UAC prompt came and went with no same-named relaunch -- ending session",
                         process_name, pid
                     );
+                } else if segment_was_short {
+                    log::info!(
+                        "[LilyPad] {} (pid {:?}) exited after {:?}; no relaunch within {:?} -- ending session",
+                        process_name, pid, segment, HANDOFF_SCAN
+                    );
                 }
                 return exited_at;
             }
         }
     }
+}
+
+/// Reads a process's OS start time (seconds since the Unix epoch).
+///
+/// Paired with the pid this identifies a process *instance*, not just a slot: Windows recycles
+/// pids, and a game closed and relaunched while LilyPad was down can land on the same one. The
+/// start time is what distinguishes "still the session we were tracking" from "a fresh launch
+/// that happens to look like it".
+pub fn process_start_time(pid: Pid) -> Option<u64> {
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::Some(&[pid]));
+    system.process(pid).map(|p| p.start_time())
 }
 
 /// Active session: we're currently tracking this process.
@@ -640,6 +948,13 @@ pub struct ActiveSession {
     pub process_name: String,
     #[allow(dead_code)]
     pub mapping: ProcessMapping,
+    /// The exact process being tracked. Read by frontends that need to record process identity
+    /// durably -- the session-start callback fires *after* this is stored, so it is readable
+    /// from there without widening `run_poll_loop`'s callback signature.
+    pub pid: Pid,
+    /// `pid`'s OS start time; see `process_start_time`. `None` when the process vanished before
+    /// it could be read, which only makes recovery fall back to matching by name.
+    pub started_at_secs: Option<u64>,
     pub started_at: Instant,
 }
 
@@ -659,290 +974,35 @@ fn run_wait_thread(
     });
 }
 
-/// Attempt to start a WMI-based process start monitor.
-/// Returns true if WMI started successfully, false if it should fall back to polling.
-#[allow(clippy::too_many_arguments)]
-#[cfg(windows)]
-fn try_run_wmi_watch(
-    config: Arc<RwLock<ProcessMapConfig>>,
-    current_session: Arc<RwLock<Option<ActiveSession>>>,
-    shutdown: Arc<AtomicBool>,
-    tx: mpsc::Sender<(String, ProcessMapping, f64)>,
-    on_session_started: Arc<dyn Fn(String, ProcessMapping) + Send + Sync + 'static>,
-    last_ended: Arc<RwLock<Option<(String, Instant)>>>,
-    force_stopped_process: Arc<RwLock<Option<String>>>,
-    installed_games: Arc<RwLock<Vec<InstalledGame>>>,
-    library_index: Arc<RwLock<LibraryIndex>>,
-    currently_tracking_unmapped: Arc<RwLock<HashSet<String>>>,
-    last_ended_unmapped: Arc<RwLock<HashMap<String, Instant>>>,
-    on_unmapped_session_ended: Arc<dyn Fn(String, String, String, f64, Option<ResolvedLibraryGame>) + Send + Sync + 'static>,
-    on_already_owned_game_needs_link: Arc<dyn Fn(ProcessMapping) + Send + Sync + 'static>,
-) -> bool {
-    use serde::Deserialize;
-    use wmi::{COMLibrary, WMIConnection};
 
-    // COM objects are not Send — create everything inside the thread.
-    // Use a channel to signal whether init succeeded so the caller can fall back to polling.
-    let (init_tx, init_rx) = mpsc::channel::<bool>();
-
-    std::thread::spawn(move || {
-        #[derive(Deserialize, Debug)]
-        #[serde(rename = "Win32_ProcessStartTrace")]
-        struct ProcessStartTrace {
-            #[serde(rename = "ProcessName")]
-            process_name: String,
-            #[serde(rename = "ProcessId")]
-            process_id: u32,
-        }
-
-        let com_lib = match COMLibrary::new() {
-            Ok(lib) => lib,
-            Err(_) => { let _ = init_tx.send(false); return; }
-        };
-        let wmi_con = match WMIConnection::new(com_lib) {
-            Ok(con) => con,
-            Err(_) => { let _ = init_tx.send(false); return; }
-        };
-        let iter = match wmi_con.notification::<ProcessStartTrace>() {
-            Ok(iter) => iter,
-            Err(_) => { let _ = init_tx.send(false); return; }
-        };
-
-        let _ = init_tx.send(true);
-
-        for result in iter {
-            if shutdown.load(Ordering::SeqCst) {
-                break;
-            }
-            let event = match result {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
-            // Collect all candidate mappings for this exe (may be multiple for javaw.exe etc.)
-            let (candidates, unmapped_detection_disabled): (Vec<ProcessMapping>, bool) = {
-                let cfg = config.read().unwrap();
-                (
-                    cfg.find_all_by_process(&event.process_name).into_iter().cloned().collect(),
-                    cfg.disable_unmapped_game_detection,
-                )
-            };
-
-            if candidates.is_empty() {
-                if unmapped_detection_disabled {
-                    continue;
-                }
-                let pid = Pid::from(event.process_id as usize);
-                let exe_path = {
-                    let mut sys = System::new();
-                    sys.refresh_processes(ProcessesToUpdate::Some(&[pid]));
-                    sys.process(pid).and_then(|p| p.exe().map(|p| p.to_path_buf()))
-                };
-                if let Some(mapping) = maybe_start_unmapped_tracking(
-                    exe_path.as_deref(),
-                    // WMI process-start events are Windows-only, where Proton/Wine doesn't
-                    // exist -- no command-line fallback is needed here.
-                    &[],
-                    pid,
-                    &installed_games,
-                    &library_index,
-                    &config,
-                    &currently_tracking_unmapped,
-                    &last_ended_unmapped,
-                    &on_unmapped_session_ended,
-                    &on_already_owned_game_needs_link,
-                ) {
-                    // Already-owned game just got auto-linked — start tracking this exact
-                    // launch now rather than waiting for a later one, since this WMI process-
-                    // start event won't fire again for it.
-                    let mut cur = current_session.write().unwrap();
-                    if cur.is_none() {
-                        let started_at = Instant::now();
-                        *cur = Some(ActiveSession {
-                            process_name: event.process_name.clone(),
-                            mapping: mapping.clone(),
-                            started_at,
-                        });
-                        drop(cur);
-                        on_session_started(event.process_name.clone(), mapping.clone());
-                        run_wait_thread(pid, event.process_name.clone(), mapping, started_at, tx.clone());
-                    }
-                }
-                continue;
-            }
-
-            let needs_title_check = candidates.iter().any(|m| m.title_filter.is_some());
-
-            if !needs_title_check {
-                // No title filter — start immediately (existing behaviour).
-                // Skip if this process just ended (brief launcher re-spawn cooldown).
-                {
-                    let le = last_ended.read().unwrap();
-                    if let Some((ref last_proc, last_time)) = *le {
-                        if last_proc.eq_ignore_ascii_case(&event.process_name)
-                            && last_time.elapsed() < POST_SESSION_COOLDOWN
-                        {
-                            continue;
-                        }
-                    }
-                }
-                // Skip if user force-stopped this process (still running)
-                {
-                    let fs = force_stopped_process.read().unwrap();
-                    if let Some(ref stopped) = *fs {
-                        if stopped.eq_ignore_ascii_case(&event.process_name) {
-                            continue;
-                        }
-                    }
-                }
-                let mapping = candidates.into_iter().next().unwrap();
-                let pid = Pid::from(event.process_id as usize);
-                let mapping = {
-                    let exe_path = {
-                        let mut sys = System::new();
-                        sys.refresh_processes(ProcessesToUpdate::Some(&[pid]));
-                        sys.process(pid).and_then(|p| p.exe().map(|p| p.to_path_buf()))
-                    };
-                    // WMI process-start events are Windows-only, where Proton/Wine doesn't
-                    // exist -- no command-line fallback is needed here, mirroring the
-                    // unmapped-detection call further up.
-                    match heal_orphaned_mapping(&mapping, exe_path.as_deref(), &[], &installed_games, &library_index.read().unwrap()) {
-                        Some(healed) => {
-                            log::info!(
-                                "[LilyPad] healed orphaned mapping for {}: {} #{} -> {} #{}",
-                                mapping.process, mapping.r#type, mapping.froglog_id, healed.r#type, healed.froglog_id
-                            );
-                            on_already_owned_game_needs_link(healed.clone());
-                            healed
-                        }
-                        None => mapping,
-                    }
-                };
-                if let Some(resolved) = check_mapped_game_needs_replay_prompt(&mapping, &library_index.read().unwrap()) {
-                    start_replay_prompt_tracking(
-                        pid,
-                        &mapping,
-                        resolved,
-                        &currently_tracking_unmapped,
-                        &last_ended_unmapped,
-                        &on_unmapped_session_ended,
-                    );
-                    continue;
-                }
-                let mut cur = current_session.write().unwrap();
-                if cur.is_some() {
-                    continue;
-                }
-                let started_at = Instant::now();
-                *cur = Some(ActiveSession {
-                    process_name: event.process_name.clone(),
-                    mapping: mapping.clone(),
-                    started_at,
-                });
-                drop(cur);
-                on_session_started(event.process_name.clone(), mapping.clone());
-                run_wait_thread(pid, event.process_name, mapping, started_at, tx.clone());
-            } else {
-                // At least one mapping has a title filter — poll for the window to appear.
-                let current_session = Arc::clone(&current_session);
-                let tx = tx.clone();
-                let on_session_started = Arc::clone(&on_session_started);
-                let process_name = event.process_name.clone();
-                let process_id = event.process_id;
-                let last_ended_clone = Arc::clone(&last_ended);
-                let force_stopped_clone = Arc::clone(&force_stopped_process);
-                let library_index_tf = Arc::clone(&library_index);
-                let installed_games_tf = Arc::clone(&installed_games);
-                let on_already_owned_tf = Arc::clone(&on_already_owned_game_needs_link);
-                let currently_tracking_unmapped_tf = Arc::clone(&currently_tracking_unmapped);
-                let last_ended_unmapped_tf = Arc::clone(&last_ended_unmapped);
-                let on_unmapped_session_ended_tf = Arc::clone(&on_unmapped_session_ended);
-
-                std::thread::spawn(move || {
-                    let pid = Pid::from(process_id as usize);
-                    let deadline = Instant::now() + Duration::from_secs(30);
-                    while Instant::now() < deadline {
-                        if current_session.read().unwrap().is_some() {
-                            return; // Another session started meanwhile.
-                        }
-                        // Skip if user force-stopped this process
-                        {
-                            let fs = force_stopped_clone.read().unwrap();
-                            if let Some(ref stopped) = *fs {
-                                if stopped.eq_ignore_ascii_case(&process_name) {
-                                    return;
-                                }
-                            }
-                        }
-                        // Respect cooldown from a recent session end for this process.
-                        {
-                            let le = last_ended_clone.read().unwrap();
-                            if let Some((ref last_proc, last_time)) = *le {
-                                if last_proc.eq_ignore_ascii_case(&process_name)
-                                    && last_time.elapsed() < POST_SESSION_COOLDOWN
-                                {
-                                    std::thread::sleep(Duration::from_millis(500));
-                                    continue;
-                                }
-                            }
-                        }
-                        let window_titles = get_window_titles_for_pid(process_id);
-                        if let Some(mapping) = pick_mapping(&candidates, &window_titles) {
-                            let exe_path = {
-                                let mut sys = System::new();
-                                sys.refresh_processes(ProcessesToUpdate::Some(&[pid]));
-                                sys.process(pid).and_then(|p| p.exe().map(|p| p.to_path_buf()))
-                            };
-                            let mapping = match heal_orphaned_mapping(&mapping, exe_path.as_deref(), &[], &installed_games_tf, &library_index_tf.read().unwrap()) {
-                                Some(healed) => {
-                                    log::info!(
-                                        "[LilyPad] healed orphaned mapping for {}: {} #{} -> {} #{}",
-                                        mapping.process, mapping.r#type, mapping.froglog_id, healed.r#type, healed.froglog_id
-                                    );
-                                    on_already_owned_tf(healed.clone());
-                                    healed
-                                }
-                                None => mapping,
-                            };
-                            if let Some(resolved) = check_mapped_game_needs_replay_prompt(&mapping, &library_index_tf.read().unwrap()) {
-                                start_replay_prompt_tracking(
-                                    pid,
-                                    &mapping,
-                                    resolved,
-                                    &currently_tracking_unmapped_tf,
-                                    &last_ended_unmapped_tf,
-                                    &on_unmapped_session_ended_tf,
-                                );
-                                return;
-                            }
-                            let mut cur = current_session.write().unwrap();
-                            if cur.is_some() {
-                                return;
-                            }
-                            let started_at = Instant::now();
-                            *cur = Some(ActiveSession {
-                                process_name: process_name.clone(),
-                                mapping: mapping.clone(),
-                                started_at,
-                            });
-                            drop(cur);
-                            on_session_started(process_name.clone(), mapping.clone());
-                            run_wait_thread(pid, process_name, mapping, started_at, tx);
-                            return;
-                        }
-                        std::thread::sleep(Duration::from_millis(500));
-                    }
-                });
-            }
-        }
-    });
-
-    // Wait up to 5 seconds for the thread to confirm WMI initialised successfully.
-    matches!(init_rx.recv_timeout(Duration::from_secs(5)), Ok(true))
-}
-
-/// Run the monitor. On Windows, tries WMI event-based start detection first;
-/// falls back to polling if WMI is unavailable. Exit detection always uses process.wait().
+/// Run the monitor: scan running processes every `poll_interval_secs` and start a session for
+/// anything that matches. Exit detection is per-session (see `wait_for_exit_with_relaunch_grace`).
+///
+/// The scan is also what catches a game that was already running when LilyPad started, which no
+/// process-start event could ever report.
+///
+/// # Overlapping games
+///
+/// **LilyPad tracks one mapped session at a time.** This is a supported constraint, not an
+/// oversight, and it is asymmetric in a way worth knowing:
+///
+/// - Only *mapped* sessions occupy `current_session`. While one is active the scan is skipped
+///   entirely, so neither a second mapped game nor any unmapped game is detected.
+/// - *Unmapped* sessions are keyed by appid in `currently_tracking_unmapped` and do not occupy
+///   `current_session`, so several can run concurrently, and a mapped game can still start while
+///   they do.
+///
+/// The cost is bounded rather than total. A game launched during an active session is not lost —
+/// the scan resumes the moment that session ends and picks it up on the next tick, so it is
+/// recorded as a partial session starting from then. What is lost is the overlap period.
+///
+/// Tracking concurrent mapped sessions was considered and rejected for now: `current_session` is
+/// a single slot that the tray title, force-stop, the heartbeat and the ledger's
+/// `active_ledger_id` all assume, so it is a structural change rather than a local one. The
+/// cheaper half-measure — scanning during a session purely to *report* the overlap — was also
+/// rejected: it would run a full process enumeration every `poll_interval_secs` throughout
+/// gameplay, spending CPU precisely when a game is using it, to produce a log line. The skip is
+/// logged at debug instead.
 ///
 /// `installed_games` and `library_index` are refreshed by the caller (Steam library scan +
 /// FrogLog games/wishlist fetch, respectively) and read live here, the same way `config` is.
@@ -968,6 +1028,8 @@ pub fn run_poll_loop(
     mut on_session_ended: impl FnMut(String, ProcessMapping, f64) + Send + 'static,
     installed_games: Arc<RwLock<Vec<InstalledGame>>>,
     library_index: Arc<RwLock<LibraryIndex>>,
+    refresh_library_index: impl Fn() -> bool + Send + Sync + 'static,
+    on_unmapped_session_started: impl Fn(UnmappedSessionStart) + Send + Sync + 'static,
     on_unmapped_session_ended: impl Fn(String, String, String, f64, Option<ResolvedLibraryGame>) + Send + Sync + 'static,
     on_already_owned_game_needs_link: impl Fn(ProcessMapping) + Send + Sync + 'static,
 ) {
@@ -987,36 +1049,22 @@ pub fn run_poll_loop(
     // misattributed as a second session of the same appid within POST_SESSION_COOLDOWN.
     let last_ended_unmapped: Arc<RwLock<HashMap<String, Instant>>> = Arc::new(RwLock::new(HashMap::new()));
 
-    // Wrap in Arc so it can be shared between WMI path and polling fallback.
+    // Wrap in Arc so the scan thread can share them.
     let on_started: Arc<dyn Fn(String, ProcessMapping) + Send + Sync + 'static> =
         Arc::new(on_session_started);
+    let refresh_library: Arc<dyn Fn() -> bool + Send + Sync + 'static> =
+        Arc::new(refresh_library_index);
+    let last_library_refresh: Arc<RwLock<HashMap<String, Instant>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+    let on_unmapped_started: Arc<dyn Fn(UnmappedSessionStart) + Send + Sync + 'static> =
+        Arc::new(on_unmapped_session_started);
     let on_unmapped_ended: Arc<dyn Fn(String, String, String, f64, Option<ResolvedLibraryGame>) + Send + Sync + 'static> =
         Arc::new(on_unmapped_session_ended);
     let on_already_owned: Arc<dyn Fn(ProcessMapping) + Send + Sync + 'static> =
         Arc::new(on_already_owned_game_needs_link);
 
-    #[cfg(windows)]
-    let wmi_ok = try_run_wmi_watch(
-        Arc::clone(&config),
-        Arc::clone(&current_session),
-        Arc::clone(&shutdown),
-        tx.clone(),
-        Arc::clone(&on_started),
-        Arc::clone(&last_ended),
-        Arc::clone(&force_stopped_process),
-        Arc::clone(&installed_games),
-        Arc::clone(&library_index),
-        Arc::clone(&currently_tracking_unmapped),
-        Arc::clone(&last_ended_unmapped),
-        Arc::clone(&on_unmapped_ended),
-        Arc::clone(&on_already_owned),
-    );
-
-    #[cfg(not(windows))]
-    let wmi_ok = false;
-
-    // Fall back to polling if WMI is unavailable.
-    if !wmi_ok {
+    log::info!("[LilyPad] scanning for game processes every {poll_interval_secs}s");
+    {
         let config = Arc::clone(&config);
         let current_session = Arc::clone(&current_session);
         let shutdown = Arc::clone(&shutdown);
@@ -1027,6 +1075,9 @@ pub fn run_poll_loop(
         let library_index_poll = Arc::clone(&library_index);
         let currently_tracking_unmapped_poll = Arc::clone(&currently_tracking_unmapped);
         let last_ended_unmapped_poll = Arc::clone(&last_ended_unmapped);
+        let refresh_library_poll = Arc::clone(&refresh_library);
+        let last_library_refresh_poll = Arc::clone(&last_library_refresh);
+        let on_unmapped_started_poll = Arc::clone(&on_unmapped_started);
         let on_unmapped_ended_poll = Arc::clone(&on_unmapped_ended);
         let on_already_owned_poll = Arc::clone(&on_already_owned);
 
@@ -1040,9 +1091,12 @@ pub fn run_poll_loop(
                     // read guard across that call would deadlock the thread against itself.
                     let cfg = config.read().unwrap().clone();
                     let mut cur = current_session.write().unwrap();
+                    // OVERLAPPING GAMES: LilyPad tracks one *mapped* session at a time, by
+                    // design. See `run_poll_loop`'s docs for the full policy and its cost.
                     if cur.is_some() {
                         log::debug!(
-                            "[LilyPad] poll tick skipped: current_session already occupied by {:?}",
+                            "[LilyPad] scan skipped: already tracking {:?}; a second mapped game \
+                             will be picked up when this session ends",
                             cur.as_ref().map(|s| (&s.process_name, &s.mapping.title, s.started_at.elapsed()))
                         );
                         None
@@ -1104,8 +1158,14 @@ pub fn run_poll_loop(
                             let (name, candidates): (String, Vec<ProcessMapping>) = {
                                 let mut result = None;
                                 for candidate in exe_name.iter().chain(std::iter::once(&comm_name)) {
-                                    let matches: Vec<ProcessMapping> =
-                                        cfg.find_all_by_process(candidate).into_iter().cloned().collect();
+                                    // The path disambiguates same-named binaries from different
+                                    // installs; see `find_all_for_process` for how it degrades
+                                    // when unrecorded or stale.
+                                    let matches: Vec<ProcessMapping> = cfg
+                                        .find_all_for_process(candidate, p.exe())
+                                        .into_iter()
+                                        .cloned()
+                                        .collect();
                                     if !matches.is_empty() {
                                         result = Some((candidate.clone(), matches));
                                         break;
@@ -1135,6 +1195,9 @@ pub fn run_poll_loop(
                                         &config,
                                         &currently_tracking_unmapped_poll,
                                         &last_ended_unmapped_poll,
+                                        &last_library_refresh_poll,
+                                        &refresh_library_poll,
+                                        &on_unmapped_started_poll,
                                         &on_unmapped_ended_poll,
                                         &on_already_owned_poll,
                                     ) {
@@ -1144,6 +1207,8 @@ pub fn run_poll_loop(
                                         *cur = Some(ActiveSession {
                                             process_name: name.clone(),
                                             mapping: mapping.clone(),
+                                            pid: *pid,
+                                            started_at_secs: Some(p.start_time()),
                                             started_at: Instant::now(),
                                         });
                                         found = Some((*pid, name, mapping));
@@ -1200,6 +1265,7 @@ pub fn run_poll_loop(
                                         resolved,
                                         &currently_tracking_unmapped_poll,
                                         &last_ended_unmapped_poll,
+                                        &on_unmapped_started_poll,
                                         &on_unmapped_ended_poll,
                                     );
                                     continue 'proc_scan;
@@ -1207,6 +1273,8 @@ pub fn run_poll_loop(
                                 *cur = Some(ActiveSession {
                                     process_name: name.clone(),
                                     mapping: mapping.clone(),
+                                    pid: *pid,
+                                    started_at_secs: Some(p.start_time()),
                                     started_at: Instant::now(),
                                 });
                                 found = Some((*pid, name, mapping));
@@ -1262,6 +1330,173 @@ pub fn run_poll_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spawns something that stays alive until killed, so a wait can be observed against it.
+    #[cfg(windows)]
+    fn spawn_long_lived() -> std::process::Child {
+        std::process::Command::new("cmd")
+            .args(["/C", "ping -n 30 127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("could not spawn a test process")
+    }
+
+    /// The regression this replaced: an ordinary game's exit was being reported as "can't be
+    /// waited on directly (likely UAC-elevated or anticheat-protected)", because a correct wait
+    /// was cross-checked against enumeration and a process stays enumerable through teardown.
+    /// A normal process must resolve by handle wait, never by polling.
+    #[cfg(windows)]
+    #[test]
+    fn an_ordinary_process_exit_is_observed_by_handle_wait_not_polling() {
+        let mut child = spawn_long_lived();
+        let pid = Pid::from(child.id() as usize);
+
+        let waiter = std::thread::spawn(move || {
+            let mut system = System::new_all();
+            wait_for_process_exit(&mut system, pid, "cmd.exe", None, Duration::from_secs(5))
+        });
+
+        // Let the waiter open its handle and block before the process goes away.
+        std::thread::sleep(Duration::from_millis(500));
+        child.kill().expect("could not kill the test process");
+        let _ = child.wait();
+
+        assert_eq!(waiter.join().unwrap(), WaitMechanism::Handle);
+    }
+
+    /// A refusal must carry a real reason, so "this game cannot be waited on" is a recorded
+    /// fact rather than an inference from a generic early return.
+    #[cfg(windows)]
+    #[test]
+    fn a_refused_handle_reports_why() {
+        let mut child = spawn_long_lived();
+        let pid = Pid::from(child.id() as usize);
+        child.kill().unwrap();
+        // Reaped, so the pid is genuinely gone rather than a zombie.
+        let _ = child.wait();
+
+        match open_wait_handle(pid) {
+            Err(reason) => assert!(
+                reason.contains("no longer exists") || reason.contains("access denied"),
+                "expected a named cause, got: {reason}"
+            ),
+            // Pid reuse inside the test window is possible but vanishingly unlikely; if it
+            // happens the handle is for an unrelated process and proves nothing either way.
+            Ok(handle) => {
+                use windows::Win32::Foundation::CloseHandle;
+                unsafe { let _ = CloseHandle(handle); }
+            }
+        }
+    }
+
+    const NO_PROMPT: bool = false;
+    const PROMPT_UP: bool = true;
+
+    /// The For Honor case, with the timings straight from the log that reported it: the stub
+    /// ran ~4s, exited, and the real `forhonor.exe` appeared ~16s later. The old single-pass
+    /// scan stopped at the instant of exit, producing a junk 4-second session plus a separate
+    /// real one.
+    #[test]
+    fn a_short_segment_keeps_looking_long_enough_to_catch_an_anti_cheat_relaunch() {
+        // For Honor's observed stub length.
+        let mut scan = RelaunchScan::new(Duration::from_millis(4_815));
+        // Still looking across the whole 16-second gap.
+        for secs in [0, 1, 5, 10, 16] {
+            assert!(
+                scan.keep_scanning(NO_PROMPT, Duration::from_secs(secs), SCAN_TICK),
+                "gave up {secs}s after exit, before the relaunch appeared"
+            );
+        }
+        // But bounded: it does not wait for ever on a game that really did just close.
+        assert!(!scan.keep_scanning(NO_PROMPT, HANDOFF_SCAN + Duration::from_secs(1), SCAN_TICK));
+    }
+
+    /// The property the original single-pass design was protecting, and which must survive:
+    /// a real session ending adds no delay at all.
+    ///
+    /// The 34-second case is the regression that made this a test rather than a comment: with
+    /// `HANDOFF_SEGMENT_MAX` at 60s, an ordinary half-minute session sat through the whole
+    /// 30-second scan before its post-play notification appeared.
+    #[test]
+    fn a_normal_exit_after_a_real_session_stops_immediately() {
+        for segment in [
+            HANDOFF_SEGMENT_MAX,
+            Duration::from_secs(34),
+            Duration::from_secs(64),
+            Duration::from_secs(3_600),
+        ] {
+            let mut scan = RelaunchScan::new(segment);
+            assert!(
+                !scan.keep_scanning(NO_PROMPT, Duration::ZERO, SCAN_TICK),
+                "a {segment:?} session should end with no added delay"
+            );
+        }
+    }
+
+    /// The boundary itself: a launcher stub is seconds long, a real session is not.
+    #[test]
+    fn only_launcher_length_segments_count_as_short() {
+        assert!(RelaunchScan::new(Duration::from_secs(9)).segment_was_short);
+        assert!(!RelaunchScan::new(Duration::from_secs(20)).segment_was_short);
+    }
+
+    #[test]
+    fn a_uac_prompt_extends_the_scan_and_outlives_a_short_segment_window() {
+        let mut scan = RelaunchScan::new(Duration::from_secs(600));
+        // A prompt on screen keeps the scan alive well past HANDOFF_SCAN...
+        assert!(scan.keep_scanning(PROMPT_UP, HANDOFF_SCAN + Duration::from_secs(30), SCAN_TICK));
+        assert!(scan.prompt_seen);
+        // ...but not past the cap.
+        assert!(!scan.keep_scanning(PROMPT_UP, UAC_PROMPT_WAIT_CAP + Duration::from_secs(1), SCAN_TICK));
+    }
+
+    #[test]
+    fn a_closed_prompt_gets_a_brief_scan_then_stops() {
+        let mut scan = RelaunchScan::new(Duration::from_secs(600));
+        assert!(scan.keep_scanning(PROMPT_UP, Duration::from_secs(1), SCAN_TICK));
+        // Prompt gone: keep looking briefly for the elevated copy, then stop. Measured rather
+        // than counted, so the assertion stays true if SCAN_TICK changes.
+        let mut scanned_for = Duration::ZERO;
+        while scan.keep_scanning(NO_PROMPT, Duration::from_secs(2), SCAN_TICK) {
+            scanned_for += SCAN_TICK;
+            assert!(scanned_for < POST_PROMPT_SCAN * 2, "post-prompt scan did not terminate");
+        }
+        assert!(
+            scanned_for >= POST_PROMPT_SCAN,
+            "stopped after {scanned_for:?}, before the {POST_PROMPT_SCAN:?} post-prompt window"
+        );
+    }
+
+    /// A prompt reappearing (a second elevation, or one redrawn on the secure desktop) resets
+    /// the post-prompt window rather than letting the earlier one expire mid-wait.
+    #[test]
+    fn a_reappearing_prompt_resets_the_post_prompt_window() {
+        let mut scan = RelaunchScan::new(Duration::from_secs(600));
+        assert!(scan.keep_scanning(PROMPT_UP, Duration::from_secs(1), SCAN_TICK));
+        assert!(scan.keep_scanning(NO_PROMPT, Duration::from_secs(2), SCAN_TICK));
+        assert!(scan.keep_scanning(PROMPT_UP, Duration::from_secs(3), SCAN_TICK));
+        assert_eq!(scan.since_prompt_gone, Duration::ZERO);
+        assert!(scan.keep_scanning(NO_PROMPT, Duration::from_secs(4), SCAN_TICK));
+    }
+
+    /// Phase 3's "two same-named games cannot be silently attributed to one another". Plenty of
+    /// games ship a `launcher.exe` or `game.exe`; adopting one as another's successor would keep
+    /// billing time to the wrong library entry.
+    #[test]
+    fn two_installs_sharing_an_executable_name_are_not_the_same_process() {
+        let ours = Path::new(r"D:\Games\Celeste\game.exe");
+        let theirs = Path::new(r"D:\Games\Hollow Knight\game.exe");
+        assert!(!paths_equal(ours, theirs), "different installs must not compare equal");
+
+        // Windows reports the same binary with inconsistent casing; that must still match.
+        let same_shouted = Path::new(r"D:\GAMES\Celeste\GAME.EXE");
+        #[cfg(windows)]
+        assert!(paths_equal(ours, same_shouted), "casing must not split one install in two");
+        #[cfg(not(windows))]
+        let _ = same_shouted;
+
+        assert!(paths_equal(ours, Path::new(r"D:\Games\Celeste\game.exe")));
+    }
 
     #[test]
     fn filters_known_helper_processes() {
@@ -1330,6 +1565,7 @@ mod tests {
             froglog_id: 5, // the old, now-deleted `games` id
             title: Some("Destiny 2".to_string()),
             title_filter: None,
+            exe_path: None,
         };
         let installed_games: Arc<RwLock<Vec<InstalledGame>>> = Arc::new(RwLock::new(vec![InstalledGame {
             appid: "1085660".to_string(),
@@ -1356,6 +1592,7 @@ mod tests {
             froglog_id: 5,
             title: Some("Destiny 2".to_string()),
             title_filter: None,
+            exe_path: None,
         };
         let installed_games: Arc<RwLock<Vec<InstalledGame>>> = Arc::new(RwLock::new(vec![]));
         assert!(heal_orphaned_mapping(&mapping, None, &[], &installed_games, &library_index).is_none());
@@ -1372,6 +1609,7 @@ mod tests {
             froglog_id: 99,
             title: Some("Destiny 2".to_string()),
             title_filter: None,
+            exe_path: None,
         };
         let installed_games: Arc<RwLock<Vec<InstalledGame>>> = Arc::new(RwLock::new(vec![]));
         assert!(heal_orphaned_mapping(&mapping, None, &[], &installed_games, &library_index).is_none());
@@ -1388,6 +1626,7 @@ mod tests {
             froglog_id: 5,
             title: Some("Deleted Game".to_string()),
             title_filter: None,
+            exe_path: None,
         };
         let installed_games: Arc<RwLock<Vec<InstalledGame>>> = Arc::new(RwLock::new(vec![]));
         assert!(heal_orphaned_mapping(&mapping, None, &[], &installed_games, &library_index).is_none());

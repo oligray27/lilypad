@@ -1,6 +1,6 @@
 [package]
 name = "lilypad"
-version = "0.5.15"
+version = "0.6.0"
 description = "Froglog game time tracker - system tray app"
 edition = "2021"
 rust-version = "1.70"
@@ -39,6 +39,13 @@ windows = { version = "0.58", features = [
     "UI_Notifications",
     "Data_Xml_Dom",
     "Foundation",
+    # Named mutex + message box for the single-instance guard: GTK gets this free from its
+    # application identity, Windows has no equivalent. See `claim_single_instance`.
+    "Win32_Foundation",
+    # CreateMutexW is gated behind Win32_Security for its SECURITY_ATTRIBUTES parameter.
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

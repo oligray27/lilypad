@@ -104,8 +104,12 @@ pub fn build(
     toggles_grid.set_column_spacing(24);
     toggles_grid.set_row_spacing(8);
     toggles_grid.set_column_homogeneous(true);
-    let auto_regular = gtk4::CheckButton::with_label("Auto-submit regular game sessions");
-    let auto_session = gtk4::CheckButton::with_label("Auto-submit session-tracked game sessions");
+    // Named after what the game is and what actually gets sent, not after the internal
+    // "regular"/"session"/"live" type names. The first deliberately says play time rather than
+    // sessions: a game without session tracking has no sessions to log, so that submission only
+    // adds hours to the game's total. Kept in step with the Tauri frontend's own copies.
+    let auto_regular = gtk4::CheckButton::with_label("Auto-submit play time to games without session tracking");
+    let auto_session = gtk4::CheckButton::with_label("Auto-submit sessions to games with session tracking");
     let auto_live = gtk4::CheckButton::with_label("Auto-submit live service sessions");
     let share_now_playing = gtk4::CheckButton::with_label("Enable online presence on FrogLog");
     let detect_unmapped = gtk4::CheckButton::with_label("Detect games not in your FrogLog library");

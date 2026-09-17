@@ -16,6 +16,16 @@ pub struct ProcessMapping {
     /// When set, the process is only tracked if a window with a matching title is found.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title_filter: Option<String>,
+    /// Full path of the executable this mapping was last seen running as.
+    ///
+    /// `process` alone is a basename, which cannot tell two installs apart — plenty of games ship
+    /// a `game.exe` or `launcher.exe`. This is recorded the first time the mapping tracks a
+    /// session and then used to disambiguate (see `find_all_for_process`).
+    ///
+    /// `None` for mappings made before this existed and for any not yet seen running; matching
+    /// falls back to the basename in that case, so nothing breaks while it is unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exe_path: Option<String>,
 }
 
 /// A root folder the user has pointed LilyPad at for non-Steam games — every immediate
@@ -49,6 +59,13 @@ pub struct ProcessMapConfig {
     pub auto_submit_live: bool,
     #[serde(default)]
     pub auto_submit_session: bool,
+    // `unattended_mode` (plus the two toggles it saved and restored) lived here. It forced
+    // auto-submit on and silenced every notification, as a workaround for a Windows install
+    // with no notification component: submission used to wait on the toast reporting dismissal,
+    // so a machine that could not show toasts filed good sessions onto the pending queue as
+    // failures. Submission no longer depends on the notification system at all (see
+    // `auto_submit`), so the workaround is gone. `ProcessMapConfig` does not deny unknown
+    // fields, so existing config files carrying these keys still load; the keys are ignored.
     #[serde(default)]
     pub share_now_playing: bool,
     /// When true, LilyPad never scans unmapped processes against installed Steam games /
@@ -113,15 +130,117 @@ impl ProcessMapConfig {
     }
 
     /// Find all mappings for a process name (multiple games can share the same exe, e.g. javaw.exe).
+    ///
+    /// Exact, case-insensitive. This used to also accept a *suffix* match
+    /// (`process_name.ends_with(m.process)`), which silently attributed unrelated games to each
+    /// other: a mapping for `game.exe` matched a running `MyGame.exe`, and one for `e.exe` matched
+    /// everything. Callers only ever pass a basename — either `exe().file_name()` or the reported
+    /// comm name — so there was no path prefix for a suffix rule to strip.
+    ///
+    /// It arrived with the Linux support commit, where the plausible motivation is `/proc/pid/comm`
+    /// being truncated to 15 characters for Proton-hosted games. A suffix test does not help
+    /// there either: a truncated name shares a *prefix* with the real one, not a suffix. So this
+    /// loses no working case.
     pub fn find_all_by_process(&self, process_name: &str) -> Vec<&ProcessMapping> {
-        let needle = process_name.to_lowercase();
-        self.mappings
+        self.find_all_for_process(process_name, None)
+    }
+
+    /// Find the mappings for a running process, using its executable path to disambiguate
+    /// same-named binaries from different installs.
+    ///
+    /// The path is preferred but not absolute, because making it absolute would silently stop
+    /// tracking a game whose install moved — a Steam library moved to another drive would break
+    /// every mapping at once, with no error. The rules, in order:
+    ///
+    /// 1. A mapping whose recorded path *is* this executable wins outright.
+    /// 2. Otherwise mappings with no recorded path are used — legacy entries, and ones not yet
+    ///    seen running. They get their path filled in the first time they track a session.
+    /// 3. Otherwise every candidate names a different file. If those files are gone from disk the
+    ///    install moved, so those mappings are matched anyway and will re-record their new path.
+    ///    If they still exist, this really is a different game that happens to share a filename,
+    ///    and nothing matches.
+    ///
+    /// The disk check only runs in case 3, which is rare, so the common path costs no I/O.
+    pub fn find_all_for_process(
+        &self,
+        process_name: &str,
+        exe_path: Option<&std::path::Path>,
+    ) -> Vec<&ProcessMapping> {
+        let by_name: Vec<&ProcessMapping> = self
+            .mappings
             .iter()
+            .filter(|m| m.process.eq_ignore_ascii_case(process_name))
+            .collect();
+        let Some(actual) = exe_path else {
+            return by_name;
+        };
+
+        let exact: Vec<&ProcessMapping> = by_name
+            .iter()
+            .copied()
+            .filter(|m| m.exe_path.as_deref().is_some_and(|p| same_path(p, actual)))
+            .collect();
+        if !exact.is_empty() {
+            return exact;
+        }
+
+        let unrecorded: Vec<&ProcessMapping> = by_name
+            .iter()
+            .copied()
+            .filter(|m| m.exe_path.is_none())
+            .collect();
+        if !unrecorded.is_empty() {
+            return unrecorded;
+        }
+
+        by_name
+            .into_iter()
             .filter(|m| {
-                m.process.to_lowercase() == needle
-                    || process_name.to_lowercase().ends_with(&m.process.to_lowercase())
+                m.exe_path
+                    .as_deref()
+                    .is_some_and(|p| !std::path::Path::new(p).exists())
             })
             .collect()
+    }
+
+    /// Records the executable a mapping was seen running as, so it can be told apart from a
+    /// same-named binary elsewhere. Returns whether anything changed, so the caller knows to save.
+    ///
+    /// Also updates a path that has gone stale, which is how a moved install heals itself.
+    pub fn record_mapping_exe_path(
+        &mut self,
+        process_name: &str,
+        froglog_id: i32,
+        game_type: &str,
+        exe_path: &std::path::Path,
+    ) -> bool {
+        let Some(mapping) = self.mappings.iter_mut().find(|m| {
+            m.process.eq_ignore_ascii_case(process_name)
+                && m.froglog_id == froglog_id
+                && m.r#type.eq_ignore_ascii_case(game_type)
+        }) else {
+            return false;
+        };
+        let path = exe_path.to_string_lossy().into_owned();
+        if mapping.exe_path.as_deref().is_some_and(|p| same_path(p, exe_path)) {
+            return false;
+        }
+        mapping.exe_path = Some(path);
+        true
+    }
+}
+
+/// Case-insensitive on Windows, where the same binary is routinely reported with different
+/// casing; exact elsewhere.
+fn same_path(recorded: &str, actual: &std::path::Path) -> bool {
+    let actual = actual.to_string_lossy();
+    #[cfg(windows)]
+    {
+        recorded.eq_ignore_ascii_case(&actual)
+    }
+    #[cfg(not(windows))]
+    {
+        recorded == actual
     }
 }
 
@@ -381,6 +500,7 @@ pub fn link_process_mapping(
         froglog_id,
         title,
         title_filter: existing_title_filter,
+        exe_path: None,
     });
     map.save_to(&process_map_path_for_auth(auth)).map_err(|e| e.to_string())?;
     *process_map_arc.write().unwrap() = map;
@@ -419,6 +539,108 @@ impl AuthConfig {
 mod tests {
     use super::*;
 
+    /// The suffix rule this replaced would attribute one game's launch to another's mapping,
+    /// silently and permanently — `game.exe` matched `MyGame.exe`, and `e.exe` matched everything.
+    #[test]
+    fn a_mapping_matches_only_its_own_executable() {
+        let cfg = ProcessMapConfig {
+            mappings: vec![
+                mapping("game.exe", "session", 1, None),
+                mapping("Fishlike.exe", "session", 2, None),
+            ],
+            ..Default::default()
+        };
+
+        // Exact, and case-insensitive because Windows reports casing inconsistently.
+        assert_eq!(cfg.find_all_by_process("game.exe").len(), 1);
+        assert_eq!(cfg.find_all_by_process("GAME.EXE").len(), 1);
+        assert_eq!(cfg.find_all_by_process("fishlike.exe")[0].froglog_id, 2);
+
+        // A different game whose name merely ends with a mapped one must not match.
+        assert!(cfg.find_all_by_process("MyGame.exe").is_empty());
+        assert!(cfg.find_all_by_process("NotFishlike.exe").is_empty());
+        assert!(cfg.find_all_by_process("othergame.exe").is_empty());
+    }
+
+    /// The point of recording a path: two installs shipping `game.exe` are different games, and a
+    /// basename alone cannot tell them apart.
+    #[test]
+    fn a_recorded_path_tells_two_installs_with_the_same_executable_name_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let celeste = dir.path().join("Celeste").join("game.exe");
+        let hollow = dir.path().join("Hollow Knight").join("game.exe");
+        for p in [&celeste, &hollow] {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"x").unwrap();
+        }
+        let mut a = mapping("game.exe", "session", 1, None);
+        a.exe_path = Some(celeste.to_string_lossy().into_owned());
+        let mut b = mapping("game.exe", "session", 2, None);
+        b.exe_path = Some(hollow.to_string_lossy().into_owned());
+        let cfg = ProcessMapConfig { mappings: vec![a, b], ..Default::default() };
+
+        let matched = cfg.find_all_for_process("game.exe", Some(&celeste));
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].froglog_id, 1, "matched the wrong install");
+        assert_eq!(cfg.find_all_for_process("game.exe", Some(&hollow))[0].froglog_id, 2);
+
+        // A third, unmapped game called game.exe matches neither -- both recorded paths still
+        // exist, so this is genuinely a different binary rather than a moved install.
+        let stranger = dir.path().join("Other").join("game.exe");
+        std::fs::create_dir_all(stranger.parent().unwrap()).unwrap();
+        std::fs::write(&stranger, b"x").unwrap();
+        assert!(cfg.find_all_for_process("game.exe", Some(&stranger)).is_empty());
+    }
+
+    /// Making the path authoritative would silently stop tracking a game whose install moved --
+    /// a Steam library moved to another drive would break every mapping at once, with no error.
+    /// A recorded path that no longer exists is treated as stale rather than as a mismatch.
+    #[test]
+    fn a_mapping_whose_install_moved_still_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let moved_to = dir.path().join("NewDrive").join("game.exe");
+        std::fs::create_dir_all(moved_to.parent().unwrap()).unwrap();
+        std::fs::write(&moved_to, b"x").unwrap();
+
+        let mut m = mapping("game.exe", "session", 1, None);
+        m.exe_path = Some(dir.path().join("GoneDrive").join("game.exe").to_string_lossy().into_owned());
+        let mut cfg = ProcessMapConfig { mappings: vec![m], ..Default::default() };
+
+        let matched = cfg.find_all_for_process("game.exe", Some(&moved_to));
+        assert_eq!(matched.len(), 1, "a moved install must not silently stop being tracked");
+
+        // ...and the next session re-pins it, so the stale path does not linger.
+        assert!(cfg.record_mapping_exe_path("game.exe", 1, "session", &moved_to));
+        assert_eq!(cfg.mappings[0].exe_path.as_deref(), Some(moved_to.to_string_lossy().as_ref()));
+        assert!(!cfg.record_mapping_exe_path("game.exe", 1, "session", &moved_to), "no rewrite needed");
+    }
+
+    /// Mappings made before the field existed have no path and must keep working untouched.
+    #[test]
+    fn a_mapping_with_no_recorded_path_still_matches_on_name_alone() {
+        let cfg = ProcessMapConfig {
+            mappings: vec![mapping("game.exe", "session", 1, None)],
+            ..Default::default()
+        };
+        let anywhere = std::path::Path::new(r"D:\Anywhere\game.exe");
+        assert_eq!(cfg.find_all_for_process("game.exe", Some(anywhere)).len(), 1);
+        assert_eq!(cfg.find_all_for_process("game.exe", None).len(), 1);
+    }
+
+    /// Several games can legitimately share one executable (modpacks under javaw.exe), which is
+    /// why this returns a list and the caller disambiguates by window title.
+    #[test]
+    fn one_executable_can_still_serve_several_mappings() {
+        let cfg = ProcessMapConfig {
+            mappings: vec![
+                mapping("javaw.exe", "session", 1, Some("Modpack A")),
+                mapping("javaw.exe", "session", 2, Some("Modpack B")),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(cfg.find_all_by_process("javaw.exe").len(), 2);
+    }
+
     fn mapping(process: &str, game_type: &str, froglog_id: i32, title_filter: Option<&str>) -> ProcessMapping {
         ProcessMapping {
             process: process.to_string(),
@@ -426,6 +648,7 @@ mod tests {
             froglog_id,
             title: None,
             title_filter: title_filter.map(|s| s.to_string()),
+            exe_path: None,
         }
     }
 
