@@ -2722,6 +2722,7 @@ dependencies = [
  "serde_json",
  "sysinfo",
  "tempfile",
+ "tokio",
  "uuid",
  "windows 0.58.0",
  "x11rb",
@@ -2746,6 +2747,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sysinfo",
+ "tokio",
 ]
 
 [[package]]

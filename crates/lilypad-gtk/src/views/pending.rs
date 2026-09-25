@@ -1,12 +1,16 @@
-use crate::state::{AppState, DEFAULT_API_URL};
+use crate::state::AppState;
 use adw::prelude::*;
-use lilypad_core::api::FroglogClient;
-use lilypad_core::config::{load_pending_sessions, save_pending_sessions, PendingSession};
+use lilypad_core::config::PendingSession;
+use lilypad_core::session_store::UnownedRecord;
 use std::cell::RefCell;
 use std::rc::Rc;
 
 /// Builds the pending-submissions queue view. Returns the widget and a
 /// `reload` closure the caller should invoke each time the view is shown.
+///
+/// Rows are ledger records owned by the logged-in account. Records imported from a pre-ledger
+/// build have no owner and are listed separately, to be assigned or discarded explicitly --
+/// never submitted merely because someone happens to be logged in.
 pub fn build(state: AppState) -> (gtk4::Widget, Rc<dyn Fn()>) {
     let container = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
     container.set_margin_top(18);
@@ -20,27 +24,51 @@ pub fn build(state: AppState) -> (gtk4::Widget, Rc<dyn Fn()>) {
     container.append(&title);
 
     let desc = gtk4::Label::new(Some(
-        "These sessions failed to submit. Log out and back in from the tray to refresh your \
-         token, or check your connection, then retry.",
+        "These sessions have not reached FrogLog yet. Log out and back in from the tray to \
+         refresh your token, or check your connection, then retry.",
     ));
     desc.set_wrap(true);
     desc.set_halign(gtk4::Align::Start);
     desc.add_css_class("dim-label");
     container.append(&desc);
 
-    let empty_label = gtk4::Label::new(Some("No pending submissions."));
-    empty_label.add_css_class("dim-label");
-    empty_label.set_margin_top(24);
-    empty_label.set_visible(false);
-    container.append(&empty_label);
+    // Shown instead of the list when the queue cannot be read: an unreadable store must never
+    // look like an empty one.
+    let status_label = gtk4::Label::new(None);
+    status_label.set_wrap(true);
+    status_label.set_halign(gtk4::Align::Start);
+    status_label.set_margin_top(12);
+    status_label.set_visible(false);
+    container.append(&status_label);
 
     let list_box = gtk4::ListBox::new();
     list_box.set_selection_mode(gtk4::SelectionMode::None);
     list_box.add_css_class("boxed-list");
+
+    let unowned_title = gtk4::Label::new(Some("From an earlier LilyPad version"));
+    unowned_title.add_css_class("heading");
+    unowned_title.set_halign(gtk4::Align::Start);
+    unowned_title.set_margin_top(12);
+    let unowned_desc = gtk4::Label::new(Some(
+        "Older versions did not record which account these belong to. Assign each one to the \
+         account you are logged in as, or discard it.",
+    ));
+    unowned_desc.set_wrap(true);
+    unowned_desc.set_halign(gtk4::Align::Start);
+    unowned_desc.add_css_class("dim-label");
+    let unowned_list = gtk4::ListBox::new();
+    unowned_list.set_selection_mode(gtk4::SelectionMode::None);
+    unowned_list.add_css_class("boxed-list");
+
+    let content = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+    content.append(&list_box);
+    content.append(&unowned_title);
+    content.append(&unowned_desc);
+    content.append(&unowned_list);
     let scroller = gtk4::ScrolledWindow::builder()
         .hscrollbar_policy(gtk4::PolicyType::Never)
         .vexpand(true)
-        .child(&list_box)
+        .child(&content)
         .build();
     container.append(&scroller);
 
@@ -49,30 +77,69 @@ pub fn build(state: AppState) -> (gtk4::Widget, Rc<dyn Fn()>) {
     let reload_cell: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
 
     let reload: Rc<dyn Fn()> = {
-        let list_box = list_box.clone();
-        let scroller = scroller.clone();
-        let empty_label = empty_label.clone();
         let reload_cell = Rc::clone(&reload_cell);
         Rc::new(move || {
-            while let Some(child) = list_box.first_child() {
-                list_box.remove(&child);
+            for list in [&list_box, &unowned_list] {
+                while let Some(child) = list.first_child() {
+                    list.remove(&child);
+                }
             }
-            let sessions = load_pending_sessions();
-            let is_empty = sessions.is_empty();
-            empty_label.set_visible(is_empty);
-            scroller.set_visible(!is_empty);
+            let on_changed: Rc<dyn Fn()> = {
+                let reload_cell = Rc::clone(&reload_cell);
+                Rc::new(move || {
+                    if let Some(reload) = reload_cell.borrow().as_ref() {
+                        reload();
+                    }
+                })
+            };
+
+            let store = state.store();
+            let sessions = match state.account() {
+                None => Err("Log in to see your pending submissions.".to_string()),
+                Some(account) => store.pending_sessions(&account).ok_or_else(|| {
+                    format!(
+                        "Pending submissions cannot be read: {}",
+                        store.error().unwrap_or_else(|| "session storage is unavailable".into())
+                    )
+                }),
+            };
+            let unowned = store.unowned().unwrap_or_default();
+
+            let (sessions, problem) = match sessions {
+                Ok(sessions) => (sessions, None),
+                Err(message) => (Vec::new(), Some(message)),
+            };
+            let nothing = sessions.is_empty() && unowned.is_empty();
+            match (&problem, nothing) {
+                (Some(message), _) => {
+                    status_label.set_text(message);
+                    status_label.add_css_class("error");
+                    status_label.remove_css_class("dim-label");
+                    status_label.set_visible(true);
+                }
+                (None, true) => {
+                    status_label.set_text("No pending submissions.");
+                    status_label.remove_css_class("error");
+                    status_label.add_css_class("dim-label");
+                    status_label.set_visible(true);
+                }
+                (None, false) => status_label.set_visible(false),
+            }
+            list_box.set_visible(!sessions.is_empty());
+            // Adoption needs someone to adopt them.
+            let show_unowned = !unowned.is_empty() && state.logged_in();
+            unowned_title.set_visible(show_unowned);
+            unowned_desc.set_visible(show_unowned);
+            unowned_list.set_visible(show_unowned);
+            scroller.set_visible(!sessions.is_empty() || show_unowned);
 
             for session in sessions {
-                let on_changed = {
-                    let reload_cell = Rc::clone(&reload_cell);
-                    move || {
-                        if let Some(reload) = reload_cell.borrow().as_ref() {
-                            reload();
-                        }
-                    }
-                };
-                let row = build_row(state.clone(), session, Rc::new(on_changed));
-                list_box.append(&row);
+                list_box.append(&build_row(state.clone(), session, Rc::clone(&on_changed)));
+            }
+            if show_unowned {
+                for record in unowned {
+                    unowned_list.append(&build_unowned_row(state.clone(), record, Rc::clone(&on_changed)));
+                }
             }
         })
     };
@@ -113,7 +180,8 @@ fn build_row(state: AppState, session: PendingSession, on_changed: Rc<dyn Fn()>)
     row.add_suffix(&delete_btn);
 
     retry_btn.connect_clicked({
-        let session = session.clone();
+        let state = state.clone();
+        let session_id = session.id.clone();
         let status_label = status_label.clone();
         let delete_btn = delete_btn.clone();
         let on_changed = Rc::clone(&on_changed);
@@ -123,28 +191,11 @@ fn build_row(state: AppState, session: PendingSession, on_changed: Rc<dyn Fn()>)
             status_label.set_text("Submitting…");
             status_label.set_visible(true);
 
-            let auth = state.auth.read().unwrap().clone();
-            let session = session.clone();
+            let state = state.clone();
+            let id = session_id.clone();
             let (tx, rx) = async_channel::bounded(1);
             std::thread::spawn(move || {
-                let base = auth.base_url.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| DEFAULT_API_URL.to_string());
-                let mut client = FroglogClient::new(base);
-                client.set_token(auth.token.clone());
-                let notes = Some(
-                    session
-                        .notes
-                        .clone()
-                        .filter(|n| !n.is_empty())
-                        .unwrap_or_else(|| "Session submitted from Pending Sessions".to_string()),
-                );
-                let result = if session.game_type.eq_ignore_ascii_case("live") {
-                    client.add_live_service_session(session.game_id, Some(session.date.clone()), Some(session.hours), notes, session.spoiler, session.is_public, None)
-                } else if session.game_type.eq_ignore_ascii_case("session") {
-                    client.add_game_session(session.game_id, Some(session.date.clone()), Some(session.hours), notes, session.spoiler, session.is_public, None)
-                } else {
-                    client.update_game_hours(session.game_id, session.hours)
-                };
-                let _ = tx.send_blocking((result, session.id.clone()));
+                let _ = tx.send_blocking(retry(&state, &id));
             });
 
             let on_changed = Rc::clone(&on_changed);
@@ -152,14 +203,9 @@ fn build_row(state: AppState, session: PendingSession, on_changed: Rc<dyn Fn()>)
             let btn = btn.clone();
             let delete_btn = delete_btn.clone();
             glib::spawn_future_local(async move {
-                let Ok((result, session_id)) = rx.recv().await else { return };
+                let Ok(result) = rx.recv().await else { return };
                 match result {
-                    Ok(_) => {
-                        let mut sessions = load_pending_sessions();
-                        sessions.retain(|s| s.id != session_id);
-                        save_pending_sessions(&sessions);
-                        on_changed();
-                    }
+                    Ok(()) => on_changed(),
                     Err(e) => {
                         btn.set_sensitive(true);
                         delete_btn.set_sensitive(true);
@@ -172,13 +218,84 @@ fn build_row(state: AppState, session: PendingSession, on_changed: Rc<dyn Fn()>)
 
     delete_btn.connect_clicked({
         let session_id = session.id.clone();
-        let on_changed = Rc::clone(&on_changed);
+        let status_label = status_label.clone();
         move |_| {
-            let mut sessions = load_pending_sessions();
-            sessions.retain(|s| s.id != session_id);
-            save_pending_sessions(&sessions);
-            on_changed();
+            let Some(account) = state.account() else { return };
+            match state.store().discard(&session_id, &account) {
+                Some(_) => on_changed(),
+                None => {
+                    status_label.set_text("Could not delete: storage unavailable");
+                    status_label.set_visible(true);
+                }
+            }
         }
+    });
+
+    row
+}
+
+/// Blocking: resubmits one pending record for the logged-in account and acknowledges it.
+fn retry(state: &AppState, id: &str) -> Result<(), String> {
+    // Credentials and ownership come from the same snapshot, so a logout/login mid-request can
+    // neither submit this row with another token nor acknowledge it for the wrong owner.
+    let (auth, account) = state.auth_and_account().ok_or("Not logged in")?;
+    let store = state.store();
+    // Re-read at action time: the row on screen may be stale (already submitted elsewhere).
+    let session = store
+        .pending_session(id, &account)
+        .ok_or_else(|| store.error().unwrap_or_else(|| "Session not found for this account".into()))?;
+    let client = crate::session_flow::client_for(&auth);
+    let result = lilypad_core::submission::retry_play_session(&client, &session, Some(session.id.clone()))
+        .map_err(|e| lilypad_core::submission::explain_failure(&e))?;
+    let remote = lilypad_core::submission::remote_reference(&result.response, result.game_id, &result.game_type);
+    match store.acknowledge(id, &account, &remote) {
+        Some(true) => Ok(()),
+        Some(false) => Err("The session changed while submitting; check its recorded status".into()),
+        None => Err("Submitted, but the result could not be saved. Retrying reuses the same session key.".into()),
+    }
+}
+
+fn build_unowned_row(state: AppState, record: UnownedRecord, on_changed: Rc<dyn Fn()>) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title(glib::markup_escape_text(&record.summary))
+        .title_lines(2)
+        .build();
+    let status_label = gtk4::Label::new(None);
+    status_label.add_css_class("error");
+    status_label.set_visible(false);
+    let assign_btn = gtk4::Button::with_label("Assign to me");
+    assign_btn.set_valign(gtk4::Align::Center);
+    let discard_btn = gtk4::Button::with_label("Discard");
+    discard_btn.set_valign(gtk4::Align::Center);
+    row.add_suffix(&status_label);
+    row.add_suffix(&assign_btn);
+    row.add_suffix(&discard_btn);
+
+    let report = {
+        let state = state.clone();
+        let status_label = status_label.clone();
+        move |outcome: Option<bool>, on_changed: &Rc<dyn Fn()>| match outcome {
+            Some(_) => on_changed(),
+            None => {
+                status_label.set_text(&state.store().error().unwrap_or_else(|| "Storage unavailable".into()));
+                status_label.set_visible(true);
+            }
+        }
+    };
+
+    assign_btn.connect_clicked({
+        let state = state.clone();
+        let id = record.id.clone();
+        let on_changed = Rc::clone(&on_changed);
+        let report = report.clone();
+        move |_| {
+            let Some(account) = state.account() else { return };
+            report(state.store().adopt(&id, &account), &on_changed);
+        }
+    });
+    discard_btn.connect_clicked({
+        let id = record.id.clone();
+        move |_| report(state.store().discard_unowned(&id), &on_changed)
     });
 
     row

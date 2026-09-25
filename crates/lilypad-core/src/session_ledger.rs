@@ -268,8 +268,40 @@ impl SessionLedger {
         Ok(self
             .unsubmitted(account)?
             .into_iter()
-            .filter(|s| !matches!(s.record.target, SessionTarget::LegacyNewGame(_)))
+            .filter(|s| !matches!(s.record.target, SessionTarget::LegacyNewGame(_) | SessionTarget::Unmapped { .. }))
             .collect())
+    }
+
+    /// Frontend retry rows for a known owner. Unowned imports require explicit adoption.
+    /// Reconstructing an unsent mapped session uses its recorded play date, never today's.
+    pub fn pending_sessions(&self, account: &AccountIdentity) -> LedgerResult<Vec<PendingSession>> {
+        self.unsubmitted_sessions(Some(account))?
+            .into_iter()
+            .map(|stored| pending_session_from_record(&stored.record))
+            .collect()
+    }
+
+    /// Re-read a queue row at action time: a stale UI row is not permission to submit it.
+    pub fn pending_session(&self, id: &str, account: &AccountIdentity) -> LedgerResult<PendingSession> {
+        let stored = self.get(id)?.ok_or("Session not found")?;
+        if stored.record.account.as_ref() != Some(account) {
+            return Err("Session belongs to another account or needs ownership confirmation".into());
+        }
+        if stored.state != SubmissionState::Pending {
+            return Err("Session is no longer pending".into());
+        }
+        pending_session_from_record(&stored.record)
+    }
+
+    /// User-facing discard with an explicit owner. Low-level recovery can still use `dismiss`.
+    pub fn dismiss_owned(&self, id: &str, account: &AccountIdentity) -> LedgerResult<bool> {
+        let Some(stored) = self.get(id)? else { return Ok(false) };
+        if stored.record.account.as_ref() != Some(account) {
+            return Err("Session belongs to another account or needs ownership confirmation".into());
+        }
+        // Owned records cannot be reassigned (`adopt` only accepts unowned records), so the
+        // owner cannot change between this check and the conditional state update.
+        self.dismiss(id)
     }
 
     fn query(
@@ -340,84 +372,49 @@ impl SessionLedger {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing = find_pending_new_game(&tx, account, appid)?;
-        let entry = crate::config::PendingGameSessionEntry { date, hours };
-
-        let total = match existing {
-            Some((id, mut record)) => {
-                let SessionTarget::LegacyNewGame(ref mut game) = record.target else {
-                    return Err("Pending new-game record has the wrong target".into());
-                };
-                // Keep the executable of the *longest* session, not the most recent one.
-                //
-                // A game can put several executables through this entry: Hotline Miami runs
-                // `HotlineMiami.exe` for about a second and then `HotlineGL.exe` for the real
-                // session, both resolving to the same appid. `exe_name` is what a later resolve
-                // turns into a `ProcessMapping`, so taking the last writer meant the mapping
-                // could end up pinned to the launcher — and then every future session would be
-                // the one second the launcher lives, rather than the play session.
-                let longest_so_far = game
-                    .sessions
-                    .iter()
-                    .map(|s| s.hours)
-                    .fold(0.0_f64, f64::max);
-                if hours >= longest_so_far {
-                    game.exe_name = exe_name.to_string();
-                }
-                game.hours += hours;
-                game.session_count += 1;
-                game.last_session_secs = now;
-                game.title = title.to_string();
-                game.replay_of = replay_of;
-                game.sessions.push(entry);
-                let total = game.hours;
-                record.last_alive_secs = Some(now);
-                record.ended_at_secs = Some(now);
-                tx.execute(
-                    "UPDATE sessions SET record=?2 WHERE id=?1",
-                    params![id, serde_json::to_string(&record)?],
-                )?;
-                total
-            }
-            None => {
-                let game = PendingGameSubmission {
-                    appid: appid.to_string(),
-                    title: title.to_string(),
-                    hours,
-                    session_count: 1,
-                    first_seen_secs: now,
-                    last_session_secs: now,
-                    exe_name: exe_name.to_string(),
-                    replay_of,
-                    sessions: vec![entry],
-                };
-                let record = SessionRecord {
-                    id: new_session_id(),
-                    account: account.cloned(),
-                    process: ProcessIdentity {
-                        executable: exe_name.to_string(),
-                        ..Default::default()
-                    },
-                    target: SessionTarget::LegacyNewGame(game),
-                    started_at_secs: Some(now),
-                    last_alive_secs: Some(now),
-                    ended_at_secs: Some(now),
-                    recovered: false,
-                    submission: None,
-                };
-                tx.execute(
-                    "INSERT INTO sessions(id,record,state) VALUES (?1,?2,?3)",
-                    params![
-                        record.id,
-                        serde_json::to_string(&record)?,
-                        SubmissionState::Pending.as_str()
-                    ],
-                )?;
-                hours
-            }
-        };
+        let total = accumulate_new_game(&tx, account, appid, title, exe_name, hours, replay_of, date, now)?;
         tx.commit()?;
         Ok(total)
+    }
+
+    /// Transfers a tracked unmapped session and settles its source in one transaction.
+    /// Repeated completion is a no-op. Recovery credits only the durable checkpoint.
+    /// Older pending sources need review: they may already have been credited.
+    pub fn complete_unmapped(
+        &mut self,
+        id: &str,
+        ended_at: u64,
+        recovered: bool,
+    ) -> LedgerResult<Option<f64>> {
+        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let json: Option<String> = tx.query_row(
+            "SELECT record FROM sessions WHERE id=?1 AND state='active'",
+            [id], |row| row.get(0),
+        ).optional()?;
+        let Some(json) = json else { return Ok(None) };
+        let mut record: SessionRecord = serde_json::from_str(&json)?;
+        let SessionTarget::Unmapped { appid, title, replay_of } = &record.target else {
+            return Err("Cannot transfer a mapped session to New Games".into());
+        };
+        let start = record.started_at_secs.ok_or("Unmapped session has no start time")?;
+        let checkpoint = record.last_alive_secs.unwrap_or(start).max(start);
+        let end = record.ended_at_secs.unwrap_or(if recovered { checkpoint } else { ended_at.max(checkpoint) }).max(start);
+        let hours = (((end - start) as f64 / 3600.0 * 100.0).round() / 100.0).max(0.01);
+        let timestamp = i64::try_from(start).map_err(|_| "Session timestamp is out of range")?;
+        let date = chrono::DateTime::from_timestamp(timestamp, 0)
+            .ok_or("Session timestamp is out of range")?
+            .with_timezone(&chrono::Local).format("%Y-%m-%d").to_string();
+        let total = accumulate_new_game(
+            &tx, record.account.as_ref(), appid, title, &record.process.executable,
+            hours, replay_of.clone(), date, end,
+        )?;
+        record.last_alive_secs = Some(end);
+        record.ended_at_secs = Some(end);
+        record.recovered |= recovered;
+        tx.execute("UPDATE sessions SET record=?2,state='dismissed' WHERE id=?1",
+            params![id, serde_json::to_string(&record)?])?;
+        tx.commit()?;
+        Ok(Some(total))
     }
 
     /// Games played but not yet in the library, for this account, oldest first.
@@ -637,6 +634,132 @@ impl SessionLedger {
     }
 }
 
+fn pending_session_from_record(record: &SessionRecord) -> LedgerResult<PendingSession> {
+    // A submission payload must not make an unresolved New Games row retryable.
+    if !matches!(record.target, SessionTarget::Mapped(_) | SessionTarget::LegacyPending(_)) {
+        return Err("This session must be resolved through New Games".into());
+    }
+    if let Some(s) = &record.submission {
+        return Ok(PendingSession {
+            id: record.id.clone(), game_id: s.game_id, game_type: s.game_type.clone(),
+            title: s.title.clone(), hours: s.hours, date: s.date.clone(), notes: s.notes.clone(),
+            spoiler: s.spoiler, is_public: s.is_public,
+            failed_at: s.failed_at.clone().unwrap_or_default(),
+            error: s.last_error.clone().unwrap_or_else(|| "Awaiting submission".into()),
+        });
+    }
+    if let SessionTarget::LegacyPending(session) = &record.target {
+        let mut session = session.clone();
+        session.id = record.id.clone();
+        return Ok(session);
+    }
+    let SessionTarget::Mapped(mapping) = &record.target else { unreachable!() };
+    let start = record.started_at_secs.ok_or("Pending session has no recorded start time")?;
+    let end = record.ended_at_secs.ok_or("Pending session has no recorded end time")?;
+    let timestamp = i64::try_from(start).map_err(|_| "Session timestamp is out of range")?;
+    let date = chrono::DateTime::from_timestamp(timestamp, 0)
+        .ok_or("Session timestamp is out of range")?
+        .with_timezone(&chrono::Local).format("%Y-%m-%d").to_string();
+    Ok(PendingSession {
+        id: record.id.clone(), game_id: mapping.froglog_id, game_type: mapping.r#type.clone(),
+        title: mapping.title.clone().unwrap_or_else(|| mapping.process.clone()),
+        hours: ((end.saturating_sub(start) as f64 / 3600.0 * 100.0).round() / 100.0).max(0.01),
+        date, notes: None, spoiler: false, is_public: true, failed_at: String::new(),
+        error: "Never submitted (LilyPad stopped before it could be sent)".into(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accumulate_new_game(
+    tx: &rusqlite::Transaction<'_>,
+    account: Option<&AccountIdentity>,
+    appid: &str,
+    title: &str,
+    exe_name: &str,
+    hours: f64,
+    replay_of: Option<crate::config::ReplayOf>,
+    date: String,
+    now: u64,
+) -> LedgerResult<f64> {
+    let existing = find_pending_new_game(tx, account, appid)?;
+    let entry = crate::config::PendingGameSessionEntry { date, hours };
+
+    let total = match existing {
+        Some((id, mut record)) => {
+            let SessionTarget::LegacyNewGame(ref mut game) = record.target else {
+                return Err("Pending new-game record has the wrong target".into());
+            };
+            // Keep the executable of the *longest* session, not the most recent one.
+            //
+            // A game can put several executables through this entry: Hotline Miami runs
+            // `HotlineMiami.exe` for about a second and then `HotlineGL.exe` for the real
+            // session, both resolving to the same appid. `exe_name` is what a later resolve
+            // turns into a `ProcessMapping`, so taking the last writer meant the mapping
+            // could end up pinned to the launcher — and then every future session would be
+            // the one second the launcher lives, rather than the play session.
+            let longest_so_far = game
+                .sessions
+                .iter()
+                .map(|s| s.hours)
+                .fold(0.0_f64, f64::max);
+            if hours >= longest_so_far {
+                game.exe_name = exe_name.to_string();
+            }
+            game.hours += hours;
+            game.session_count += 1;
+            game.last_session_secs = now;
+            game.title = title.to_string();
+            game.replay_of = replay_of;
+            game.sessions.push(entry);
+            let total = game.hours;
+            record.last_alive_secs = Some(now);
+            record.ended_at_secs = Some(now);
+            tx.execute(
+                "UPDATE sessions SET record=?2 WHERE id=?1",
+                params![id, serde_json::to_string(&record)?],
+            )?;
+            total
+        }
+        None => {
+            let game = PendingGameSubmission {
+                appid: appid.to_string(),
+                title: title.to_string(),
+                hours,
+                session_count: 1,
+                first_seen_secs: now,
+                last_session_secs: now,
+                exe_name: exe_name.to_string(),
+                replay_of,
+                sessions: vec![entry],
+            };
+            let record = SessionRecord {
+                id: new_session_id(),
+                account: account.cloned(),
+                process: ProcessIdentity {
+                    executable: exe_name.to_string(),
+                    ..Default::default()
+                },
+                target: SessionTarget::LegacyNewGame(game),
+                started_at_secs: Some(now),
+                last_alive_secs: Some(now),
+                ended_at_secs: Some(now),
+                recovered: false,
+                submission: None,
+            };
+            tx.execute(
+                "INSERT INTO sessions(id,record,state) VALUES (?1,?2,?3)",
+                params![
+                    record.id,
+                    serde_json::to_string(&record)?,
+                    SubmissionState::Pending.as_str()
+                ],
+            )?;
+            hours
+        }
+    };
+    Ok(total)
+}
+
 /// Finds the pending new-game record for `appid` owned by `account`, inside a transaction.
 ///
 /// The account match is part of the key, not a filter applied afterwards: two accounts can each
@@ -765,6 +888,164 @@ fn legacy_records(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mapped_session() -> SessionRecord {
+        let mut record = session();
+        record.target = SessionTarget::Mapped(ProcessMapping {
+            process: "game.exe".into(), r#type: "session".into(), froglog_id: 7,
+            title: Some("Game".into()), title_filter: None, exe_path: None,
+        });
+        record
+    }
+
+    #[test]
+    fn retry_rows_recover_the_original_play_date_and_stable_id() {
+        let mut ledger = SessionLedger::open(Path::new(":memory:")).unwrap();
+        let mut record = mapped_session();
+        // Midday local time keeps this test independent of the machine's time zone.
+        use chrono::TimeZone;
+        let start = chrono::Local.with_ymd_and_hms(2020, 3, 4, 12, 0, 0).unwrap().timestamp() as u64;
+        record.started_at_secs = Some(start);
+        record.last_alive_secs = Some(start);
+        ledger.insert(&record, SubmissionState::Active).unwrap();
+        ledger.finish(&record.id, start + 5400).unwrap();
+        let owner = record.account.as_ref().unwrap();
+        let row = ledger.pending_session(&record.id, owner).unwrap();
+        assert_eq!(row.date, "2020-03-04");
+        assert_eq!(row.hours, 1.5);
+        assert_eq!(row.id, record.id);
+        assert_eq!(row.game_id, 7);
+        assert_eq!(ledger.pending_sessions(owner).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn retry_rows_preserve_saved_payload_including_privacy_and_notes() {
+        let ledger = SessionLedger::open(Path::new(":memory:")).unwrap();
+        let mut record = mapped_session();
+        let mut payload = submission();
+        payload.is_public = false;
+        payload.spoiler = true;
+        payload.notes = Some("Keep exactly this note".into());
+        record.submission = Some(payload.clone());
+        ledger.insert(&record, SubmissionState::Pending).unwrap();
+        let owner = record.account.as_ref().unwrap();
+        let row = ledger.pending_session(&record.id, owner).unwrap();
+        assert_eq!(row.date, payload.date);
+        assert_eq!(row.hours, payload.hours);
+        assert_eq!(row.notes, payload.notes);
+        assert!(!row.is_public);
+        assert!(row.spoiler);
+        assert_eq!(row.error, payload.last_error.unwrap());
+        ledger.acknowledge(&record.id, owner, "session:42").unwrap();
+        assert!(ledger.pending_session(&record.id, owner).is_err());
+    }
+
+    #[test]
+    fn queue_actions_reject_other_accounts_and_unowned_imports() {
+        let mut ledger = SessionLedger::open(Path::new(":memory:")).unwrap();
+        let mut record = mapped_session();
+        let owner = record.account.clone().unwrap();
+        record.account = None;
+        record.ended_at_secs = Some(3700);
+        ledger.insert(&record, SubmissionState::Pending).unwrap();
+        assert!(ledger.pending_session(&record.id, &owner).is_err());
+        assert!(ledger.dismiss_owned(&record.id, &owner).is_err());
+        ledger.adopt(&record.id, &owner).unwrap();
+        let mut other = owner.clone();
+        other.server = "https://different.example/api".into();
+        assert!(ledger.pending_sessions(&other).unwrap().is_empty());
+        assert!(ledger.pending_session(&record.id, &other).is_err());
+        assert!(ledger.dismiss_owned(&record.id, &other).is_err());
+        assert!(ledger.pending_session(&record.id, &owner).is_ok());
+        assert!(ledger.dismiss_owned(&record.id, &owner).unwrap());
+        assert!(ledger.pending_session(&record.id, &owner).is_err());
+    }
+
+    #[test]
+    fn queue_conversion_reports_missing_timestamps_and_excludes_unmapped_targets() {
+        let ledger = SessionLedger::open(Path::new(":memory:")).unwrap();
+        let record = mapped_session();
+        ledger.insert(&record, SubmissionState::Pending).unwrap();
+        assert!(ledger.pending_sessions(record.account.as_ref().unwrap()).is_err());
+        let mut unmapped = session();
+        unmapped.submission = Some(submission());
+        ledger.insert(&unmapped, SubmissionState::Pending).unwrap();
+        assert!(ledger.pending_session(&unmapped.id, unmapped.account.as_ref().unwrap()).is_err());
+    }
+
+    #[test]
+    fn legacy_retry_payload_without_submission_metadata_is_preserved() {
+        let ledger = SessionLedger::open(Path::new(":memory:")).unwrap();
+        let mut record = mapped_session();
+        let legacy: Vec<PendingSession> = serde_json::from_str(PENDING).unwrap();
+        record.target = SessionTarget::LegacyPending(legacy[0].clone());
+        ledger.insert(&record, SubmissionState::Pending).unwrap();
+        let row = ledger.pending_session(&record.id, record.account.as_ref().unwrap()).unwrap();
+        let mut expected = legacy[0].clone();
+        expected.id = record.id;
+        assert_eq!(serde_json::to_value(row).unwrap(), serde_json::to_value(expected).unwrap());
+    }
+
+    #[test]
+    fn unmapped_completion_is_durable_and_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("l.sqlite");
+        let record = session();
+        let owner = record.account.as_ref();
+        let mut ledger = SessionLedger::open(&path).unwrap();
+        ledger.insert(&record, SubmissionState::Active).unwrap();
+        assert_eq!(ledger.complete_unmapped(&record.id, 3700, false).unwrap(), Some(1.0));
+        drop(ledger);
+        let mut ledger = SessionLedger::open(&path).unwrap();
+        assert_eq!(ledger.complete_unmapped(&record.id, 7300, false).unwrap(), None);
+        let games = ledger.new_games(owner).unwrap();
+        assert_eq!(games[0].hours, 1.0);
+        assert_eq!(games[0].session_count, 1);
+        assert!(ledger.unsubmitted_sessions(owner).unwrap().is_empty());
+        assert_eq!(ledger.get(&record.id).unwrap().unwrap().state, SubmissionState::Dismissed);
+        let other = AccountIdentity { server: owner.unwrap().server.clone(), account_id: "other".into() };
+        assert!(ledger.new_games(Some(&other)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unmapped_recovery_excludes_downtime_and_preserves_unknown_ownership() {
+        let mut ledger = SessionLedger::open(Path::new(":memory:")).unwrap();
+        let mut record = session();
+        record.account = None;
+        ledger.insert(&record, SubmissionState::Active).unwrap();
+        ledger.checkpoint(&record.id, 1900).unwrap();
+        assert_eq!(ledger.complete_unmapped(&record.id, 100000, true).unwrap(), Some(0.5));
+        let stored = ledger.get(&record.id).unwrap().unwrap();
+        assert!(stored.record.recovered);
+        assert_eq!(stored.record.ended_at_secs, Some(1900));
+        assert_eq!(ledger.new_games(None).unwrap()[0].hours, 0.5);
+    }
+
+    #[test]
+    fn unmapped_transfer_rolls_back_when_settling_the_source_fails() {
+        let mut ledger = SessionLedger::open(Path::new(":memory:")).unwrap();
+        let record = session();
+        ledger.insert(&record, SubmissionState::Active).unwrap();
+        // Fail the second write, after the aggregate was inserted inside the transaction.
+        ledger.connection.execute_batch("CREATE TRIGGER fail_settlement BEFORE UPDATE ON sessions
+            WHEN NEW.state='dismissed' BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").unwrap();
+        assert!(ledger.complete_unmapped(&record.id, 3700, false).is_err());
+        assert!(ledger.new_games(record.account.as_ref()).unwrap().is_empty());
+        assert_eq!(ledger.get(&record.id).unwrap().unwrap().state, SubmissionState::Active);
+        ledger.connection.execute_batch("DROP TRIGGER fail_settlement").unwrap();
+        assert_eq!(ledger.complete_unmapped(&record.id, 3700, false).unwrap(), Some(1.0));
+    }
+
+    #[test]
+    fn stranded_unmapped_pending_records_cannot_enter_the_retry_queue() {
+        let mut ledger = SessionLedger::open(Path::new(":memory:")).unwrap();
+        let record = session();
+        ledger.insert(&record, SubmissionState::Active).unwrap();
+        ledger.finish(&record.id, 1900).unwrap();
+        assert!(ledger.unsubmitted_sessions(record.account.as_ref()).unwrap().is_empty());
+        assert_eq!(ledger.complete_unmapped(&record.id, 100000, true).unwrap(), None);
+        assert_eq!(ledger.get(&record.id).unwrap().unwrap().state, SubmissionState::Pending);
+    }
 
     fn session() -> SessionRecord {
         SessionRecord::new(
@@ -1167,7 +1448,11 @@ mod tests {
         let account = session().account.unwrap();
 
         // A real session awaiting retry...
-        let played = session();
+        let mut played = session();
+        played.target = SessionTarget::Mapped(ProcessMapping {
+            process: "game.exe".into(), r#type: "session".into(), froglog_id: 7,
+            title: Some("Game".into()), exe_path: None, title_filter: None,
+        });
         ledger.insert(&played, SubmissionState::Active).unwrap();
         ledger.finish(&played.id, 200).unwrap();
         ledger.set_submission(&played.id, &submission()).unwrap();

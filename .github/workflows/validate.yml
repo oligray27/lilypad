@@ -1,0 +1,50 @@
+name: Validate desktop clients
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GTK build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libgtk-4-dev libadwaita-1-dev dbus-x11
+      - name: Select validated Rust toolchain
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup default 1.95.0
+      - name: Test and build Linux client
+        run: bash scripts/validate-linux.sh
+      - name: Retain Linux validation logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-validation-logs
+          path: target/validation/*.log
+          if-no-files-found: warn
+
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select validated Rust toolchain
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default 1.95.0
+      - name: Prepare embedded frontend
+        run: node scripts/copy-frontend.js
+      - name: Test shared core and Tauri
+        run: cargo test -p lilypad-core -p lilypad --locked
+      - name: Build Windows client
+        run: cargo build -p lilypad --locked

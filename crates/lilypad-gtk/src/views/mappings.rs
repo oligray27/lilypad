@@ -424,6 +424,8 @@ pub fn build(
                         froglog_id: id,
                         title,
                         title_filter: if new_filter.is_empty() { None } else { Some(new_filter) },
+                        // The editor supplies a basename, not a verified running executable.
+                        exe_path: None,
                     });
                 }
             }
@@ -487,19 +489,28 @@ pub fn build(
                 detect_unmapped.set_active(!cfg.disable_unmapped_game_detection);
             }
 
-            let pending_count = lilypad_core::config::load_pending_sessions().len();
-            if pending_count > 0 {
-                pending_notice_label.set_text(&format!(
-                    "⚠ {pending_count} pending submission{}",
-                    if pending_count > 1 { "s" } else { "" },
-                ));
-                pending_notice_link.set_visible(true);
-            } else {
-                pending_notice_label.set_text("✓ No pending submissions");
-                pending_notice_link.set_visible(false);
+            let account = state.account();
+            let counts = state.store().counts(account.as_ref());
+            match counts.pending.map(|p| p + counts.unowned.unwrap_or(0)) {
+                Some(pending_count) if pending_count > 0 => {
+                    pending_notice_label.set_text(&format!(
+                        "⚠ {pending_count} pending submission{}",
+                        if pending_count > 1 { "s" } else { "" },
+                    ));
+                    pending_notice_link.set_visible(true);
+                }
+                Some(_) => {
+                    pending_notice_label.set_text("✓ No pending submissions");
+                    pending_notice_link.set_visible(false);
+                }
+                // Unknown is not zero.
+                None => {
+                    pending_notice_label.set_text("⚠ Pending submissions unavailable (storage problem)");
+                    pending_notice_link.set_visible(true);
+                }
             }
 
-            let new_games_count = lilypad_core::config::load_pending_game_submissions().len();
+            let new_games_count = counts.new_games.unwrap_or(0);
             if new_games_count > 0 {
                 new_games_notice_label.set_text(&format!(
                     "⚠ {new_games_count} game{} detected that {} not in FrogLog yet.",

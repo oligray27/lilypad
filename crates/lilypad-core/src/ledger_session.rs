@@ -1,10 +1,8 @@
 //! Ledger-backed session lifecycle: the durable replacement for `session_persistence`'s
 //! `active-session.json`.
 //!
-//! `session_persistence` is deliberately left in place and unchanged. The GTK frontend still
-//! runs on it, and the Tauri frontend is the only one cut over so far — see `PLAN.md`. The two
-//! never share an app data directory in practice (GTK is Linux-only, Tauri Windows-only), so
-//! the split costs nothing at runtime.
+//! Both frontends now run on this (GTK through `session_store`). `session_persistence` is no
+//! longer used by either; its `active-session.json` is imported into the ledger on first start.
 //!
 //! What changes versus the JSON file: the record is keyed by a UUID rather than being "the one
 //! active session", it carries the account that owns it, a completed session survives until the

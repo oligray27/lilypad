@@ -1,0 +1,39 @@
+[
+  {
+    "appid": "fixture-new",
+    "title": "Fixture new game",
+    "hours": 1.75,
+    "session_count": 2,
+    "first_seen_secs": 1787263200,
+    "last_session_secs": 1787349600,
+    "exe_name": "Game With Spaces.exe",
+    "sessions": [
+      { "date": "2026-08-20", "hours": 0.5 },
+      { "date": "2026-08-21", "hours": 1.25 }
+    ]
+  },
+  {
+    "appid": "fixture-replay",
+    "title": "Fixture replay",
+    "hours": 0.75,
+    "session_count": 1,
+    "first_seen_secs": 1787349600,
+    "last_session_secs": 1787349600,
+    "exe_name": "replay.x86_64",
+    "replay_of": {
+      "id": 103,
+      "game_type": "regular",
+      "title": "Fixture original game",
+      "status": "Completed"
+    },
+    "sessions": [{ "date": "2026-08-21", "hours": 0.75 }]
+  },
+  {
+    "appid": "fixture-aggregate",
+    "title": "Fixture older aggregate",
+    "hours": 4.5,
+    "session_count": 3,
+    "first_seen_secs": 1787263200,
+    "last_session_secs": 1787349600
+  }
+]

@@ -1,0 +1,15 @@
+[
+  {
+    "id": "1787264000000",
+    "game_id": 102,
+    "game_type": "live",
+    "title": "Fixture pending game",
+    "hours": 1.25,
+    "notes": "Keep this private note — café",
+    "spoiler": true,
+    "is_public": false,
+    "date": "2026-08-20",
+    "failed_at": "2026-08-20T22:00:00+01:00",
+    "error": "Fixture: offline"
+  }
+]

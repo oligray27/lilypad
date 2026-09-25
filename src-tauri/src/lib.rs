@@ -2,7 +2,9 @@
 // session lifecycle now runs on the durable ledger (`ledger_session`). The module stays in the
 // core crate for the GTK frontend, which is not part of this cutover -- see `PLAN.md`.
 use lilypad_core::{api, config, duration, ledger_session, library_match, local_games, monitor, steam};
-mod auto_submit;
+use lilypad_core::auto_submit;
+use lilypad_core::submission::{submit_play_session, explain_failure, log_each_pending_session, remote_reference};
+use lilypad_core::session_store::find_original_process;
 
 use api::FroglogClient;
 // `load_pending_sessions`/`save_pending_sessions` are gone: the retry queue is now ledger
@@ -228,10 +230,10 @@ struct AppState {
     /// Reported by `session_storage_status` so "this game looks new" can be understood as
     /// possibly meaning "we could not check".
     library_stale: Arc<RwLock<bool>>,
-    /// Ledger id of the session currently being tracked. Held here rather than on
-    /// `ActiveSession` so `monitor::run_poll_loop`'s signature -- and therefore the GTK
-    /// frontend, which is not part of this cutover -- stays untouched.
-    active_ledger_id: Arc<RwLock<Option<String>>>,
+    /// Ledger id of the session currently being tracked, tied to its process so a stale waiter
+    /// cannot take a later session's record. Held here rather than on `ActiveSession` so
+    /// `monitor::run_poll_loop`'s signature, shared with the GTK frontend, stays untouched.
+    active_ledger_id: lilypad_core::session_store::ActiveRecord,
     /// Ledger ids of unmapped games currently being played, keyed by appid. A map rather than a
     /// single slot because several unmapped games can be tracked at once — the monitor keys that
     /// on appid too (`currently_tracking_unmapped`).
@@ -377,29 +379,11 @@ fn report_storage_error(app: &tauri::AppHandle, message: String) {
 /// failed to open said so only in the UI and left no trace in the log file. The caller replays
 /// them with `replay_startup_log` once logging exists.
 fn open_session_ledger() -> (Result<SessionLedger, String>, Vec<(log::Level, String)>) {
-    let mut messages = Vec::new();
-    let path = lilypad_core::session_ledger::ledger_path();
-    let mut ledger = match SessionLedger::open(&path) {
-        Ok(ledger) => ledger,
-        Err(e) => return (Err(e.to_string()), messages),
-    };
-    // All three legacy files are now cut over, so the full set is imported. Each moved across in
-    // the same change that stopped its JSON writer, because `import_legacy` consumes a file
-    // exactly once -- importing one while its writer was still running would have stranded every
-    // write it received afterwards. The originals are left on disk.
-    match ledger.import_legacy(&config::app_data_dir(), &lilypad_core::session_ledger::LEGACY_FILES) {
-        Ok(imported) if imported > 0 => messages.push((
-            log::Level::Info,
-            format!("[LilyPad] session store: migrated {imported} record(s) from the legacy JSON queues"),
-        )),
-        Ok(_) => {}
-        Err(e) => return (Err(e.to_string()), messages),
-    }
-    messages.push((
-        log::Level::Info,
-        format!("[LilyPad] session store ready at {}", path.display()),
-    ));
-    (Ok(ledger), messages)
+    // All three legacy files are cut over, so the shared opener imports the full set.
+    lilypad_core::session_store::open_ledger_with_import(
+        &lilypad_core::session_ledger::ledger_path(),
+        &config::app_data_dir(),
+    )
 }
 
 /// Backfills `auth.username` for logins that predate it being stored (pre-v0.4.4) and moves that
@@ -522,7 +506,7 @@ fn begin_ledger_session(
 /// network call, so a crash between the game exiting and the session being submitted leaves a
 /// pending record rather than nothing.
 fn finish_ledger_session(state: &AppState, ended_at: u64) -> Option<String> {
-    let id = state.active_ledger_id.write().unwrap().take()?;
+    let id = state.active_ledger_id.take()?;
     state.with_ledger("recording session end", |l| l.finish(&id, ended_at))?;
     *state.last_finished_ledger_id.write().unwrap() = Some(id.clone());
     Some(id)
@@ -563,50 +547,6 @@ fn complete_session(state: &AppState, id: &str, ended_at: u64) -> Completion {
     }
 }
 
-/// Submits one play session, whatever the game's type. The single place LilyPad logs play time.
-///
-/// A "regular" game — one without session tracking — has no session rows, so its hours used to go
-/// through `update_game_hours`: GET the game, add to `hours_played`, PUT the whole object back.
-/// That is the last non-atomic write in the system and it fails in three ways. Anything changing
-/// the game between the read and the write is lost (phase 4's "concurrent play-time updates
-/// cannot overwrite unrelated metadata or hours"); the full-object PUT can carry stale fields
-/// back over fresh ones; and it takes no `sync_ref`, so a retry after an ambiguous failure
-/// double-counts the hours with nothing able to detect it.
-///
-/// Rather than build an atomic delta endpoint for a path that should not exist, the game is
-/// promoted to session tracking and the session logged normally — which is what LilyPad already
-/// does on *every* path that creates a mapping (`save_process_mapping`, the New Games resolves,
-/// the already-owned auto-link), on the stated principle that anything it tracks ends up
-/// session-tracked. Only mappings predating that behaviour still arrive here as "regular".
-///
-/// `enable_session_tracking` returns early if tracking is already on, and preserves any existing
-/// `hours_played` as a "Pre-tracked hours" session, so no play time is lost in the conversion.
-/// Its failure aborts the submission: the session then queues and retries, which is right, since
-/// the log attempt would have failed too.
-fn submit_play_session(
-    client: &FroglogClient,
-    game_type: &str,
-    game_id: i32,
-    date: Option<String>,
-    hours: f64,
-    notes: Option<String>,
-    spoiler: bool,
-    is_public: bool,
-    sync_ref: Option<String>,
-) -> Result<serde_json::Value, String> {
-    if game_type.eq_ignore_ascii_case("live") {
-        return client.add_live_service_session(game_id, date, Some(hours), notes, spoiler, is_public, sync_ref);
-    }
-    if !game_type.eq_ignore_ascii_case("session") {
-        log::info!(
-            "[LilyPad] game {game_id} is not session-tracked; enabling it so this session can be \
-             logged atomically rather than added to a running total"
-        );
-        client.enable_session_tracking(game_id)?;
-    }
-    client.add_game_session(game_id, date, Some(hours), notes, spoiler, is_public, sync_ref)
-}
-
 /// Removes a mapping whose game turned out not to exist, and re-reads the library.
 ///
 /// The auto-link path builds a mapping from the cached library index. If the game was deleted on
@@ -640,41 +580,6 @@ fn drop_dead_mapping(app: &tauri::AppHandle, process: &str, game_type: &str, fro
     }
     // The cached library is demonstrably out of date -- it just claimed a game that is gone.
     refresh_library_index_state(&state);
-}
-
-/// Turns a raw API error into something a user can act on, for the Pending Submissions list.
-///
-/// The raw text is the server's, e.g. `404: Not found`, which says nothing about what to do.
-/// The classification already exists; this just gives each kind a sentence.
-fn explain_failure(error: &str) -> String {
-    match api::ApiFailure::classify(error) {
-        api::ApiFailure::NotFound => {
-            "This game no longer exists in FrogLog — it was probably deleted. Discard this \
-             session, or re-add the game and play it again to re-link it."
-                .to_string()
-        }
-        api::ApiFailure::Unauthorized => {
-            "Not signed in to FrogLog. Log in again, then retry.".to_string()
-        }
-        api::ApiFailure::RateLimited => {
-            "FrogLog asked LilyPad to slow down. Retry in a moment.".to_string()
-        }
-        api::ApiFailure::Transient => format!("Could not reach FrogLog ({error}). Retry when back online."),
-        api::ApiFailure::Rejected => format!("FrogLog rejected this session ({error})."),
-        api::ApiFailure::AlreadySubmitted => "Already submitted to FrogLog.".to_string(),
-    }
-}
-
-/// Whether a submission failure actually means "the server already has it".
-///
-/// A `sync_ref` replay answers 409, which is success wearing a failure's clothes: queueing it
-/// would ask again for something already recorded, and the user would watch a retry that can
-/// never clear.
-fn already_submitted(result: &Result<serde_json::Value, String>) -> bool {
-    result
-        .as_ref()
-        .err()
-        .is_some_and(|e| api::ApiFailure::classify(e) == api::ApiFailure::AlreadySubmitted)
 }
 
 /// Queues a session for retry after a failed submission.
@@ -826,8 +731,8 @@ fn recover_interrupted_sessions(app: &tauri::AppHandle) {
         // An unmapped game has no library entry to submit against, so it is credited into the
         // new-games queue instead -- the same place a normally-ended one goes. This is what the
         // start-of-play record exists for: without it the whole session was simply lost.
-        if let SessionTarget::Unmapped { appid, title, replay_of } = record.target.clone() {
-            recover_unmapped_session(app, &record, &appid, &title, replay_of);
+        if let SessionTarget::Unmapped { appid, title, .. } = record.target.clone() {
+            recover_unmapped_session(app, &record, &appid, &title);
             continue;
         }
         let SessionTarget::Mapped(mapping) = record.target.clone() else {
@@ -861,49 +766,6 @@ fn recover_interrupted_sessions(app: &tauri::AppHandle) {
     }
 }
 
-/// Finds the process this session was tracking, distinguishing it from a *new* launch of the
-/// same game.
-///
-/// With a recorded pid and start time, both must match: a pid alone proves nothing, because
-/// Windows recycles pids and a game closed and relaunched while LilyPad was down can land on
-/// the same one. Adopting that relaunch would resume a finished session against a process that
-/// has nothing to do with it, and bill the wrong span of time.
-///
-/// Records with no identity (imported legacy entries, or a process that vanished before its
-/// start time could be read) fall back to matching by executable name -- the old behaviour,
-/// which is a guess, and is why the match is logged.
-fn find_original_process(sys: &System, identity: &ProcessIdentity) -> Option<sysinfo::Pid> {
-    if let (Some(pid), Some(started)) = (identity.pid, identity.started_at_secs) {
-        let pid = sysinfo::Pid::from(pid as usize);
-        return match sys.process(pid) {
-            Some(p) if p.start_time() == started => Some(pid),
-            Some(_) => {
-                log::info!(
-                    "[LilyPad] pid {pid:?} is alive but started at a different time than the \
-                     recorded session -- treating it as an unrelated process, not a resume"
-                );
-                None
-            }
-            None => None,
-        };
-    }
-    let found = sys.processes().iter().find_map(|(pid, p)| {
-        let name = p
-            .exe()
-            .and_then(|path| path.file_name().and_then(|n| n.to_str().map(String::from)))
-            .unwrap_or_else(|| p.name().to_string_lossy().into_owned());
-        name.eq_ignore_ascii_case(&identity.executable).then_some(*pid)
-    });
-    if found.is_some() {
-        log::info!(
-            "[LilyPad] resuming {} by executable name; the session predates process-identity \
-             recording, so this may be a different launch",
-            identity.executable
-        );
-    }
-    found
-}
-
 /// Credits an interrupted unmapped session into the new-games queue, bounded by its last
 /// confirmed-alive checkpoint.
 ///
@@ -915,58 +777,14 @@ fn recover_unmapped_session(
     record: &SessionRecord,
     appid: &str,
     title: &str,
-    replay_of: Option<config::ReplayOf>,
 ) {
     let state = app.state::<AppState>();
-    let duration_secs = ledger_session::interrupted_duration_secs(record);
-    let hours = {
-        let r = ((duration_secs / 3600.0) * 100.0).round() / 100.0;
-        if r < 0.01 { 0.01 } else { r }
-    };
-    let ended_at = record
-        .last_alive_secs
-        .or(record.started_at_secs)
-        .unwrap_or_else(ledger_session::now_secs);
-
-    // Closed first: if crediting fails the record stays put and is retried next startup, but a
-    // record closed and then credited twice would double-count the play time.
-    if state
-        .with_ledger("closing an interrupted unmapped session", |l| {
-            l.finish(&record.id, ended_at)
-        })
-        .is_none()
-    {
-        return;
-    }
-
-    let account = state.account();
-    let date = chrono::DateTime::<chrono::Local>::from(
-        SystemTime::UNIX_EPOCH + Duration::from_secs(record.started_at_secs.unwrap_or(ended_at)),
-    )
-    .format("%Y-%m-%d")
-    .to_string();
-    let total = state.with_ledger("crediting an interrupted unmapped session", |l| {
-        l.record_new_game_session(
-            account.as_ref(),
-            appid,
-            title,
-            &record.process.executable,
-            hours,
-            replay_of,
-            date,
-            ended_at,
-        )
-    });
-    state.with_ledger("settling a recovered unmapped session", |l| l.dismiss(&record.id));
-
-    if let Some(total) = total {
-        log::info!(
-            "[LilyPad] interrupted session for new game {title} ({appid}) recovered: \
-             {hours}h credited up to its last checkpoint; {total}h awaiting resolution"
-        );
+    if let Some(Some(total)) = state.with_ledger("recovering an unmapped session", |l| {
+        l.complete_unmapped(&record.id, ledger_session::now_secs(), true)
+    }) {
+        log::info!("[LilyPad] recovered {title} ({appid}) through its last checkpoint; {total}h awaiting resolution");
     }
 }
-
 /// The game outlived LilyPad: carry on tracking the same ledger record rather than opening a
 /// second one, so the recovered session keeps its original start time and id.
 fn resume_recovered_session(
@@ -999,7 +817,7 @@ fn resume_recovered_session(
         started_at_secs: record.process.started_at_secs,
         started_at,
     });
-    *state.active_ledger_id.write().unwrap() = Some(record.id.clone());
+    state.active_ledger_id.set(&record.process.executable, Some(record.id.clone()));
     let _ = update_tray_state(app);
 
     let started_at_iso = chrono::DateTime::<chrono::Utc>::from(started_wall).to_rfc3339();
@@ -1022,8 +840,9 @@ fn resume_recovered_session(
             .unwrap_or_default()
             .as_secs_f64();
         let state = app.state::<AppState>();
-        *state.current_session_arc.write().unwrap() = None;
-        state.active_ledger_id.write().unwrap().take();
+        // Only our own session: after a force-stop another game may be tracked by now.
+        monitor::clear_session_for(&state.current_session_arc, &process_name);
+        state.active_ledger_id.clear_if(&session_id);
 
         // The process has really exited now, so release any force-stop block on it. Nothing
         // else will: the monitor never had a waiter for a recovered session, and its own end
@@ -1137,18 +956,6 @@ fn start_unmapped_heartbeat(app: &tauri::AppHandle, session_id: String, exe_name
         move || !exe_name.is_empty(),
         move |e| report_storage_error(&app, e),
     );
-}
-
-/// The server id to record against a submitted session. Session-type submissions return the
-/// created row, so its `id` is the real reference. A regular game's hours update is a
-/// read-modify-write on the game itself with no session row behind it, so there is nothing
-/// better to point at than the game -- that is a real gap, and what `PLAN.md` phase 4 item 3
-/// (an atomic server-side session/delta endpoint) exists to close.
-fn remote_reference(response: &serde_json::Value, game_id: i32, game_type: &str) -> String {
-    match response.get("id").and_then(|v| v.as_i64()) {
-        Some(id) if !game_type.eq_ignore_ascii_case("regular") => format!("session:{id}"),
-        _ => format!("game-hours:{game_id}"),
-    }
 }
 
 /// Re-scans Steam's installed games and every configured watched directory, replacing
@@ -1691,26 +1498,14 @@ fn handle_session_ended(
                     let sync_ref = ledger_id.clone();
                     std::thread::spawn(move || {
                         let result = if let Some(client) = api_client(&auth2) {
-                            if game_type2.eq_ignore_ascii_case("live") {
-                                client.add_live_service_session(mapping.froglog_id, Some(date), Some(hours), Some("Session auto submitted with LilyPad".to_string()), false, true, sync_ref)
-                            } else {
-                                client.add_game_session(mapping.froglog_id, Some(date), Some(hours), Some("Session auto submitted with LilyPad".to_string()), false, true, sync_ref)
-                            }
+                            submit_play_session(&client, &game_type2, mapping.froglog_id,
+                                Some(date), hours, Some("Session auto submitted with LilyPad".to_string()),
+                                false, true, sync_ref)
                         } else { Err("Not logged in".to_string()) };
                         let _ = tx2.send(result);
                     });
                     let result = rx2.await.unwrap_or_else(|e| Err(format!("Auto-submit worker stopped: {e}")));
-                    // A `sync_ref` replay the server already holds answers 409. That is success
-                    // wearing a failure's clothes -- queueing it would ask again for something
-                    // already recorded, and the retry could never clear.
-                    if already_submitted(&result) {
-                        log::info!("[LilyPad] game {} was already submitted; settling it", mapping.froglog_id);
-                        if let Some(id) = &ledger_id {
-                            acknowledge_ledger_session(
-                                &app, id, &format!("{}:{}", mapping.r#type, mapping.froglog_id),
-                            );
-                        }
-                    } else if let Err(error) = &result {
+                    if let Err(error) = &result {
                         let error = error.clone();
                         log::warn!("[LilyPad] auto-submit failed for game {}: {}", mapping.froglog_id, error);
                         queue_failed_submission(
@@ -1781,20 +1576,13 @@ fn handle_session_ended(
                 let _ = tx.send(result);
             });
             let result = rx.await.unwrap_or_else(|e| Err(format!("Auto-submit worker stopped: {e}")));
-            // A replay the server already holds counts as submitted, not failed.
-            let replayed = already_submitted(&result);
-            let submitted = result.is_ok() || replayed;
             let title_str = mapping.title.as_deref().unwrap_or_else(|| mapping.process.as_str()).to_string();
             let time_str = duration::format_session_duration(duration_secs);
-            if submitted {
-                match (&ledger_id, &result) {
-                    (Some(id), Ok(value)) => acknowledge_ledger_session(
+            if let Ok(value) = &result {
+                if let Some(id) = &ledger_id {
+                    acknowledge_ledger_session(
                         &app, id, &remote_reference(value, mapping.froglog_id, &mapping.r#type),
-                    ),
-                    (Some(id), Err(_)) => acknowledge_ledger_session(
-                        &app, id, &format!("{}:{}", mapping.r#type, mapping.froglog_id),
-                    ),
-                    (None, _) => {}
+                    );
                 }
                 let _ = app.notification().builder()
                     .title("Session Auto-Submitted")
@@ -2046,10 +1834,8 @@ fn submit_session(
     let is_public = is_public.unwrap_or(true);
     let ledger_id = submission_ledger_id(&state, ledger_id);
 
-    // The ledger id doubles as the submission's idempotency key. The backend stores `sync_ref`
-    // but does not deduplicate on it yet (PLAN.md phase 4 item 2), so this does not prevent
-    // duplicates today -- it makes them identifiable, and lets that fix apply retroactively to
-    // everything recorded from this build onwards.
+    // Reuse the ledger identity on retry. The backend returns an existing session on a
+    // confirmed replay; a 409 alone is not an acknowledgement.
     let sync_ref = ledger_id.clone();
     let result = match api_client(&auth) {
         None => Err("Not logged in".to_string()),
@@ -2058,13 +1844,6 @@ fn submit_session(
             notes.clone(), spoiler, is_public, sync_ref,
         ),
     };
-    // A replay the server already holds settles the record rather than being queued.
-    if already_submitted(&result) {
-        if let Some(id) = &ledger_id {
-            acknowledge_ledger_session(&app, id, &format!("{game_type}:{game_id}"));
-        }
-        return Ok(serde_json::json!({ "alreadySubmitted": true }));
-    }
     match result {
         Ok(v) => {
             if let Some(id) = ledger_id {
@@ -2103,50 +1882,10 @@ fn submit_session(
 /// between completion and submission). It is still listed — that is the whole point of keeping
 /// records until the server confirms them — using what the session itself knows.
 fn pending_sessions_for(state: &AppState) -> Vec<PendingSession> {
-    let account = state.account();
-    let records = state
-        .with_ledger("reading the retry queue", |l| l.unsubmitted_sessions(account.as_ref()))
-        .unwrap_or_default();
-    records
-        .into_iter()
-        .map(|stored| {
-            let r = stored.record;
-            let fallback_title = || match &r.target {
-                SessionTarget::Mapped(m) => m.title.clone().unwrap_or_else(|| m.process.clone()),
-                SessionTarget::Unmapped { title, .. } => title.clone(),
-                SessionTarget::LegacyPending(p) => p.title.clone(),
-                SessionTarget::LegacyNewGame(g) => g.title.clone(),
-            };
-            let (game_id, game_type) = match &r.target {
-                SessionTarget::Mapped(m) => (m.froglog_id, m.r#type.clone()),
-                _ => (0, "regular".to_string()),
-            };
-            let s = r.submission;
-            PendingSession {
-                id: r.id,
-                game_id: s.as_ref().map(|s| s.game_id).unwrap_or(game_id),
-                game_type: s.as_ref().map(|s| s.game_type.clone()).unwrap_or(game_type),
-                title: s.as_ref().map(|s| s.title.clone()).unwrap_or_else(fallback_title),
-                hours: s.as_ref().map(|s| s.hours).unwrap_or_else(|| {
-                    let secs = r.ended_at_secs.unwrap_or(0).saturating_sub(r.started_at_secs.unwrap_or(0));
-                    ((secs as f64 / 3600.0) * 100.0).round() / 100.0
-                }),
-                notes: s.as_ref().and_then(|s| s.notes.clone()),
-                spoiler: s.as_ref().map(|s| s.spoiler).unwrap_or(false),
-                is_public: s.as_ref().map(|s| s.is_public).unwrap_or(true),
-                date: s.as_ref().map(|s| s.date.clone()).unwrap_or_else(|| {
-                    chrono::Local::now().format("%Y-%m-%d").to_string()
-                }),
-                failed_at: s.as_ref().and_then(|s| s.failed_at.clone()).unwrap_or_default(),
-                error: s
-                    .as_ref()
-                    .and_then(|s| s.last_error.clone())
-                    .unwrap_or_else(|| "Never submitted (LilyPad stopped before it could be sent)".to_string()),
-            }
-        })
-        .collect()
+    let Some(account) = state.account() else { return Vec::new() };
+    state.with_ledger("reading the retry queue", |l| l.pending_sessions(&account))
+        .unwrap_or_default()
 }
-
 #[tauri::command]
 fn get_pending_sessions(state: tauri::State<AppState>) -> Vec<PendingSession> {
     pending_sessions_for(&state)
@@ -2202,80 +1941,24 @@ fn retry_pending_session(
     state: tauri::State<AppState>,
     id: String,
 ) -> Result<(), String> {
-    let sessions = pending_sessions_for(&state);
-    let idx = sessions.iter().position(|s| s.id == id).ok_or("Not found")?;
-    let mut s = sessions[idx].clone();
-    let original = s.clone();
-    log::info!(
-        "[LilyPad] retrying queued session {id}: {} ({}h, {}) — last failed with: {}",
-        s.title, s.hours, s.date, s.error
-    );
+    // Credentials and ownership come from the same snapshot. A later logout/login must
+    // neither submit this row with another token nor prevent acknowledging the original owner.
     let auth = state.auth.read().unwrap().clone();
     let client = api_client(&auth).ok_or("Not logged in")?;
-    let notes = Some(s.notes.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| "Session submitted from Pending Sessions".to_string()));
-
-    // A queue entry created by this build is keyed by its ledger id, so the same idempotency
-    // key is replayed on every retry rather than a fresh one per attempt.
-    let sync_ref = Some(s.id.clone());
-    let first_attempt = submit_play_session(
-        &client, &s.game_type, s.game_id, Some(s.date.clone()), s.hours,
-        notes.clone(), s.spoiler, s.is_public, sync_ref.clone(),
-    );
-    let mut response = match &first_attempt {
-        Ok(v) => v.clone(),
-        Err(_) => serde_json::Value::Null,
-    };
-
-    // A 409 means the server already holds this submission -- a replay of a `sync_ref` it has
-    // seen. The work is done, so settle the record rather than reporting a failure the user
-    // would keep retrying.
-    if first_attempt
-        .as_ref()
-        .err()
-        .is_some_and(|e| api::ApiFailure::classify(e) == api::ApiFailure::AlreadySubmitted)
-    {
-        log::info!("[LilyPad] session {} was already submitted; settling it", s.id);
-        acknowledge_ledger_session(&app, &s.id, &format!("{}:{}", s.game_type, s.game_id));
-        return Ok(());
-    }
-
-    if let Err(first_err) = first_attempt {
-        // Only a genuinely missing game justifies the recovery below. Being offline, rate
-        // limited or logged out must not: the game is fine, and hunting for a live-service
-        // entry to move the session onto would be answering the wrong question -- and on a
-        // network failure the lookup would fail too, masking the real cause.
-        if api::ApiFailure::classify(&first_err) != api::ApiFailure::NotFound {
-            return Err(first_err);
+    let account = ledger_session::account_identity(&auth, DEFAULT_API_URL).ok_or("Not logged in")?;
+    let session = state.with_ledger("reading a pending session", |l| l.pending_session(&id, &account))
+        .ok_or("Session not found for this account, or storage unavailable")?;
+    let result = lilypad_core::submission::retry_play_session(&client, &session, Some(session.id.clone()))?;
+    let remote = remote_reference(&result.response, result.game_id, &result.game_type);
+    match state.with_ledger("recording retry acknowledgement", |l| l.acknowledge(&id, &account, &remote)) {
+        Some(true) => {
+            let handle = app.clone();
+            let _ = app.run_on_main_thread(move || { let _ = update_tray_state(&handle); });
+            Ok(())
         }
-        // Orphaned-mapping recovery -- the queue-time equivalent of `monitor.rs`'s
-        // `heal_orphaned_mapping`. A "session"/"regular" entry that still 404s here most
-        // likely predates a website "move to Live Service": the `games` row it targeted is
-        // gone, but the move copies the title across verbatim into a new
-        // `live_service_games` row (see `games.js`'s `move-to-live-service`), so an exact
-        // title match there recovers it -- this command only ever has a title to go on
-        // (`PendingSession` was never given the Steam appid `heal_orphaned_mapping` uses,
-        // since the queue exists precisely for submissions that already have no live
-        // process/mapping context left). "live" entries never had a `games`-table id to
-        // begin with, so there's nothing to recover for them -- surface the original error.
-        if s.game_type.eq_ignore_ascii_case("live") {
-            return Err(first_err);
-        }
-        let live_games = client.get_live_service_games().map_err(|_| first_err.clone())?;
-        let matched = live_games.into_iter().find(|g| g.title.as_deref() == Some(s.title.as_str()));
-        let Some(g) = matched else { return Err(first_err) };
-        response = client.add_live_service_session(g.id, Some(s.date.clone()), Some(s.hours), notes, s.spoiler, s.is_public, sync_ref)?;
-        s.game_id = g.id;
-        s.game_type = "live".to_string();
-        log::info!(
-            "[LilyPad] recovered pending session {} ({}): {} #{} -> live #{}",
-            s.id, s.title, original.game_type, original.game_id, g.id
-        );
+        Some(false) => Err("The session changed while submitting; check its recorded status".into()),
+        None => Err("Submitted, but the acknowledgement could not be saved. Retry uses the same session key.".into()),
     }
-
-    // Acknowledging is what removes it from the queue: `unsubmitted` only returns records still
-    // in `pending`, so there is no separate list to delete from. The record itself is kept.
-    acknowledge_ledger_session(&app, &s.id, &remote_reference(&response, s.game_id, &s.game_type));
-    Ok(())
 }
 
 /// "Do not record session": the user has looked at a finished session and decided against
@@ -2290,7 +1973,8 @@ fn discard_session(app: tauri::AppHandle, state: tauri::State<AppState>, ledger_
     let Some(id) = submission_ledger_id(&state, ledger_id) else {
         return Ok(());
     };
-    match state.with_ledger("discarding a session", |l| l.dismiss(&id)) {
+    let account = state.account().ok_or("Not logged in")?;
+    match state.with_ledger("discarding a session", |l| l.dismiss_owned(&id, &account)) {
         Some(true) => {
             log::info!("[LilyPad] session {id} discarded at the user's request");
             let app2 = app.clone();
@@ -2316,7 +2000,8 @@ fn delete_pending_session(state: tauri::State<AppState>, id: String) -> Result<(
         .unwrap_or_else(|| "unknown session".to_string());
     // Dismissing takes it out of every queue while keeping the row, so a discarded session stays
     // distinguishable from one that was never recorded.
-    match state.with_ledger("discarding session", |l| l.dismiss(&id)) {
+    let account = state.account().ok_or("Not logged in")?;
+    match state.with_ledger("discarding session", |l| l.dismiss_owned(&id, &account)) {
         Some(true) => {
             log::info!("[LilyPad] queued session {id} discarded: {describe}");
             Ok(())
@@ -2360,19 +2045,15 @@ fn record_mapping_exe_path(app: &tauri::AppHandle, mapping: &ProcessMapping) {
         return;
     };
 
-    let mut map = state.process_map_arc.read().unwrap().clone();
-    if !map.record_mapping_exe_path(&mapping.process, mapping.froglog_id, &mapping.r#type, &exe_path) {
-        return;
+    let auth = state.auth.read().unwrap().clone();
+    match config::backfill_mapping_exe_path(&state.process_map_arc, &auth, mapping, &exe_path) {
+        Ok(true) => log::info!(
+            "[LilyPad] mapping {} -> {} #{} now pinned to {}",
+            mapping.process, mapping.r#type, mapping.froglog_id, exe_path.display()
+        ),
+        Ok(false) => {}
+        Err(e) => log::warn!("[LilyPad] could not save the mapping's executable path: {e}"),
     }
-    if let Err(e) = map.save_to(&process_map_path_for_auth(&state.auth.read().unwrap())) {
-        log::warn!("[LilyPad] could not save the mapping's executable path: {e}");
-        return;
-    }
-    *state.process_map_arc.write().unwrap() = map;
-    log::info!(
-        "[LilyPad] mapping {} -> {} #{} now pinned to {}",
-        mapping.process, mapping.r#type, mapping.froglog_id, exe_path.display()
-    );
 }
 
 /// Records an unmapped game's session durably as it starts, and checkpoints it while it runs.
@@ -2435,19 +2116,13 @@ fn begin_unmapped_session(app: &tauri::AppHandle, start: &monitor::UnmappedSessi
 
 /// Settles the durable record for an unmapped session that ended normally. Its hours go into the
 /// new-games queue by the usual route, so the record has done its job.
-fn finish_unmapped_session(app: &tauri::AppHandle, appid: &str) {
+fn finish_unmapped_session(app: &tauri::AppHandle, appid: &str) -> Option<f64> {
     let state = app.state::<AppState>();
-    let Some(id) = state.active_unmapped_ledger_ids.write().unwrap().remove(appid) else {
-        return;
-    };
-    state.with_ledger("closing an unmapped session", |l| {
-        l.finish(&id, ledger_session::now_secs())?;
-        // Not a submission in its own right -- the play time is carried by the new-games entry
-        // this session was just accumulated into, which is what gets resolved.
-        l.dismiss(&id)
-    });
+    let id = state.active_unmapped_ledger_ids.write().unwrap().remove(appid)?;
+    state.with_ledger("completing an unmapped session", |l| {
+        l.complete_unmapped(&id, ledger_session::now_secs(), false)
+    }).flatten()
 }
-
 /// Records that a new game was added to the library, naming what it became. Called by every
 /// resolve path.
 ///
@@ -2514,41 +2189,6 @@ fn search_igdb_games(state: tauri::State<AppState>, query: String) -> Result<Vec
     let auth = state.auth.read().unwrap();
     let client = api_client(&auth).ok_or("Not logged in")?;
     client.search_igdb(&query)
-}
-
-/// Logs each individually-accumulated real-world play session in `entry.sessions` as its own
-/// FrogLog session (each with its own real date), via `submit_one(date, hours)`. Falls back to a
-/// single entry dated today using the accumulated `entry.hours` total for a pending item
-/// persisted before per-session tracking existed (`sessions` defaults to empty in that case) --
-/// otherwise resolving it would silently lose the hours rather than just merging them.
-/// Each session is given a `sync_ref` derived from the pending entry's appid and the session's
-/// position in the list, which is what makes a partly-completed resolution resumable. An upload
-/// that fails halfway leaves earlier sessions on the server and the pending entry still queued;
-/// resolving again replays the *same* keys, so the server recognises and skips what it already
-/// has instead of logging every earlier session a second time (see `sync_ref` uniqueness,
-/// phase 4 item 2). `sessions` is only ever appended to, so an index is stable across retries.
-/// Returns how many sessions were logged, so the caller's log line can say.
-fn log_each_pending_session(
-    entry: &config::PendingGameSubmission,
-    mut submit_one: impl FnMut(String, f64, Option<String>) -> Result<serde_json::Value, String>,
-) -> Result<usize, String> {
-    let key = |index: usize| Some(format!("newgame:{}#{index}", entry.appid));
-    if entry.sessions.is_empty() {
-        let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-        submit_one(date, entry.hours, key(0))?;
-        return Ok(1);
-    }
-    let total = entry.sessions.len();
-    for (index, session) in entry.sessions.iter().enumerate() {
-        // Logged per session so a resolution that fails partway says how far it got. The caller
-        // reports the total, which is no help when the answer is "it stopped at the fourth".
-        log::info!(
-            "[LilyPad] logging session {}/{total} for {}: {}h on {}",
-            index + 1, entry.title, session.hours, session.date
-        );
-        submit_one(session.date.clone(), session.hours, key(index))?;
-    }
-    Ok(total)
 }
 
 /// Resolves a pending game submission by creating a brand-new FrogLog game entry for it.
@@ -3279,7 +2919,7 @@ pub fn run() {
             storage_error: Arc::new(RwLock::new(ledger_open_error)),
             library_stale: Arc::new(RwLock::new(false)),
             install_fingerprint: Arc::new(RwLock::new(None)),
-            active_ledger_id: Arc::new(RwLock::new(None)),
+            active_ledger_id: Default::default(),
             active_unmapped_ledger_ids: Arc::new(RwLock::new(std::collections::HashMap::new())),
             last_finished_ledger_id: Arc::new(RwLock::new(None)),
         })
@@ -3533,7 +3173,7 @@ pub fn run() {
                         let ledger_id = {
                             let state = handle.state::<AppState>();
                             let id = begin_ledger_session(&state, &process_name, &mapping);
-                            *state.active_ledger_id.write().unwrap() = id.clone();
+                            state.active_ledger_id.set(&process_name, id.clone());
                             id
                         };
                         // Pin the mapping to this exact binary, so a same-named executable from
@@ -3592,7 +3232,13 @@ pub fn run() {
                             // A force-stopped session was already ended by the tray handler.
                             // Clear the block now the process has genuinely exited.
                             let was_force_stopped = take_force_stop(&state, &process_name);
-                            let active_id = state.active_ledger_id.write().unwrap().take();
+                            // Only this process's own record, and none at all after a force-stop:
+                            // by then the slot may hold a different game started since.
+                            let active_id = if was_force_stopped {
+                                None
+                            } else {
+                                state.active_ledger_id.take_for(&process_name)
+                            };
 
                             // Completion is persisted before any notification or network call,
                             // so a crash between the game exiting and the session being
@@ -3641,39 +3287,11 @@ pub fn run() {
                 },
                 {
                     let handle = app_handle_for_unmapped;
-                    move |title: String, appid: String, exe_name: String, duration_secs: f64, replay_of: Option<lilypad_core::library_match::ResolvedLibraryGame>| {
-                        // The durable start-of-play record has served its purpose: the hours are
-                        // about to go into the new-games queue, which is what gets resolved.
-                        finish_unmapped_session(&handle, &appid);
-                        let raw_hours = duration_secs / 3600.0;
-                        let hours = { let r = (raw_hours * 100.0).round() / 100.0; if r < 0.01 { 0.01 } else { r } };
-                        let replay_of = replay_of.map(|r| config::ReplayOf { id: r.id, game_type: r.game_type, title: r.title, status: r.status });
-                        {
-                            let state = handle.state::<AppState>();
-                            let account = state.account();
-                            let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-                            let total = state.with_ledger("recording a new-game session", |l| {
-                                l.record_new_game_session(
-                                    account.as_ref(),
-                                    &appid,
-                                    &title,
-                                    &exe_name,
-                                    hours,
-                                    replay_of.clone(),
-                                    today,
-                                    ledger_session::now_secs(),
-                                )
-                            });
-                            // Logged like any other session: an unmapped game is recorded only
-                            // when it ends (the monitor has no unmapped-session-started
-                            // callback), so without this the whole play produced no log at all.
-                            if let Some(total) = total {
-                                log::info!(
-                                    "[LilyPad] new game {title} (appid {appid}) played for {hours}h; \
-                                     {total}h awaiting resolution"
-                                );
-                            }
-                        }
+                    move |title: String, appid: String, _exe_name: String, duration_secs: f64, replay_of: Option<lilypad_core::library_match::ResolvedLibraryGame>| {
+                        // The recorded owner and target are authoritative, even after logout.
+                        // A failed transaction leaves the source available for startup recovery.
+                        let Some(total) = finish_unmapped_session(&handle, &appid) else { return; };
+                        log::info!("[LilyPad] new game {title} (appid {appid}); {total}h awaiting resolution");
                         let time_str = duration::format_session_duration(duration_secs);
                         let body = if replay_of.is_some() {
                             format!("{title} ({time_str}) is marked as finished in FrogLog. Resolve?")

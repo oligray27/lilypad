@@ -1,0 +1,8 @@
+{
+  "process": "portal2_linux",
+  "game_type": "session",
+  "froglog_id": 101,
+  "title": "Fixture active game",
+  "started_at_secs": 1787263200,
+  "last_alive_secs": 1787263800
+}

@@ -1,9 +1,18 @@
 use crate::session_flow::{self, SessionEndedData};
-use crate::state::{AppState, DEFAULT_API_URL};
+use crate::state::AppState;
 use crate::tray::RefreshTray;
 use adw::prelude::*;
-use lilypad_core::api::FroglogClient;
-use lilypad_core::config::{load_pending_sessions, save_pending_sessions, PendingSession};
+use std::cell::Cell;
+use std::rc::Rc;
+
+/// How one Submit attempt ended, decided on the worker thread.
+enum Attempt {
+    Submitted,
+    /// Failed, and the session is durably in Pending Submissions: terminal for this popup.
+    Queued(String),
+    /// Failed and could not be saved, or was refused; the user may try again.
+    Failed(String),
+}
 
 /// Builds and presents the session-ended popup as its own small top-level
 /// window (not a stack page) — the original positions this near the tray
@@ -86,13 +95,43 @@ pub fn show_popup(state: AppState, parent: &gtk4::Window, refresh_tray: RefreshT
         .title("LilyPad")
         .build();
 
+    // Set once a failed submission has been saved for retry. From then on this popup has
+    // nothing left to decide: the record is retried from Pending Submissions, not from here.
+    let queued = Rc::new(Cell::new(false));
+
+    // "Do not record session" discards the record explicitly. Closing the window without a
+    // choice leaves it pending, so the session is never lost by accident.
     skip_button.connect_clicked({
         let window = window.clone();
-        move |_| window.close()
+        let state = state.clone();
+        let refresh_tray = refresh_tray.clone();
+        let error_label = error_label.clone();
+        let ledger_id = data.ledger_id.clone();
+        let queued = Rc::clone(&queued);
+        move |_| {
+            if queued.get() {
+                window.close();
+                return;
+            }
+            if let (Some(id), Some(account)) = (&ledger_id, state.account()) {
+                if state.store().discard(id, &account).is_none() {
+                    error_label.set_text(&format!(
+                        "Could not discard this session: {}",
+                        state.store().error().unwrap_or_else(|| "storage unavailable".into())
+                    ));
+                    error_label.set_visible(true);
+                    return;
+                }
+                refresh_tray();
+            }
+            window.close();
+        }
     });
 
     submit_button.connect_clicked({
         let window = window.clone();
+        let skip_button = skip_button.clone();
+        let queued = Rc::clone(&queued);
         move |btn| {
             let notes = if has_notes {
                 let (start, end) = notes_buffer.bounds();
@@ -109,57 +148,37 @@ pub fn show_popup(state: AppState, parent: &gtk4::Window, refresh_tray: RefreshT
             btn.set_sensitive(false);
             error_label.set_visible(false);
 
-            let auth = state.auth.read().unwrap().clone();
+            skip_button.set_sensitive(false);
+            let state = state.clone();
             let mapping = data.mapping.clone();
-            let title = mapping.title.clone().unwrap_or_else(|| mapping.process.clone());
+            let ledger_id = data.ledger_id.clone();
 
             let (tx, rx) = async_channel::bounded(1);
             std::thread::spawn(move || {
-                let base = auth.base_url.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| DEFAULT_API_URL.to_string());
-                let mut client = FroglogClient::new(base);
-                client.set_token(auth.token.clone());
-                let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-                let result = if mapping.r#type.eq_ignore_ascii_case("live") {
-                    client.add_live_service_session(mapping.froglog_id, Some(date), Some(hours), notes.clone(), spoiler, is_public, None)
-                } else if mapping.r#type.eq_ignore_ascii_case("session") {
-                    client.add_game_session(mapping.froglog_id, Some(date), Some(hours), notes.clone(), spoiler, is_public, None)
-                } else {
-                    client.update_game_hours(mapping.froglog_id, hours)
-                };
-                let _ = tx.send_blocking((result, notes, spoiler, is_public, hours, mapping, title));
+                let _ = tx.send_blocking(submit(&state, &mapping, ledger_id, hours, notes, spoiler, is_public));
             });
 
             let window = window.clone();
             let refresh_tray = refresh_tray.clone();
             let btn = btn.clone();
+            let skip_button = skip_button.clone();
             let error_label = error_label.clone();
+            let queued = Rc::clone(&queued);
             glib::spawn_future_local(async move {
-                let Ok((result, notes, spoiler, is_public, hours, mapping, title)) = rx.recv().await else { return };
-                match result {
-                    Ok(_) => {
-                        window.close();
+                let Ok(attempt) = rx.recv().await else { return };
+                refresh_tray();
+                skip_button.set_sensitive(true);
+                match attempt {
+                    Attempt::Submitted => window.close(),
+                    Attempt::Queued(message) => {
+                        queued.set(true);
+                        skip_button.set_label("Close");
+                        error_label.set_text(&message);
+                        error_label.set_visible(true);
                     }
-                    Err(e) => {
-                        let mut sessions = load_pending_sessions();
-                        sessions.push(PendingSession {
-                            id: chrono::Local::now().timestamp_millis().to_string(),
-                            game_id: mapping.froglog_id,
-                            game_type: mapping.r#type.clone(),
-                            title,
-                            hours,
-                            notes,
-                            spoiler,
-                            is_public,
-                            date: chrono::Local::now().format("%Y-%m-%d").to_string(),
-                            failed_at: chrono::Local::now().to_rfc3339(),
-                            error: e.clone(),
-                        });
-                        save_pending_sessions(&sessions);
-                        refresh_tray();
+                    Attempt::Failed(message) => {
                         btn.set_sensitive(true);
-                        error_label.set_text(&format!(
-                            "Submission failed, session saved to Pending Submissions. {e}"
-                        ));
+                        error_label.set_text(&message);
                         error_label.set_visible(true);
                     }
                 }
@@ -168,4 +187,57 @@ pub fn show_popup(state: AppState, parent: &gtk4::Window, refresh_tray: RefreshT
     });
 
     window.present();
+}
+
+/// Blocking: submits against the session's record, then acknowledges or queues that record.
+fn submit(
+    state: &AppState,
+    mapping: &lilypad_core::config::ProcessMapping,
+    ledger_id: Option<String>,
+    hours: f64,
+    notes: Option<String>,
+    spoiler: bool,
+    is_public: bool,
+) -> Attempt {
+    // One snapshot for both, so a login change mid-popup cannot pair them up wrongly.
+    let auth = state.auth.read().unwrap().clone();
+    let store = state.store();
+    let account = store.account(&auth);
+    if account.is_none() {
+        return Attempt::Failed("Log in to FrogLog to submit this session.".into());
+    }
+    if !session_flow::may_submit(state, ledger_id.as_deref(), account.as_ref()) {
+        return Attempt::Failed(
+            "This session was started under a different FrogLog account. Log back in to that account to submit it.".into(),
+        );
+    }
+    let client = session_flow::client_for(&auth);
+    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let result = lilypad_core::submission::submit_play_session(
+        &client, &mapping.r#type, mapping.froglog_id, Some(date.clone()), hours,
+        notes.clone(), spoiler, is_public, ledger_id.clone(),
+    );
+    match result {
+        Ok(response) => {
+            if let (Some(id), Some(account)) = (&ledger_id, &account) {
+                let remote = lilypad_core::submission::remote_reference(&response, mapping.froglog_id, &mapping.r#type);
+                if store.acknowledge(id, account, &remote).is_none() {
+                    log::warn!("[LilyPad] session {id} submitted but its acknowledgement was not saved; a retry reuses the same key");
+                }
+            }
+            Attempt::Submitted
+        }
+        Err(e) => {
+            let explanation = lilypad_core::submission::explain_failure(&e);
+            let submission = session_flow::failed_submission(mapping, hours, date, notes, spoiler, is_public, &e);
+            if store.queue_failed(ledger_id.as_deref(), account, submission) {
+                Attempt::Queued(format!("Submission failed; the session is saved in Pending Submissions. {explanation}"))
+            } else {
+                Attempt::Failed(format!(
+                    "Submission failed and the session could not be saved for retry ({}). {explanation}",
+                    store.error().unwrap_or_else(|| "storage unavailable".into())
+                ))
+            }
+        }
+    }
 }

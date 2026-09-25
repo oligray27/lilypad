@@ -18,6 +18,7 @@ glib = "0.22"
 ksni = { version = "0.3", features = ["blocking"] }
 notify-rust = "4"
 async-channel = "2"
+tokio = { version = "1", features = ["sync", "time", "macros", "rt", "net"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sysinfo = "0.31"

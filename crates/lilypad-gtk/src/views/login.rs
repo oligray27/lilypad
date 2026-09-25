@@ -1,7 +1,7 @@
 use crate::state::{AppState, DEFAULT_API_URL};
 use adw::prelude::*;
 use lilypad_core::api::FroglogClient;
-use lilypad_core::config::{auth_config_path, process_map_path_for_auth, ProcessMapConfig};
+use lilypad_core::config::AuthConfig;
 use std::rc::Rc;
 
 /// Builds the login view. `on_success` is called (on the GTK main thread) once
@@ -83,16 +83,21 @@ pub fn build(state: AppState, on_success: impl Fn() + 'static) -> gtk4::Box {
             btn.set_sensitive(true);
             match result {
                 Ok(res) => {
-                    let map_path = {
-                        let mut auth = state.auth.write().unwrap();
-                        auth.base_url = Some(DEFAULT_API_URL.to_string());
-                        auth.token = Some(res.token.clone());
-                        auth.username = res.username.clone().or_else(|| Some(username.clone()));
-                        let _ = auth.save_to(&auth_config_path());
-                        process_map_path_for_auth(&auth)
+                    let auth = AuthConfig {
+                        base_url: Some(DEFAULT_API_URL.to_string()),
+                        token: Some(res.token),
+                        username: res.username.or(Some(username)),
                     };
-                    let process_map = ProcessMapConfig::load_from(&map_path);
-                    *state.process_map.write().unwrap() = process_map;
+                    if let Err(e) = state.change_account(auth) {
+                        error_label.set_text(&e);
+                        error_label.set_visible(true);
+                        return;
+                    }
+                    let refresh_state = state.clone();
+                    std::thread::spawn(move || {
+                        refresh_state.refresh_installed_games();
+                        refresh_state.refresh_library_index();
+                    });
                     on_success();
                 }
                 Err(e) => {

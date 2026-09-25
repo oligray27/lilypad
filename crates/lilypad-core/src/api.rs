@@ -120,7 +120,7 @@ pub struct AddSessionBody {
     pub is_public: bool,
     /// Opaque source identifier (e.g. "lilypad-mobile:{system}|{path}") a syncing
     /// client can stamp on a session to recognize it again later, without
-    /// polluting the user-visible `notes` field. Unused by desktop LilyPad.
+    /// polluting the user-visible `notes` field. Ledger-backed desktop sessions use their UUID.
     pub sync_ref: Option<String>,
 }
 
@@ -144,8 +144,7 @@ pub struct FroglogClient {
 /// Every request in this client reports failures as a `String`, and changing that would ripple
 /// through both frontends -- the GTK one pipes `Result<_, String>` through typed channels -- so
 /// the status code is carried *in* the message by `http_error` and recovered here. Stringly, but
-/// contained in one place and tested, rather than a type change across ~29 call sites, half of
-/// which cannot be compiler-checked on this host.
+/// contained in one place and tested, preserving the frontends' existing channel/IPC contracts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiFailure {
     /// The token is rejected. Retrying unchanged cannot work; it needs a fresh login.
@@ -153,9 +152,9 @@ pub enum ApiFailure {
     /// The target is gone. For a session submit this is the orphaned-mapping case -- the game
     /// was deleted or moved between types -- and is worth trying to recover from, not retrying.
     NotFound,
-    /// The server already holds this submission (a `sync_ref` replay). Not a failure: the work
-    /// is done, and retrying would only ask again.
-    AlreadySubmitted,
+    /// The server has not confirmed a result. A session may still be being created;
+    /// only a successful response with the existing session can acknowledge a replay.
+    Conflict,
     /// Asked to slow down. The same request should succeed later, untouched.
     RateLimited,
     /// The request itself is unacceptable. Retrying it identically will fail identically.
@@ -167,7 +166,7 @@ pub enum ApiFailure {
 impl ApiFailure {
     /// Whether retrying the identical request could plausibly succeed later.
     pub fn is_worth_retrying(self) -> bool {
-        matches!(self, Self::RateLimited | Self::Transient)
+        matches!(self, Self::RateLimited | Self::Transient | Self::Conflict)
     }
 
     /// Classifies an error message produced by this client.
@@ -181,7 +180,7 @@ impl ApiFailure {
             return match status {
                 401 | 403 => Self::Unauthorized,
                 404 => Self::NotFound,
-                409 => Self::AlreadySubmitted,
+                409 => Self::Conflict,
                 408 | 429 => Self::RateLimited,
                 500..=599 => Self::Transient,
                 _ => Self::Rejected,
@@ -423,7 +422,10 @@ impl FroglogClient {
         games
             .into_iter()
             .find(|v| v.get("id").and_then(|i| i.as_i64()) == Some(game_id as i64))
-            .ok_or_else(|| "Game not found".to_string())
+            // Formatted as the 404 it is (see `http_error`), so `ApiFailure::classify` reads it
+            // as NotFound. As a bare "Game not found" it classified as a transient network error,
+            // so the dead-mapping cleanup that depends on NotFound never ran.
+            .ok_or_else(|| format!("404: Game {game_id} not found"))
     }
 
     /// Parse a numeric field that pg may serialize as a JSON string (DECIMAL columns).
@@ -802,7 +804,7 @@ mod tests {
             (reqwest::StatusCode::UNAUTHORIZED, ApiFailure::Unauthorized),
             (reqwest::StatusCode::FORBIDDEN, ApiFailure::Unauthorized),
             (reqwest::StatusCode::NOT_FOUND, ApiFailure::NotFound),
-            (reqwest::StatusCode::CONFLICT, ApiFailure::AlreadySubmitted),
+            (reqwest::StatusCode::CONFLICT, ApiFailure::Conflict),
             (reqwest::StatusCode::TOO_MANY_REQUESTS, ApiFailure::RateLimited),
             (reqwest::StatusCode::BAD_REQUEST, ApiFailure::Rejected),
             (reqwest::StatusCode::UNPROCESSABLE_ENTITY, ApiFailure::Rejected),
@@ -820,7 +822,7 @@ mod tests {
         let body = serde_json::json!({ "error": "Session with this sync_ref is already being created" });
         assert_eq!(
             ApiFailure::classify(&http_error(reqwest::StatusCode::CONFLICT, Some(body))),
-            ApiFailure::AlreadySubmitted
+            ApiFailure::Conflict
         );
     }
 
@@ -835,18 +837,20 @@ mod tests {
             ApiFailure::Transient
         );
         assert_eq!(ApiFailure::classify("operation timed out"), ApiFailure::Transient);
+        // `get_game_raw`'s lookup miss is a genuine "no such game", not a network blip: the
+        // dead-mapping cleanup after an auto-link depends on it reading as NotFound.
+        assert_eq!(ApiFailure::classify("404: Game 13072 not found"), ApiFailure::NotFound);
     }
 
-    /// Only these two are worth handing back to the retry queue; the rest need a human or are
-    /// already done.
+    /// Transient failures and unconfirmed conflicts can be retried with the same identity.
     #[test]
     fn only_transient_failures_are_worth_retrying() {
         assert!(ApiFailure::Transient.is_worth_retrying());
         assert!(ApiFailure::RateLimited.is_worth_retrying());
+        assert!(ApiFailure::Conflict.is_worth_retrying());
         for settled in [
             ApiFailure::Unauthorized,
             ApiFailure::NotFound,
-            ApiFailure::AlreadySubmitted,
             ApiFailure::Rejected,
         ] {
             assert!(!settled.is_worth_retrying(), "{settled:?} should not be retried blindly");

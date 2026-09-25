@@ -9,10 +9,12 @@ use crate::session_flow::client_for;
 use crate::state::AppState;
 use crate::tray::RefreshTray;
 use adw::prelude::*;
-use lilypad_core::config::{load_pending_game_submissions, remove_pending_game_submission, PendingGameSubmission, ReplayOf};
+use lilypad_core::config::{PendingGameSubmission, ReplayOf};
 use lilypad_core::library_match::normalize_title;
 use std::cell::RefCell;
 use std::rc::Rc;
+
+const EMPTY_TEXT: &str = "No games detected outside FrogLog.";
 
 /// Best-effort pre-selection for the "Map to Existing" dropdown — exact normalized-title match
 /// first, then substring containment either direction. Just a starting point for the user to
@@ -54,7 +56,8 @@ pub fn build(state: AppState, refresh_tray: RefreshTray) -> (gtk4::Widget, Rc<dy
     desc.add_css_class("dim-label");
     container.append(&desc);
 
-    let empty_label = gtk4::Label::new(Some("No games detected outside FrogLog."));
+    let empty_label = gtk4::Label::new(Some(EMPTY_TEXT));
+    empty_label.set_wrap(true);
     empty_label.add_css_class("dim-label");
     empty_label.set_margin_top(24);
     empty_label.set_visible(false);
@@ -86,7 +89,29 @@ pub fn build(state: AppState, refresh_tray: RefreshTray) -> (gtk4::Widget, Rc<dy
             while let Some(child) = list_box.first_child() {
                 list_box.remove(&child);
             }
-            let items = load_pending_game_submissions();
+            // An unreadable queue is reported as such, never shown as "nothing detected".
+            let store = state.store();
+            let items = match state.account() {
+                None => Err("Log in to see games detected outside FrogLog.".to_string()),
+                Some(account) => store.new_games(&account).ok_or_else(|| {
+                    format!(
+                        "New Games cannot be read: {}",
+                        store.error().unwrap_or_else(|| "session storage is unavailable".into())
+                    )
+                }),
+            };
+            let items = match items {
+                Ok(items) => {
+                    empty_label.set_text(EMPTY_TEXT);
+                    empty_label.remove_css_class("error");
+                    items
+                }
+                Err(message) => {
+                    empty_label.set_text(&message);
+                    empty_label.add_css_class("error");
+                    Vec::new()
+                }
+            };
             let is_empty = items.is_empty();
             empty_label.set_visible(is_empty);
             scroller.set_visible(!is_empty);
@@ -580,13 +605,28 @@ fn build_row(state: AppState, entry: PendingGameSubmission, on_changed: Rc<dyn F
     dismiss_btn.connect_clicked({
         let appid = entry.appid.clone();
         let on_changed = Rc::clone(&on_changed);
-        move |_| {
-            remove_pending_game_submission(&appid);
-            on_changed();
-        }
+        let status_label = status_label.clone();
+        move |_| dismiss(&state, &appid, &status_label, &on_changed)
     });
 
     row
+}
+
+/// Discards a New Games entry for the logged-in account; the row is kept in the ledger,
+/// distinguishable from one that was resolved.
+fn dismiss(state: &AppState, appid: &str, status_label: &gtk4::Label, on_changed: &Rc<dyn Fn()>) {
+    let Some(account) = state.account() else { return };
+    match state.store().dismiss_new_game(&account, appid) {
+        Some(_) => on_changed(),
+        None => {
+            status_label.add_css_class("error");
+            status_label.set_text(&format!(
+                "Could not dismiss: {}",
+                state.store().error().unwrap_or_else(|| "storage unavailable".into())
+            ));
+            status_label.set_visible(true);
+        }
+    }
 }
 
 /// Row for a pending submission whose appid matches an existing library entry that's already
@@ -730,10 +770,8 @@ fn build_replay_row(state: AppState, entry: PendingGameSubmission, replay_of: Re
     dismiss_btn.connect_clicked({
         let appid = entry.appid.clone();
         let on_changed = Rc::clone(&on_changed);
-        move |_| {
-            remove_pending_game_submission(&appid);
-            on_changed();
-        }
+        let status_label = status_label.clone();
+        move |_| dismiss(&state, &appid, &status_label, &on_changed)
     });
 
     row

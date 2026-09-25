@@ -132,7 +132,10 @@ impl ksni::Tray for LilypadTray {
                 }
                 .into(),
             );
-            let pending_count = lilypad_core::config::load_pending_sessions().len();
+            let account = self.state.account();
+            let counts = self.state.store().counts(account.as_ref());
+            // Unowned imports are listed in the Pending view, where they are assigned.
+            let pending_count = counts.pending.unwrap_or(0) + counts.unowned.unwrap_or(0);
             if pending_count > 0 {
                 items.push(
                     StandardItem {
@@ -142,8 +145,18 @@ impl ksni::Tray for LilypadTray {
                     }
                     .into(),
                 );
+            } else if counts.pending.is_none() {
+                // Unknown is not zero: keep the queue reachable so its error can be seen.
+                items.push(
+                    StandardItem {
+                        label: "Pending Submissions (unavailable)".into(),
+                        activate: Box::new(|t: &mut Self| t.send(TrayAction::ShowPending)),
+                        ..Default::default()
+                    }
+                    .into(),
+                );
             }
-            let new_games_count = lilypad_core::config::load_pending_game_submissions().len();
+            let new_games_count = counts.new_games.unwrap_or(0);
             if new_games_count > 0 {
                 items.push(
                     StandardItem {

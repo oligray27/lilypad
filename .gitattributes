@@ -1,0 +1,2 @@
+# Linux validation/release scripts must remain executable by bash after Windows checkouts.
+*.sh text eol=lf

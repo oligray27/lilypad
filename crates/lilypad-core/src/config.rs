@@ -171,7 +171,9 @@ impl ProcessMapConfig {
             .iter()
             .filter(|m| m.process.eq_ignore_ascii_case(process_name))
             .collect();
-        let Some(actual) = exe_path else {
+        // A Wine/Proton host binary is shared by every game it runs, so its path says nothing
+        // about which game this is -- match by name alone, as if no path were known.
+        let Some(actual) = exe_path.filter(|p| !is_shared_game_host(p)) else {
             return by_name;
         };
 
@@ -214,6 +216,11 @@ impl ProcessMapConfig {
         game_type: &str,
         exe_path: &std::path::Path,
     ) -> bool {
+        // Pinning a mapping to `wine64-preloader` would identify nothing, and once Proton is
+        // upgraded the old (still installed) binary would make the mapping stop matching.
+        if is_shared_game_host(exe_path) {
+            return false;
+        }
         let Some(mapping) = self.mappings.iter_mut().find(|m| {
             m.process.eq_ignore_ascii_case(process_name)
                 && m.froglog_id == froglog_id
@@ -228,6 +235,96 @@ impl ProcessMapConfig {
         mapping.exe_path = Some(path);
         true
     }
+
+    /// The mapped process name that `comm` is the kernel-truncated form of, if exactly one
+    /// mapping could be meant. Linux caps a process's reported name at 15 bytes, and Wine sets
+    /// that name from the game's `.exe`, so `HotlineMiami.exe` is reported as `HotlineMiami.ex`
+    /// and never matches its mapping exactly. Two mappings sharing the same first 15 bytes are
+    /// ambiguous and match nothing, rather than guessing.
+    pub fn find_by_truncated_comm(&self, comm: &str) -> Option<String> {
+        let mut names = self
+            .mappings
+            .iter()
+            .filter(|m| is_truncated_comm_of(comm, &m.process))
+            .map(|m| m.process.as_str());
+        let first = names.next()?;
+        if names.any(|n| !n.eq_ignore_ascii_case(first)) {
+            log::info!("[LilyPad] process name {comm:?} is truncated and matches several mappings; not guessing");
+            return None;
+        }
+        Some(first.to_string())
+    }
+}
+
+/// The longest process name Linux reports (`TASK_COMM_LEN` is 16 including the terminator).
+pub const COMM_MAX_LEN: usize = 15;
+
+/// Whether a reported process name `comm` could be the truncated form of `full`. Always false
+/// off Linux, where reported names are not truncated this way.
+pub fn is_truncated_comm_of(comm: &str, full: &str) -> bool {
+    cfg!(target_os = "linux")
+        && comm.len() == COMM_MAX_LEN
+        && full.len() > COMM_MAX_LEN
+        && full.as_bytes()[..COMM_MAX_LEN].eq_ignore_ascii_case(comm.as_bytes())
+}
+
+/// Process names of executables that host many different games (Wine, Proton's Python entry
+/// point). Such a name or path identifies the runtime, not the game.
+pub fn is_shared_host_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "wine" | "wine64" | "wine-preloader" | "wine64-preloader" | "wineserver" | "proton"
+    ) || name.starts_with("python")
+}
+
+pub fn is_shared_game_host(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(is_shared_host_name)
+}
+
+/// Removes the mapping of `process` to a game that turned out not to exist, saving the account's
+/// map. Returns whether one was removed. The auto-link path builds mappings from the cached
+/// library, which can still list a game deleted on the website since the last refresh; left in
+/// place, every future launch would track against an id the server 404s on.
+pub fn remove_dead_mapping(
+    process_map_arc: &std::sync::Arc<std::sync::RwLock<ProcessMapConfig>>,
+    auth: &AuthConfig,
+    process: &str,
+    game_type: &str,
+    froglog_id: i32,
+) -> Result<bool, String> {
+    let mut map = process_map_arc.read().unwrap().clone();
+    let before = map.mappings.len();
+    map.mappings.retain(|m| {
+        !(m.froglog_id == froglog_id
+            && m.r#type.eq_ignore_ascii_case(game_type)
+            && m.process.eq_ignore_ascii_case(process))
+    });
+    if map.mappings.len() == before {
+        return Ok(false);
+    }
+    map.save_to(&process_map_path_for_auth(auth)).map_err(|e| e.to_string())?;
+    *process_map_arc.write().unwrap() = map;
+    Ok(true)
+}
+
+/// Pins `mapping` to the executable it was just seen running as, saving the account's map.
+/// Returns whether anything changed. No-op for a shared Wine/Proton host binary.
+pub fn backfill_mapping_exe_path(
+    process_map_arc: &std::sync::Arc<std::sync::RwLock<ProcessMapConfig>>,
+    auth: &AuthConfig,
+    mapping: &ProcessMapping,
+    exe_path: &std::path::Path,
+) -> Result<bool, String> {
+    let mut map = process_map_arc.read().unwrap().clone();
+    if !map.record_mapping_exe_path(&mapping.process, mapping.froglog_id, &mapping.r#type, exe_path) {
+        return Ok(false);
+    }
+    map.save_to(&process_map_path_for_auth(auth)).map_err(|e| e.to_string())?;
+    *process_map_arc.write().unwrap() = map;
+    Ok(true)
 }
 
 /// Case-insensitive on Windows, where the same binary is routinely reported with different
@@ -650,6 +747,41 @@ mod tests {
             title_filter: title_filter.map(|s| s.to_string()),
             exe_path: None,
         }
+    }
+
+    /// Recording `wine64-preloader` would identify nothing, and after a Proton upgrade the old
+    /// (still installed) binary would make the mapping match nothing either.
+    #[test]
+    fn a_wine_host_is_never_recorded_or_used_as_a_games_path() {
+        let wine = std::path::Path::new(
+            "/home/u/.local/share/Steam/steamapps/common/Proton 9.0/files/bin/wine64-preloader",
+        );
+        let mut cfg = ProcessMapConfig { mappings: vec![mapping("Balatro.exe", "session", 1, None)], ..Default::default() };
+        assert!(!cfg.record_mapping_exe_path("Balatro.exe", 1, "session", wine));
+        assert!(cfg.mappings[0].exe_path.is_none());
+
+        // Even a path recorded by an older build must not stop a newer Proton from matching.
+        cfg.mappings[0].exe_path = Some(wine.to_string_lossy().into_owned());
+        let newer = std::path::Path::new(
+            "/home/u/.local/share/Steam/steamapps/common/Proton - Experimental/files/bin/wine64-preloader",
+        );
+        assert_eq!(cfg.find_all_for_process("Balatro.exe", Some(newer)).len(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_truncated_wine_process_name_finds_its_mapping_only_when_unambiguous() {
+        let mut cfg = ProcessMapConfig {
+            mappings: vec![mapping("HotlineMiami.exe", "session", 1, None), mapping("Hades.exe", "session", 2, None)],
+            ..Default::default()
+        };
+        assert_eq!(cfg.find_by_truncated_comm("HotlineMiami.ex").as_deref(), Some("HotlineMiami.exe"));
+        // Only a genuinely truncated (15-byte) name is treated as one.
+        assert_eq!(cfg.find_by_truncated_comm("HotlineMiami"), None);
+        assert_eq!(cfg.find_by_truncated_comm("Hades.exe"), None);
+        // Two games sharing their first 15 bytes: refuse to guess.
+        cfg.mappings.push(mapping("HotlineMiami.exe2", "session", 3, None));
+        assert_eq!(cfg.find_by_truncated_comm("HotlineMiami.ex"), None);
     }
 
     #[test]

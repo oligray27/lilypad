@@ -275,6 +275,18 @@ fn maybe_start_unmapped_tracking(
         return None;
     }
 
+    // A mapping already covers this executable, so the mapped path tracks it. This is reached
+    // for a Proton game, whose `waitforexitandrun` wrapper resolves to the game's `.exe` through
+    // its command line while the game's own Wine process matches the mapping by name. The
+    // library check further down only catches that when the mapped game resolves by appid; a
+    // mapping to an entry with no Steam link, or to one deleted since the last refresh, slipped
+    // past it and the same play was recorded twice (once mapped, once as a New Game). Asked
+    // with the matched path, so an install that a pinned mapping says is a *different* game
+    // with the same filename still proceeds.
+    if !config.read().unwrap().find_all_for_process(exe_name, Some(&matched_path)).is_empty() {
+        return None;
+    }
+
     // A companion process not on the `is_known_helper_process` blocklist can still start or
     // exit around the same time as the real game (e.g. right after it closes) and get
     // misattributed as a new instance of the same appid. Skip it if we very recently finished
@@ -327,7 +339,9 @@ fn maybe_start_unmapped_tracking(
     }
 
     let mut replay_of = None;
-    if let Some(resolved) = library_index.read().unwrap().resolve_by_appid(&found.appid).cloned() {
+    // Drop the library guard before callbacks acquire frontend account/config locks.
+    let resolved = library_index.read().unwrap().resolve_by_appid(&found.appid).cloned();
+    if let Some(resolved) = resolved {
         // If some OTHER process is already mapped to this exact game (most commonly: the game's
         // own renamed "<Game>.exe" process, when *this* process is a Proton/Wine launcher
         // wrapper that never gets renamed -- e.g. the `python3 <proton> waitforexitandrun <exe>`
@@ -691,7 +705,12 @@ fn process_matches_name(process: &sysinfo::Process, process_name: &str) -> bool 
         .exe()
         .and_then(|path| path.file_name().and_then(|n| n.to_str()))
         .is_some_and(|e| e.eq_ignore_ascii_case(process_name));
-    exe_matches || process.name().to_string_lossy().eq_ignore_ascii_case(process_name)
+    let comm = process.name().to_string_lossy();
+    // A Wine-hosted game reports its `.exe` name cut to 15 bytes on Linux; see
+    // `ProcessMapConfig::find_by_truncated_comm`.
+    exe_matches
+        || comm.eq_ignore_ascii_case(process_name)
+        || crate::config::is_truncated_comm_of(&comm, process_name)
 }
 
 /// The same test, additionally requiring the process to be *the same executable on disk* when
@@ -785,11 +804,18 @@ fn wait_on_handle(handle: windows::Win32::Foundation::HANDLE) -> bool {
 /// Prefers a native handle wait; falls back to existence polling only when Windows actually
 /// refuses a handle, and says why. `DISCOVER_TIMEOUT` bounds the case of a pid that vanishes
 /// before it is ever observed.
+///
+/// "Still our process" is decided by the pid's OS start time when it is known, not by name.
+/// That is the exact pid-reuse guard, and it is the only test that works for a tracked process
+/// whose name is not the game's: an unmapped Proton game is tracked through Proton's
+/// `waitforexitandrun` wrapper (reported as `proton`/`python3`), while the session carries the
+/// game's `.exe` name, so a name test reported the game as exited on the first check.
 fn wait_for_process_exit(
     system: &mut System,
     pid: Pid,
     process_name: &str,
     expected_exe: Option<&Path>,
+    started_at_secs: Option<u64>,
     discover_timeout: Duration,
 ) -> WaitMechanism {
     #[cfg(windows)]
@@ -810,8 +836,12 @@ fn wait_for_process_exit(
     let discover_start = Instant::now();
     loop {
         system.refresh_processes(ProcessesToUpdate::All);
+        let still_ours = |process: &sysinfo::Process| match started_at_secs {
+            Some(started) => process.start_time() == started,
+            None => process_matches_identity(process, process_name, expected_exe),
+        };
         match system.process(pid) {
-            Some(process) if process_matches_identity(process, process_name, expected_exe) => {}
+            Some(process) if still_ours(process) => {}
             // Never seen at all: give it a moment to appear before concluding it is gone.
             None if discover_start.elapsed() <= discover_timeout => {}
             _ => return WaitMechanism::Polling { reason: polling_reason },
@@ -839,6 +869,12 @@ pub fn wait_for_exit_with_relaunch_grace(initial_pid: Pid, process_name: &str) -
     let expected_exe = system
         .process(initial_pid)
         .and_then(|p| p.exe().map(|path| path.to_path_buf()));
+    let mut started_at_secs = system.process(initial_pid).map(|p| p.start_time());
+    // A session identified only by a shared runtime (Proton's `python3` entry point, a Wine
+    // binary) has no game-specific name to recognise a relaunch by: adopting "another python3"
+    // would attach whatever unrelated script happens to be running and keep billing the session.
+    // Such a tracked process lives exactly as long as the game, so it needs no successor.
+    let adopt_successors = !crate::config::is_shared_host_name(process_name);
     if expected_exe.is_none() {
         log::debug!(
             "[LilyPad] {process_name} (pid {initial_pid:?}) has no readable executable path; \
@@ -858,13 +894,18 @@ pub fn wait_for_exit_with_relaunch_grace(initial_pid: Pid, process_name: &str) -
         // perfectly ordinary games: a process object stays enumerable through teardown, so a
         // correct wait looks untrustworthy for a moment at exit. Polling is now entered only
         // when Windows actually refuses a handle, and the refusal is reported with its cause.
-        match wait_for_process_exit(&mut system, pid, process_name, expected_exe.as_deref(), DISCOVER_TIMEOUT) {
+        match wait_for_process_exit(&mut system, pid, process_name, expected_exe.as_deref(), started_at_secs, DISCOVER_TIMEOUT) {
             WaitMechanism::Handle => log::debug!(
                 "[LilyPad] {process_name} (pid {pid:?}) exit observed by handle wait"
             ),
-            WaitMechanism::Polling { reason } => log::info!(
+            // Polling is simply how exits are observed off Windows; only on Windows does it mean
+            // a handle was refused, which is worth recording.
+            WaitMechanism::Polling { reason } if cfg!(windows) => log::info!(
                 "[LilyPad] {process_name} (pid {pid:?}) could not be waited on ({reason}) \
                  -- exit observed by existence polling instead"
+            ),
+            WaitMechanism::Polling { .. } => log::info!(
+                "[LilyPad] {process_name} (pid {pid:?}) exited"
             ),
         }
         let exited_at = Instant::now();
@@ -880,6 +921,9 @@ pub fn wait_for_exit_with_relaunch_grace(initial_pid: Pid, process_name: &str) -
         let mut scan = RelaunchScan::new(segment);
         let segment_was_short = scan.segment_was_short;
         let successor = loop {
+            if !adopt_successors {
+                break None;
+            }
             system.refresh_processes(ProcessesToUpdate::All);
             let found = system.processes().iter().find_map(|(p2, proc)| {
                 if *p2 == pid || proc.thread_kind().is_some() {
@@ -910,6 +954,7 @@ pub fn wait_for_exit_with_relaunch_grace(initial_pid: Pid, process_name: &str) -
                     process_name, pid, segment, next
                 );
                 pid = next;
+                started_at_secs = system.process(next).map(|p| p.start_time());
             }
             None => {
                 if prompt_seen {
@@ -956,6 +1001,14 @@ pub struct ActiveSession {
     /// it could be read, which only makes recovery fall back to matching by name.
     pub started_at_secs: Option<u64>,
     pub started_at: Instant,
+}
+
+/// Clears `current_session` only if it is still the session for `process_name`.
+pub fn clear_session_for(current_session: &RwLock<Option<ActiveSession>>, process_name: &str) {
+    let mut current = current_session.write().unwrap();
+    if current.as_ref().is_some_and(|s| s.process_name.eq_ignore_ascii_case(process_name)) {
+        *current = None;
+    }
 }
 
 /// Block until the process (and any same-named UAC/self-restart successor — see
@@ -1171,6 +1224,21 @@ pub fn run_poll_loop(
                                         break;
                                     }
                                 }
+                                // A Wine-hosted game whose `.exe` name was cut to 15 bytes. The
+                                // session is named after the full mapped name, which the exit
+                                // waiter also recognises in truncated form.
+                                if result.is_none() {
+                                    if let Some(full) = cfg.find_by_truncated_comm(&comm_name) {
+                                        let matches: Vec<ProcessMapping> = cfg
+                                            .find_all_for_process(&full, p.exe())
+                                            .into_iter()
+                                            .cloned()
+                                            .collect();
+                                        if !matches.is_empty() {
+                                            result = Some((full, matches));
+                                        }
+                                    }
+                                }
                                 match result {
                                     Some(v) => v,
                                     None => (exe_name.unwrap_or(comm_name), Vec::new()),
@@ -1204,6 +1272,16 @@ pub fn run_poll_loop(
                                         // Already-owned game just got auto-linked — track this
                                         // launch now via the normal path below instead of
                                         // waiting for the next poll tick to notice the mapping.
+                                        //
+                                        // Matched through Proton's wrapper, this process is
+                                        // `python3`/`wine64`: name the session after the game, so
+                                        // a force-stop blocks the game's own Wine process too, not
+                                        // every other process sharing that runtime.
+                                        let name = if crate::config::is_shared_host_name(&name) {
+                                            mapping.process.clone()
+                                        } else {
+                                            name
+                                        };
                                         *cur = Some(ActiveSession {
                                             process_name: name.clone(),
                                             mapping: mapping.clone(),
@@ -1247,7 +1325,8 @@ pub fn run_poll_loop(
                                 candidates.into_iter().next()
                             };
                             if let Some(mapping) = mapping {
-                                let mapping = match heal_orphaned_mapping(&mapping, p.exe(), p.cmd(), &installed_games_poll, &library_index_poll.read().unwrap()) {
+                                let healed = heal_orphaned_mapping(&mapping, p.exe(), p.cmd(), &installed_games_poll, &library_index_poll.read().unwrap());
+                                let mapping = match healed {
                                     Some(healed) => {
                                         log::info!(
                                             "[LilyPad] healed orphaned mapping for {}: {} #{} -> {} #{}",
@@ -1258,7 +1337,8 @@ pub fn run_poll_loop(
                                     }
                                     None => mapping,
                                 };
-                                if let Some(resolved) = check_mapped_game_needs_replay_prompt(&mapping, &library_index_poll.read().unwrap()) {
+                                let replay = check_mapped_game_needs_replay_prompt(&mapping, &library_index_poll.read().unwrap());
+                                if let Some(resolved) = replay {
                                     start_replay_prompt_tracking(
                                         *pid,
                                         &mapping,
@@ -1314,7 +1394,10 @@ pub fn run_poll_loop(
             Ok((process_name, mapping, duration_secs)) => {
                 // Record end time before clearing session so the cooldown window starts immediately.
                 *last_ended.write().unwrap() = Some((process_name.clone(), Instant::now()));
-                *current_session.write().unwrap() = None;
+                // Only this waiter's own session. A force-stopped game's waiter reports long after
+                // the tray cleared its session, by which point another game may be tracked; clearing
+                // that one would make the next scan start it a second time.
+                clear_session_for(&current_session, &process_name);
                 on_session_ended(process_name, mapping, duration_secs);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -1330,6 +1413,70 @@ pub fn run_poll_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_link_callback_does_not_hold_the_library_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("game.exe");
+        let installed = Arc::new(RwLock::new(vec![InstalledGame {
+            appid: "123".into(), name: "Test game".into(),
+            install_dir: directory.path().to_path_buf(),
+        }]));
+        let game = serde_json::from_value(serde_json::json!({
+            "id": 7, "title": "Test game", "steam_app_id": 123,
+        })).unwrap();
+        let library = Arc::new(RwLock::new(LibraryIndex::build(&[game], &[], &[])));
+        let callback_library = library.clone();
+        let callback: Arc<dyn Fn(ProcessMapping) + Send + Sync> = Arc::new(move |_| {
+            assert!(callback_library.try_write().is_ok(), "callback retained the library guard");
+        });
+        let result = maybe_start_unmapped_tracking(
+            Some(&executable), &[], Pid::from(123usize), &installed, &library,
+            &Arc::new(RwLock::new(ProcessMapConfig::default())),
+            &Arc::new(RwLock::new(HashSet::new())),
+            &Arc::new(RwLock::new(HashMap::new())),
+            &Arc::new(RwLock::new(HashMap::new())),
+            &(Arc::new(|| true) as Arc<dyn Fn() -> bool + Send + Sync>),
+            &(Arc::new(|_| panic!("owned game must not start an unmapped session")) as Arc<dyn Fn(UnmappedSessionStart) + Send + Sync>),
+            &(Arc::new(|_, _, _, _, _| {}) as Arc<dyn Fn(String, String, String, f64, Option<ResolvedLibraryGame>) + Send + Sync>),
+            &callback,
+        );
+        assert_eq!(result.unwrap().froglog_id, 7);
+    }
+
+    /// One Proton launch is two processes: the wrapper (matched to the game through its command
+    /// line) and the game's Wine process (matched to the mapping by name). With a mapping in
+    /// place the wrapper must not also start an unmapped session, even when the mapped game
+    /// cannot be resolved by appid -- the double-recording seen in real testing.
+    #[test]
+    fn a_mapped_executable_is_not_also_tracked_as_a_new_game() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("About Fishing.exe");
+        let installed = Arc::new(RwLock::new(vec![InstalledGame {
+            appid: "999".into(), name: "About Fishing".into(),
+            install_dir: directory.path().to_path_buf(),
+        }]));
+        // The library does not know this appid (deleted game, or an entry with no Steam link).
+        let library = Arc::new(RwLock::new(LibraryIndex::build(&[], &[], &[])));
+        let config = Arc::new(RwLock::new(ProcessMapConfig {
+            mappings: vec![ProcessMapping {
+                process: "About Fishing.exe".into(), r#type: "session".into(), froglog_id: 5,
+                title: None, title_filter: None, exe_path: None,
+            }],
+            ..Default::default()
+        }));
+        let result = maybe_start_unmapped_tracking(
+            Some(&executable), &[], Pid::from(123usize), &installed, &library, &config,
+            &Arc::new(RwLock::new(HashSet::new())),
+            &Arc::new(RwLock::new(HashMap::new())),
+            &Arc::new(RwLock::new(HashMap::new())),
+            &(Arc::new(|| true) as Arc<dyn Fn() -> bool + Send + Sync>),
+            &(Arc::new(|_| panic!("a mapped game must not start an unmapped session")) as Arc<dyn Fn(UnmappedSessionStart) + Send + Sync>),
+            &(Arc::new(|_, _, _, _, _| {}) as Arc<dyn Fn(String, String, String, f64, Option<ResolvedLibraryGame>) + Send + Sync>),
+            &(Arc::new(|_| panic!("a mapped game must not be auto-linked")) as Arc<dyn Fn(ProcessMapping) + Send + Sync>),
+        );
+        assert!(result.is_none());
+    }
 
     /// Spawns something that stays alive until killed, so a wait can be observed against it.
     #[cfg(windows)]
@@ -1353,7 +1500,7 @@ mod tests {
 
         let waiter = std::thread::spawn(move || {
             let mut system = System::new_all();
-            wait_for_process_exit(&mut system, pid, "cmd.exe", None, Duration::from_secs(5))
+            wait_for_process_exit(&mut system, pid, "cmd.exe", None, None, Duration::from_secs(5))
         });
 
         // Let the waiter open its handle and block before the process goes away.
@@ -1496,6 +1643,45 @@ mod tests {
         let _ = same_shouted;
 
         assert!(paths_equal(ours, Path::new(r"D:\Games\Celeste\game.exe")));
+    }
+
+    fn active(process_name: &str) -> ActiveSession {
+        ActiveSession {
+            process_name: process_name.into(),
+            mapping: ProcessMapping {
+                process: process_name.into(), r#type: "session".into(), froglog_id: 1,
+                title: None, title_filter: None, exe_path: None,
+            },
+            pid: Pid::from(1usize),
+            started_at_secs: None,
+            started_at: Instant::now(),
+        }
+    }
+
+    /// Force-stop X, start Y, then X exits: Y must still be the tracked session, or the next
+    /// scan starts Y a second time.
+    #[test]
+    fn a_late_exit_does_not_clear_another_games_session() {
+        let current = RwLock::new(Some(active("y.exe")));
+        clear_session_for(&current, "x.exe");
+        assert_eq!(current.read().unwrap().as_ref().map(|s| s.process_name.as_str()), Some("y.exe"));
+        clear_session_for(&current, "Y.EXE");
+        assert!(current.read().unwrap().is_none());
+    }
+
+    /// Relaunch adoption must not attach an unrelated process that merely shares a runtime.
+    #[test]
+    fn shared_runtimes_are_not_game_identities() {
+        use crate::config::{is_shared_game_host, is_shared_host_name};
+        for name in ["python3", "python3.12", "wine64-preloader", "wine", "proton", "wineserver"] {
+            assert!(is_shared_host_name(name), "{name}");
+        }
+        for name in ["Balatro.exe", "portal2_linux", "winemaker.exe", "HotlineMiami.exe"] {
+            assert!(!is_shared_host_name(name), "{name}");
+        }
+        assert!(is_shared_game_host(Path::new(
+            "/home/u/.local/share/Steam/steamapps/common/Proton 9.0/files/bin/wine64-preloader"
+        )));
     }
 
     #[test]

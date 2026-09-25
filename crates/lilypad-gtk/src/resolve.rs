@@ -8,26 +8,42 @@
 
 use crate::session_flow::client_for;
 use crate::state::AppState;
-use lilypad_core::config;
+use lilypad_core::config::{self, AuthConfig, PendingGameSubmission};
+use lilypad_core::session_ledger::AccountIdentity;
+use lilypad_core::submission::log_each_pending_session;
 
-/// Logs each individually-accumulated real-world play session in `entry.sessions` as its own
-/// FrogLog session (each with its own real date), via `submit_one(date, hours)`. Falls back to a
-/// single entry dated today using the accumulated `entry.hours` total for a pending item
-/// persisted before per-session tracking existed (`sessions` defaults to empty in that case) --
-/// otherwise resolving it would silently lose the hours rather than just merging them.
-fn log_each_pending_session(
-    entry: &config::PendingGameSubmission,
-    mut submit_one: impl FnMut(String, f64) -> Result<serde_json::Value, String>,
-) -> Result<(), String> {
-    if entry.sessions.is_empty() {
-        let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-        submit_one(date, entry.hours)?;
-    } else {
-        for session in &entry.sessions {
-            submit_one(session.date.clone(), session.hours)?;
+/// The New Games entry for `appid`, read from the ledger for the logged-in account, together
+/// with the credentials of that same snapshot.
+fn pending_entry(state: &AppState, appid: &str) -> Result<(PendingGameSubmission, AuthConfig, AccountIdentity), String> {
+    let (auth, account) = state.auth_and_account().ok_or("Not logged in")?;
+    let store = state.store();
+    let entry = store
+        .new_games(&account)
+        .ok_or_else(|| store.error().unwrap_or_else(|| "Session storage is unavailable".into()))?
+        .into_iter()
+        .find(|p| p.appid == appid)
+        .ok_or("Pending submission not found")?;
+    Ok((entry, auth, account))
+}
+
+/// Records that the entry became `game_type:game_id`. The server-side work is already done, so
+/// a failure here must say so: resolving again would create a second game.
+fn settle(state: &AppState, account: &AccountIdentity, entry: &PendingGameSubmission, game_type: &str, game_id: i32, how: &str, logged: usize) -> Result<(), String> {
+    let remote_id = format!("{game_type}:{game_id}");
+    match state.store().resolve_new_game(account, &entry.appid, &remote_id) {
+        Some(_) => {
+            log::info!(
+                "[LilyPad] new game {} (appid {}) {how} as {remote_id}; {logged} session(s) logged",
+                entry.title, entry.appid
+            );
+            Ok(())
         }
+        None => Err(format!(
+            "Logged to FrogLog, but LilyPad could not record that this entry is resolved ({}). \
+             Dismiss it rather than resolving it again.",
+            state.store().error().unwrap_or_else(|| "storage unavailable".into())
+        )),
     }
-    Ok(())
 }
 
 /// Resolves a pending game submission by creating a brand-new FrogLog game entry for it.
@@ -35,14 +51,7 @@ fn log_each_pending_session(
 /// for it are fetched fresh (via `fetch_game_details`) rather than trusting the lightweight
 /// search result, since `/search/fetch` returns the richer, create-ready field set.
 pub fn resolve_as_new(state: &AppState, appid: &str, igdb_title: &str) -> Result<serde_json::Value, String> {
-    let pending = config::load_pending_game_submissions();
-    let entry = pending
-        .iter()
-        .find(|p| p.appid == appid)
-        .ok_or("Pending submission not found")?
-        .clone();
-
-    let auth = state.auth.read().unwrap().clone();
+    let (entry, auth, account) = pending_entry(state, appid)?;
     let client = client_for(&auth);
 
     // If IGDB has no exact match for the confirmed title, fall back to `igdb_title` itself —
@@ -106,7 +115,9 @@ pub fn resolve_as_new(state: &AppState, appid: &str, igdb_title: &str) -> Result
     let created_id = created.get("id").and_then(|v| v.as_i64()).ok_or("Created game missing id")?;
     let created_title = created.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());
 
-    log_each_pending_session(&entry, |date, hours| {
+    // Stable per-session keys: a resolution that fails partway replays the same keys next time,
+    // so the server skips what it already has instead of logging it twice.
+    let logged = log_each_pending_session(&entry, |date, hours, sync_ref| {
         client.add_game_session(
             created_id as i32,
             Some(date),
@@ -114,11 +125,11 @@ pub fn resolve_as_new(state: &AppState, appid: &str, igdb_title: &str) -> Result
             Some("Session logged from LilyPad".to_string()),
             false,
             true,
-            None,
+            sync_ref,
         )
     })?;
 
-    config::remove_pending_game_submission(appid);
+    settle(state, &account, &entry, "session", created_id as i32, "created", logged)?;
 
     // Link the exe to the newly-created game so future sessions are tracked normally instead
     // of falling through detection again. Best-effort: a failure here shouldn't fail the
@@ -153,15 +164,8 @@ pub fn resolve_as_new(state: &AppState, appid: &str, igdb_title: &str) -> Result
 /// set explicitly rather than relying on the backend's title-based auto-detect on `POST /games`
 /// — we already know for certain this is the same title, no guessing needed.
 pub fn resolve_as_replay(state: &AppState, appid: &str) -> Result<serde_json::Value, String> {
-    let pending = config::load_pending_game_submissions();
-    let entry = pending
-        .iter()
-        .find(|p| p.appid == appid)
-        .ok_or("Pending submission not found")?
-        .clone();
+    let (entry, auth, account) = pending_entry(state, appid)?;
     let replay_of = entry.replay_of.clone().ok_or("Pending submission has no replay match")?;
-
-    let auth = state.auth.read().unwrap().clone();
     let client = client_for(&auth);
 
     let mut payload = client.get_game_raw(replay_of.id)?;
@@ -187,7 +191,7 @@ pub fn resolve_as_replay(state: &AppState, appid: &str) -> Result<serde_json::Va
     let created_id = created.get("id").and_then(|v| v.as_i64()).ok_or("Created game missing id")?;
     let created_title = created.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());
 
-    log_each_pending_session(&entry, |date, hours| {
+    let logged = log_each_pending_session(&entry, |date, hours, sync_ref| {
         client.add_game_session(
             created_id as i32,
             Some(date),
@@ -195,11 +199,11 @@ pub fn resolve_as_replay(state: &AppState, appid: &str) -> Result<serde_json::Va
             Some("Session logged from LilyPad".to_string()),
             false,
             true,
-            None,
+            sync_ref,
         )
     })?;
 
-    config::remove_pending_game_submission(appid);
+    settle(state, &account, &entry, "session", created_id as i32, "logged as a replay", logged)?;
 
     // Link the exe to the newly-created replay entry, not the old one, so future sessions of
     // this playthrough are tracked against it instead of falling through detection again.
@@ -230,14 +234,7 @@ pub fn resolve_as_existing(
     game_id: i32,
     game_title: &str,
 ) -> Result<(), String> {
-    let pending = config::load_pending_game_submissions();
-    let entry = pending
-        .iter()
-        .find(|p| p.appid == appid)
-        .ok_or("Pending submission not found")?
-        .clone();
-
-    let auth = state.auth.read().unwrap().clone();
+    let (entry, auth, account) = pending_entry(state, appid)?;
     let client = client_for(&auth);
     // Anything mapped here should end up session-tracked, not "regular" (a single running
     // hours_played total) -- matches the silent already-owned auto-link path (see the comment
@@ -267,11 +264,11 @@ pub fn resolve_as_existing(
         "session"
     };
     let notes = Some("Logged from LilyPad's untracked-session detection".to_string());
-    log_each_pending_session(&entry, |date, hours| {
+    let logged = log_each_pending_session(&entry, |date, hours, sync_ref| {
         if effective_game_type == "live" {
-            client.add_live_service_session(game_id, Some(date), Some(hours), notes.clone(), false, true, None)
+            client.add_live_service_session(game_id, Some(date), Some(hours), notes.clone(), false, true, sync_ref)
         } else {
-            client.add_game_session(game_id, Some(date), Some(hours), notes.clone(), false, true, None)
+            client.add_game_session(game_id, Some(date), Some(hours), notes.clone(), false, true, sync_ref)
         }
     })?;
     // Best-effort: a game picked here might be a Steam-bulk-imported entry that was never
@@ -280,7 +277,7 @@ pub fn resolve_as_existing(
     if let Err(e) = client.fix_imported_status_if_needed(game_id, effective_game_type) {
         log::warn!("[LilyPad] failed to fix imported status: {e}");
     }
-    config::remove_pending_game_submission(appid);
+    settle(state, &account, &entry, effective_game_type, game_id, "mapped to an existing entry", logged)?;
 
     // Link the exe to this game so future sessions are tracked normally instead of falling
     // through detection again. Uses the existing game's own confirmed title, not

@@ -1,4 +1,5 @@
 pub mod api;
+pub mod auto_submit;
 pub mod config;
 pub mod duration;
 pub mod ledger_session;
@@ -7,4 +8,6 @@ pub mod local_games;
 pub mod monitor;
 pub mod session_persistence;
 pub mod session_ledger;
+pub mod session_store;
 pub mod steam;
+pub mod submission;
