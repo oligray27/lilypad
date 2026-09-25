@@ -199,7 +199,7 @@ fn build_row(state: AppState, session: PendingSession, on_changed: Rc<dyn Fn()>)
             let id = session.id.clone();
             let (tx, rx) = async_channel::bounded(1);
             std::thread::spawn(move || {
-                let _ = tx.send_blocking(retry(&state, &id));
+                let _ = tx.send_blocking(lilypad_core::engine::actions::retry_pending(&state, &id));
             });
 
             let on_changed = Rc::clone(&on_changed);
@@ -237,27 +237,6 @@ fn build_row(state: AppState, session: PendingSession, on_changed: Rc<dyn Fn()>)
     });
 
     row
-}
-
-/// Blocking: resubmits one pending record for the logged-in account and acknowledges it.
-fn retry(state: &AppState, id: &str) -> Result<(), String> {
-    // Credentials and ownership come from the same snapshot, so a logout/login mid-request can
-    // neither submit this row with another token nor acknowledge it for the wrong owner.
-    let (auth, account) = state.auth_and_account().ok_or("Not logged in")?;
-    let store = state.store();
-    // Re-read at action time: the row on screen may be stale (already submitted elsewhere).
-    let session = store
-        .pending_session(id, &account)
-        .ok_or_else(|| store.error().unwrap_or_else(|| "Session not found for this account".into()))?;
-    let client = crate::session_flow::client_for(&auth);
-    let result = lilypad_core::submission::retry_play_session(&client, &session, Some(session.id.clone()))
-        .map_err(|e| lilypad_core::submission::explain_failure(&e))?;
-    let remote = lilypad_core::submission::remote_reference(&result.response, result.game_id, &result.game_type);
-    match store.acknowledge(id, &account, &remote) {
-        Some(true) => Ok(()),
-        Some(false) => Err("The session changed while submitting; check its recorded status".into()),
-        None => Err("Submitted, but the result could not be saved. Retrying reuses the same session key.".into()),
-    }
 }
 
 fn build_unowned_row(state: AppState, record: UnownedRecord, on_changed: Rc<dyn Fn()>) -> adw::ActionRow {

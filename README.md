@@ -2,10 +2,11 @@
 
 A system tray companion for [FrogLog](https://froglog.co.uk). LilyPad notices when you start a game, times the session, and logs it to your FrogLog profile when you stop — automatically, or after you add notes.
 
-There are two builds from this repository, sharing the same core:
+There are three builds from this repository, sharing the same core:
 
 - **Windows**: a Tauri app.
 - **Linux**: a native GTK4/libadwaita app.
+- **Steam Gaming Mode** (Steam Deck, Bazzite): a [Decky Loader](https://decky.xyz) plugin with its own headless tracking engine. See [decky/README.md](decky/README.md).
 
 ## Install
 
@@ -29,6 +30,12 @@ Requires GTK 4.12+ and libadwaita 1.5+. The packages declare these; the AppImage
 - **GNOME** needs the [AppIndicator and KStatusNotifierItem Support](https://extensions.gnome.org/extension/615/appindicator-support/) extension for any tray icon. Without it, LilyPad opens its window on every start instead; the ⋮ menu has everything the tray would.
 
 LilyPad adds itself to your login items on first launch.
+
+### Steam Gaming Mode (Steam Deck, Bazzite)
+
+Needs [Decky Loader](https://decky.xyz). Download `LilyPad-<version>.zip`, enable Decky's developer mode, then go to Decky settings > Developer > Install Plugin from ZIP. LilyPad then appears in the Quick Access Menu. The plugin works on its own and doesn't need the desktop app.
+
+If you also install the Linux desktop app, both share one login and history, and only one tracks at a time: the desktop app in Desktop Mode, the plugin in Gaming Mode.
 
 #### Upgrading from 0.5.x on Linux
 
@@ -94,6 +101,7 @@ The GTK build needs GTK 4.12+ and libadwaita 1.5+ development files. Its code ca
 
 - **Windows**: `scripts/release.ps1` bumps the patch version, builds, commits, tags, pushes and creates the GitHub release. Use `-NoBump` to release the version already in the manifests.
 - **Linux**: `scripts/release-linux-gtk.sh` builds the `.deb`, `.rpm` and AppImage into `target/release/bundle/linux-<version>/`, with `SHA256SUMS` and `BUILD-INFO.txt`. Build on the oldest distribution you support: the packages need at least the build machine's glibc.
+- **Steam Gaming Mode**: build the engine (`cargo build --release --locked -p lilypad-engine`, in the same build container) and the frontend (`cd decky && npm ci && npm run build`), then `decky/build-plugin.sh` assembles `target/decky/LilyPad-<version>.zip`.
 
 ### App icon
 

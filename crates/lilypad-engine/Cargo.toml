@@ -1,0 +1,22 @@
+[package]
+name = "lilypad-engine"
+version = "0.6.1"
+description = "Headless LilyPad tracking engine for Steam Gaming Mode, driven by the Decky plugin over stdin/stdout"
+edition = "2021"
+rust-version = "1.89"
+license = "Proprietary"
+
+[[bin]]
+name = "lilypad-engine"
+path = "src/main.rs"
+
+[dependencies]
+lilypad-core = { path = "../lilypad-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+env_logger = "0.11"
+chrono = "0.4"
+
+[dev-dependencies]
+tempfile = "3"

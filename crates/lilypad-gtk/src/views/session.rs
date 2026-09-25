@@ -2,17 +2,9 @@ use crate::session_flow::{self, SessionEndedData};
 use crate::state::AppState;
 use crate::tray::RefreshTray;
 use adw::prelude::*;
+use lilypad_core::engine::actions::{self, Attempt};
 use std::cell::Cell;
 use std::rc::Rc;
-
-/// How one Submit attempt ended, decided on the worker thread.
-enum Attempt {
-    Submitted,
-    /// Failed, and the session is durably in Pending Submissions: terminal for this popup.
-    Queued(String),
-    /// Failed and could not be saved, or was refused; the user may try again.
-    Failed(String),
-}
 
 /// Builds and presents the session-ended popup as its own small top-level
 /// window (not a stack page) — the original positions this near the tray
@@ -113,17 +105,12 @@ pub fn show_popup(state: AppState, parent: &gtk4::Window, refresh_tray: RefreshT
                 window.close();
                 return;
             }
-            if let (Some(id), Some(account)) = (&ledger_id, state.account()) {
-                if state.store().discard(id, &account).is_none() {
-                    error_label.set_text(&format!(
-                        "Could not discard this session: {}",
-                        state.store().error().unwrap_or_else(|| "storage unavailable".into())
-                    ));
-                    error_label.set_visible(true);
-                    return;
-                }
-                refresh_tray();
+            if let Err(e) = actions::discard_session(&state, ledger_id.as_deref()) {
+                error_label.set_text(&e);
+                error_label.set_visible(true);
+                return;
             }
+            refresh_tray();
             window.close();
         }
     });
@@ -155,7 +142,7 @@ pub fn show_popup(state: AppState, parent: &gtk4::Window, refresh_tray: RefreshT
 
             let (tx, rx) = async_channel::bounded(1);
             std::thread::spawn(move || {
-                let _ = tx.send_blocking(submit(&state, &mapping, ledger_id, hours, notes, spoiler, is_public));
+                let _ = tx.send_blocking(actions::submit_decision(&state, &mapping, ledger_id, hours, notes, spoiler, is_public));
             });
 
             let window = window.clone();
@@ -187,60 +174,4 @@ pub fn show_popup(state: AppState, parent: &gtk4::Window, refresh_tray: RefreshT
     });
 
     window.present();
-}
-
-/// Blocking: submits against the session's record, then acknowledges or queues that record.
-fn submit(
-    state: &AppState,
-    mapping: &lilypad_core::config::ProcessMapping,
-    ledger_id: Option<String>,
-    hours: f64,
-    notes: Option<String>,
-    spoiler: bool,
-    is_public: bool,
-) -> Attempt {
-    // One snapshot for both, so a login change mid-popup cannot pair them up wrongly.
-    let auth = state.auth.read().unwrap().clone();
-    let store = state.store();
-    let account = store.account(&auth);
-    if account.is_none() {
-        return Attempt::Failed("Log in to FrogLog to submit this session.".into());
-    }
-    if !session_flow::may_submit(state, ledger_id.as_deref(), account.as_ref()) {
-        return Attempt::Failed(
-            "This session was started under a different FrogLog account. Log back in to that account to submit it.".into(),
-        );
-    }
-    let client = session_flow::client_for(&auth);
-    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let submission = session_flow::submission_for(mapping, hours, date.clone(), notes.clone(), spoiler, is_public);
-    if let Some(id) = &ledger_id {
-        store.save_attempt(id, &submission);
-    }
-    let result = lilypad_core::submission::submit_play_session(
-        &client, &mapping.r#type, mapping.froglog_id, Some(date.clone()), hours,
-        notes.clone(), spoiler, is_public, ledger_id.clone(),
-    );
-    match result {
-        Ok(response) => {
-            if let (Some(id), Some(account)) = (&ledger_id, &account) {
-                let remote = lilypad_core::submission::remote_reference(&response, mapping.froglog_id, &mapping.r#type);
-                if store.acknowledge(id, account, &remote).is_none() {
-                    log::warn!("[LilyPad] session {id} submitted but its acknowledgement was not saved; a retry reuses the same key");
-                }
-            }
-            Attempt::Submitted
-        }
-        Err(e) => {
-            let explanation = lilypad_core::submission::explain_failure(&e);
-            if store.queue_failed(ledger_id.as_deref(), account, session_flow::failed(submission, &e)) {
-                Attempt::Queued(format!("Submission failed; the session is saved in Pending Submissions. {explanation}"))
-            } else {
-                Attempt::Failed(format!(
-                    "Submission failed and the session could not be saved for retry ({}). {explanation}",
-                    store.error().unwrap_or_else(|| "storage unavailable".into())
-                ))
-            }
-        }
-    }
 }

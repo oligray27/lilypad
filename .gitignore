@@ -1,5 +1,8 @@
 node_modules/
 
+# Decky plugin build output (npm run build in decky/)
+decky/dist/
+
 # Rust workspace build artifacts (cargo builds to the workspace root now)
 target/
 src-tauri/gen/

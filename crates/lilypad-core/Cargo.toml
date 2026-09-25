@@ -3,7 +3,8 @@ name = "lilypad-core"
 version = "0.6.1"
 description = "Shared Froglog API client, config, and process-monitor logic for Lilypad (Windows/Tauri and Linux/GTK)"
 edition = "2021"
-rust-version = "1.70"
+# 1.89: std::fs::File::lock/try_lock, used for the single-tracker lock (engine::lock).
+rust-version = "1.89"
 
 [dependencies]
 log = "0.4"

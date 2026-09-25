@@ -64,7 +64,7 @@ if ($SkipLinux) {
 } else {
     Step 'Linux: copy source to the isolated workspace' {
         tar -czf target/linux-parity-source.tar.gz --exclude=target --exclude=node_modules --exclude=.git --exclude=*.log `
-            Cargo.toml Cargo.lock crates src-tauri src index.html scripts package.json package-lock.json .github docs LINUX_PARITY_PLAN.md
+            Cargo.toml Cargo.lock crates src-tauri src index.html scripts package.json package-lock.json .github docs LINUX_PARITY_PLAN.md decky
         if ($LASTEXITCODE -eq 0) { scp -q target/linux-parity-source.tar.gz "${LinuxHost}:$RemoteRoot/source.tar.gz" }
         if ($LASTEXITCODE -eq 0) {
             # Tracked dirs are cleared first so files deleted locally do not linger remotely.

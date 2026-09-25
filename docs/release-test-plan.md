@@ -107,6 +107,19 @@ bash scripts/test-linux-packages.sh <linux-<version> package dir> <previous-rele
   - **Discard** removes one.
   - The old JSON files are still in `~/.local/share/froglog-lilypad/`.
 
+### I2. Steam Gaming Mode (Decky plugin)
+
+Install the plugin zip via Decky settings > Developer > Install Plugin from ZIP. Engine log: `~/homebrew/logs/LilyPad/engine.log`.
+
+- [ ] **Open the LilyPad panel** in the Quick Access Menu. *Expect:* the LilyPad icon on its tab; logged in as the desktop app's account (shared data).
+- [ ] **Play a linked game.** *Expect:* "Tracking Started" toast; the panel shows it under Now.
+- [ ] **Quit it** (any game type, whatever the desktop app's auto-submit settings). *Expect:* "Session Auto-Submitted" toast straight away; the session is on the website once, with the session message as its note.
+- [ ] **Change the session message**, then blank it. *Expect:* the next sessions carry the new message, then no note; the desktop app's own sessions are unaffected.
+- [ ] **Unlinked Steam game.** *Expect:* "Session Recorded" toast; resolvable from New Games (search, existing game, dismiss).
+- [ ] **Stop tracking** from the panel. *Expect:* "Session Stopped" toast; the session waits under Stopped sessions (Submit or Don't record); the game is not re-tracked until relaunched.
+- [ ] **Switch to Desktop Mode with a game running, then back.** *Expect:* the desktop app takes over (engine log: "handing over tracking"); the session continues and is submitted once; back in Gaming Mode the panel tracks again.
+- [ ] **Log in from the panel** after logging out. *Expect:* the on-screen keyboard works; the panel returns to the normal view.
+
 ### J. Windows regression
 
 Windows shares the session code, and several fixes changed it (stale waiter after force-stop, deleted-game detection, New Games resolution, saving submissions before sending).

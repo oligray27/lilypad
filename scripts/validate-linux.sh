@@ -15,8 +15,9 @@ cargo test -p lilypad-core --locked 2>&1 | tee target/validation/core.log
 # Real processes: detection, exit timing, crash recovery, pid reuse (~20 s).
 cargo test -p lilypad-core --locked --test e2e_process -- --ignored --test-threads=1 2>&1 \
   | tee target/validation/e2e-process.log
+cargo test -p lilypad-engine --locked 2>&1 | tee target/validation/engine.log
 cargo test -p lilypad-gtk --locked 2>&1 | tee target/validation/gtk.log
 dbus-run-session -- cargo test -p lilypad-gtk --locked \
   notify::tests::no_notification_daemon_preserves_the_interception_window \
   -- --exact --ignored 2>&1 | tee target/validation/notification-unavailable.log
-cargo build -p lilypad-gtk --release --locked 2>&1 | tee target/validation/release.log
+cargo build -p lilypad-gtk -p lilypad-engine --release --locked 2>&1 | tee target/validation/release.log

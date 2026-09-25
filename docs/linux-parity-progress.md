@@ -213,7 +213,11 @@ Not verifiable here and left for the end-to-end run: how the header menu looks a
 - `docs/release-test-plan.md`: the manual checklist for what automation cannot reach (real games, Proton, notifications, tray, upgrades, Windows regression).
 - `scripts/show-ledger.py`: read-only dump of a session store, used by the checklist to spot stuck or duplicated records.
 
-## 2026-09-25 — Phase 6: release 0.6.1 (built and qualified; not published)
+## 2026-09-25 — Phase 6: release 0.6.1 (published)
+
+**Published as [v0.6.1](https://github.com/oligray27/lilypad/releases/tag/v0.6.1)**, marked Latest. The tag `v0.6.1` points at `a54b5d5`. The Linux packages were rebuilt from `git archive v0.6.1` (not the working tree) and passed the five package checks and the AppImage desktop smoke test again; `BUILD-INFO.txt` records `a54b5d5 (tag v0.6.1)`. The Windows installer was built and the release created by `scripts/release.ps1 -NoBump`. The release has the Windows installer, `.deb`, `.rpm`, AppImage and `SHA256SUMS`, with the notes from `docs/release-notes-0.6.1.md`. The Linux assets were downloaded back from GitHub and match `SHA256SUMS`.
+
+Earlier build and qualification notes, from the pre-commit working tree:
 
 - **Version 0.6.1** set in all five manifests and `Cargo.lock`, for both builds. Publishing is left to the user's `scripts/release.ps1`, run with `-NoBump`, since without it the script bumps the patch version again.
 - **Supported floor: glibc 2.39, GTK 4.12, libadwaita 1.5**, i.e. Ubuntu 24.04+, Debian 13+, Fedora 40+. The build container is Debian 13, and the release binary's highest glibc symbol is `GLIBC_2.39`. The `.deb` now declares `$auto` (exact shared-library minimums via `dpkg-shlibdeps`) plus the GTK/libadwaita floors; the `.rpm` requires `gtk4 >= 4.12` and `libadwaita >= 1.5` (previously unversioned).

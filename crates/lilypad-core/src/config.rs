@@ -86,6 +86,10 @@ pub struct ProcessMapConfig {
     /// user explicitly removes it.
     #[serde(default)]
     pub default_exclusions_seeded: bool,
+    /// The note sent with sessions submitted from Steam Gaming Mode (the Decky plugin), which
+    /// submits every session without asking. `None` is the standard note, an empty string none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gaming_mode_note: Option<String>,
 }
 
 impl ProcessMapConfig {

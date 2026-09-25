@@ -23,6 +23,16 @@ Packages: `.deb` (Ubuntu 24.04+, Debian 13+), `.rpm` (Fedora 40+), and an AppIma
 
 - **The `.rpm` now installs on Fedora.** Earlier `.rpm`s listed library names that only exist on Debian, so `dnf` refused them.
 
+### Steam Gaming Mode (new)
+
+LilyPad now works in Steam Gaming Mode on the Steam Deck, Bazzite and other gamescope sessions, as a [Decky Loader](https://decky.xyz) plugin: `LilyPad-0.6.1.zip`. Install it from Decky settings > Developer > Install Plugin from ZIP.
+
+- **Tracks in the background** and submits every session as soon as the game closes, with a message you choose (or none). Notes can be added afterwards on the FrogLog website.
+- **The Quick Access Menu** shows what's being tracked and has Stop Tracking, Pending Submissions, New Games, login and settings.
+- **Works on its own**, with no desktop app needed.
+- **Works alongside the desktop app** if you have it. Both use the same login, game links and history. The desktop app tracks in Desktop Mode and the plugin in Gaming Mode; a game running when you switch carries on as the same session.
+- Game links are managed in the desktop app. Steam games already in your FrogLog are linked automatically the first time you play them.
+
 ### Windows and Linux
 
 - **Force-stop fix:** stopping tracking on one game and then starting another no longer ends the second game's session when the first finally closes.

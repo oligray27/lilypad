@@ -1,0 +1,272 @@
+// LilyPad in the Quick Access Menu. The engine tracks in the background whether or not this panel
+// is open; the panel shows what it is doing and handles everything that needs the user.
+
+import { addEventListener, definePlugin, removeEventListener, toaster } from "@decky/api";
+import {
+  ButtonItem, ConfirmModal, Field, Navigation, PanelSection, PanelSectionRow, QuickAccessTab, TextField, ToggleField,
+  showModal, staticClasses,
+} from "@decky/ui";
+import { useCallback, useEffect, useState } from "react";
+import lilypadIcon from "../assets/lilypad.png";
+import { DecisionModal, NewGamesModal, PendingModal } from "./modals";
+import { Decision, EngineEvent, Settings, Status, call, errorText, publish, subscribe } from "./lilypad";
+
+const openPanel = () => Navigation.OpenQuickAccessMenu(QuickAccessTab.Decky);
+
+/** Toasts for engine events, shown even while the panel is closed (i.e. mid-game). */
+function toastFor(event: EngineEvent) {
+  const s = (key: string) => String(event[key] ?? "");
+  switch (event.event) {
+    case "notify":
+      toaster.toast({ title: s("summary"), body: s("body") });
+      break;
+    case "session_started":
+      toaster.toast({ title: "Tracking Started", body: s("title") });
+      break;
+    case "needs_decision": {
+      const decision = event.decision as Decision;
+      toaster.toast({
+        title: "Session Stopped",
+        body: `${decision.title} (${decision.time}). Tap to submit it or not record it.`,
+        onClick: () => showModal(<DecisionModal decision={decision} />),
+      });
+      break;
+    }
+    case "new_game_recorded":
+      toaster.toast({
+        title: "Session Recorded",
+        body: event.is_replay
+          ? `${s("title")} (${s("time")}) is marked as finished in FrogLog. Open LilyPad to resolve it.`
+          : `${s("title")} (${s("time")}) isn't in your FrogLog yet. Open LilyPad to add it.`,
+        onClick: openPanel,
+      });
+      break;
+  }
+}
+
+function LoginSection({ onDone }: { onDone: () => void }) {
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const login = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await call("login", { username, password });
+      setPassword("");
+      onDone();
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <PanelSection title="Log in to FrogLog">
+      <PanelSectionRow>
+        <TextField label="Username" value={username} onChange={(e) => setUsername(e.target.value)} />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <TextField label="Password" bIsPassword value={password} onChange={(e) => setPassword(e.target.value)} />
+      </PanelSectionRow>
+      {error && <PanelSectionRow><Field description={error} /></PanelSectionRow>}
+      <PanelSectionRow>
+        <ButtonItem layout="below" disabled={busy || !username || !password} onClick={login}>
+          {busy ? "Logging in…" : "Log in"}
+        </ButtonItem>
+      </PanelSectionRow>
+    </PanelSection>
+  );
+}
+
+/** The note sent with every session. Saved when the field loses focus, not on each keystroke. */
+function NoteField({ saved, onSaved }: { saved: string; onSaved: (settings: Settings) => void }) {
+  const [note, setNote] = useState(saved);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => setNote(saved), [saved]);
+
+  const save = async () => {
+    if (note.trim() === saved) return;
+    try {
+      onSaved(await call<Settings>("settings_set", { session_note: note }));
+      setError(null);
+    } catch (e) {
+      setError(errorText(e));
+    }
+  };
+
+  return (
+    <TextField
+      label="Session message"
+      description={error ?? "Sent with every session. Leave blank for none."}
+      value={note}
+      onChange={(e) => setNote(e.target.value)}
+      onBlur={save}
+    />
+  );
+}
+
+function SettingsSection() {
+  const [settings, setSettings] = useState<Settings | null>(null);
+  useEffect(() => { call<Settings>("settings_get").then(setSettings).catch(() => undefined); }, []);
+  if (!settings) return null;
+
+  const set = (key: keyof Settings) => async (value: boolean) => {
+    setSettings({ ...settings, [key]: value });
+    try {
+      setSettings(await call<Settings>("settings_set", { [key]: value }));
+    } catch {
+      setSettings(settings);
+    }
+  };
+
+  return (
+    <PanelSection title="Settings">
+      <PanelSectionRow>
+        <NoteField saved={settings.session_note} onSaved={setSettings} />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ToggleField label="Show what I'm playing on FrogLog" checked={settings.share_now_playing} onChange={set("share_now_playing")} />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ToggleField
+          label="Record games not in FrogLog"
+          description="They appear under New Games to add."
+          checked={settings.detect_unmapped}
+          onChange={set("detect_unmapped")}
+        />
+      </PanelSectionRow>
+    </PanelSection>
+  );
+}
+
+function Content() {
+  const [status, setStatus] = useState<Status | null>(null);
+  const [decisions, setDecisions] = useState<Decision[]>([]);
+  const [error, setError] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      const next = await call<Status>("status");
+      setStatus(next);
+      setError(null);
+      setDecisions(next.tracking && next.logged_in ? await call<Decision[]>("decisions") : []);
+    } catch (e) {
+      setError(errorText(e));
+    }
+  }, []);
+
+  useEffect(() => {
+    refresh();
+    return subscribe(() => { refresh(); });
+  }, [refresh]);
+
+  if (!status) {
+    return (
+      <PanelSection>
+        <PanelSectionRow><Field label={error ? "LilyPad isn't running" : "Starting LilyPad…"} description={error ?? undefined} /></PanelSectionRow>
+      </PanelSection>
+    );
+  }
+
+  if (!status.tracking) {
+    return (
+      <PanelSection>
+        <PanelSectionRow>
+          <Field
+            label="Tracking from the desktop app"
+            description="LilyPad is running in Desktop Mode, so it is tracking there. Gaming Mode takes over when you switch back."
+          />
+        </PanelSectionRow>
+      </PanelSection>
+    );
+  }
+
+  if (!status.logged_in) return <LoginSection onDone={refresh} />;
+
+  const stopTracking = () =>
+    showModal(
+      <ConfirmModal
+        strTitle="Stop tracking this session?"
+        strDescription="Use this if LilyPad picked the wrong game. You can still submit the time or not record it."
+        strOKButtonText="Stop tracking"
+        onOK={() => { call("force_stop").then(refresh).catch(() => undefined); }}
+      />,
+    );
+
+  const logout = () =>
+    showModal(
+      <ConfirmModal
+        strTitle="Log out of FrogLog?"
+        strOKButtonText="Log out"
+        onOK={() => { call("logout").then(refresh).catch(() => undefined); }}
+      />,
+    );
+
+  return (
+    <>
+      {status.storage_error && (
+        <PanelSection><PanelSectionRow><Field label="Storage problem" description={status.storage_error} /></PanelSectionRow></PanelSection>
+      )}
+      <PanelSection title="Now">
+        <PanelSectionRow>
+          <Field label={status.now_tracking ? `Tracking ${status.now_tracking}` : "Not tracking a game"} />
+        </PanelSectionRow>
+        {status.now_tracking && (
+          <PanelSectionRow><ButtonItem layout="below" onClick={stopTracking}>Stop tracking this session</ButtonItem></PanelSectionRow>
+        )}
+      </PanelSection>
+
+      {decisions.length > 0 && (
+        <PanelSection title="Stopped sessions">
+          {decisions.map((d) => (
+            <PanelSectionRow key={d.id}>
+              <ButtonItem layout="below" label={`${d.title} · ${d.time}`} onClick={() => showModal(<DecisionModal decision={d} />)}>
+                Submit or don't record
+              </ButtonItem>
+            </PanelSectionRow>
+          ))}
+        </PanelSection>
+      )}
+
+      <PanelSection title="Queues">
+        <PanelSectionRow>
+          <ButtonItem layout="below" onClick={() => showModal(<PendingModal />)}>
+            Pending Submissions{status.pending ? ` (${status.pending})` : ""}
+          </ButtonItem>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <ButtonItem layout="below" onClick={() => showModal(<NewGamesModal />)}>
+            New Games{status.new_games ? ` (${status.new_games})` : ""}
+          </ButtonItem>
+        </PanelSectionRow>
+      </PanelSection>
+
+      <SettingsSection />
+
+      <PanelSection title="Account">
+        <PanelSectionRow><Field label={status.username ?? "Logged in"} description={`LilyPad ${status.version}`} /></PanelSectionRow>
+        <PanelSectionRow><ButtonItem layout="below" onClick={logout}>Log out</ButtonItem></PanelSectionRow>
+      </PanelSection>
+    </>
+  );
+}
+
+export default definePlugin(() => {
+  const listener = addEventListener<[EngineEvent]>("lilypad_event", (event) => {
+    toastFor(event);
+    publish(event);
+  });
+  return {
+    name: "LilyPad",
+    titleView: <div className={staticClasses.Title}>LilyPad</div>,
+    content: <Content />,
+    icon: <img src={lilypadIcon} alt="" style={{ width: "1em", height: "1em" }} />,
+    onDismount() {
+      removeEventListener("lilypad_event", listener);
+    },
+  };
+});

@@ -1,0 +1,11 @@
+{
+  "name": "LilyPad",
+  "author": "Oli Gray",
+  "flags": [],
+  "api_version": 1,
+  "publish": {
+    "tags": ["utility", "tracking"],
+    "description": "Tracks your play time in Gaming Mode and logs it to FrogLog, with notes, pending submissions and new games in the Quick Access Menu.",
+    "image": "https://raw.githubusercontent.com/oligray27/lilypad/main/src-tauri/icons/icon.png"
+  }
+}

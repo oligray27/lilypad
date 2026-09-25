@@ -1,23 +1,16 @@
-use crate::monitor_glue::{self, MonitorEvent};
+use crate::frontend::GtkFrontend;
 use crate::notify;
-use crate::session_flow::{self, AppAction};
+use crate::session_flow::AppAction;
 use crate::state::AppState;
 use crate::tray::{self, LilypadTray, TrayAction};
 use crate::views;
 use adw::prelude::*;
 use lilypad_core::config::AuthConfig;
-use lilypad_core::ledger_session::now_secs;
-use lilypad_core::session_store::{Completion, SessionStore};
+use lilypad_core::engine::FrontendRef;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 const APP_ID: &str = "uk.co.froglog.lilypad";
-
-/// How often to check whether anything has been installed or removed. Cheap because the scan
-/// itself is gated on install-location fingerprints; the library fetch stays on the slow cycle.
-const INSTALL_SCAN_INTERVAL: Duration = Duration::from_secs(10);
-const LIBRARY_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Per-view default window size, mirroring the Tauri build's `VIEW_SIZE` map —
 /// the mappings table in particular needs much more width than the other views.
@@ -90,15 +83,21 @@ fn build_window(app: &adw::Application, state: AppState) {
     // than in `main` because only the primary instance reaches `activate` -- a second launch just
     // forwards to it over D-Bus. Every GTK legacy JSON writer is gone as of this build, which is
     // the precondition for importing their files (each is consumed exactly once).
-    {
-        let (store, startup_log) = SessionStore::open(crate::state::DEFAULT_API_URL);
-        for (level, message) in startup_log {
-            log::log!(level, "{message}");
+    // One tracker per user: take over from the Gaming Mode engine if it is running (Decky keeps
+    // it alive across mode switches). It exits within a couple of seconds of being asked; its
+    // in-progress session is resumed by recovery below. Held for the life of the process.
+    match lilypad_core::engine::lock::TrackerLock::take_over(std::time::Duration::from_secs(20)) {
+        Ok(lock) => {
+            Box::leak(Box::new(lock));
         }
-        if let Some(error) = store.error() {
-            notify::show("LilyPad storage problem", &error);
+        Err(e) => {
+            log::warn!("[LilyPad] could not take the tracker lock ({e}); tracking anyway");
+            notify::show("LilyPad", "Another LilyPad may still be tracking. If sessions are recorded twice, restart LilyPad.");
         }
-        state.set_store(store);
+    }
+
+    if let Some(error) = lilypad_core::engine::open_store(&state) {
+        notify::show("LilyPad storage problem", &error);
     }
 
     // Matches the Tauri build: autostart is (re)registered on every launch, so it follows the
@@ -339,13 +338,14 @@ fn build_window(app: &adw::Application, state: AppState) {
 
     // Tray menu actions.
     let (app_tx, app_rx) = async_channel::unbounded::<AppAction>();
+    let frontend: FrontendRef = Arc::new(GtkFrontend { refresh_tray: refresh_tray.clone(), app_tx: app_tx.clone() });
     glib::spawn_future_local({
+        let frontend = frontend.clone();
         let state = state.clone();
         let window = window.clone();
         let stack = stack.clone();
         let app = app.clone();
         let refresh_tray = refresh_tray.clone();
-        let app_tx = app_tx.clone();
         let reload_mappings = Rc::clone(&reload_mappings);
         let reload_pending = Rc::clone(&reload_pending);
         let reload_new_games = Rc::clone(&reload_new_games);
@@ -387,44 +387,7 @@ fn build_window(app: &adw::Application, state: AppState) {
                         refresh_tray();
                     }
                     TrayAction::ForceStopTracking => {
-                        // Capture session info before clearing so it can still be
-                        // submitted; block re-tracking until the process actually exits
-                        // (checked via force_stopped_process in the monitor-event loop
-                        // below, mirroring the Tauri build).
-                        let session_info = {
-                            let sess = state.current_session.read().unwrap();
-                            sess.as_ref().map(|s| (s.process_name.clone(), s.mapping.clone(), s.started_at.elapsed().as_secs_f64()))
-                        };
-                        if let Some((process_name, mapping, duration_secs)) = session_info {
-                            *state.force_stopped_process.write().unwrap() = Some(process_name.clone());
-                            *state.current_session.write().unwrap() = None;
-                            // Close the durable record now. `finish` only applies to an active
-                            // record, so the monitor's own end event for this process (when it
-                            // really exits) cannot complete it a second time.
-                            let active = state.active_ledger_id.take();
-                            let ledger_id = match active {
-                                Some(id) => match state.store().complete(&id, now_secs()) {
-                                    Completion::Owned(id) => id,
-                                    // Already ended by its waiter a moment ago; that path
-                                    // presents it.
-                                    Completion::Stale => {
-                                        refresh_tray();
-                                        continue;
-                                    }
-                                },
-                                None => None,
-                            };
-                            session_flow::handle_session_ended(
-                                state.clone(),
-                                refresh_tray.clone(),
-                                app_tx.clone(),
-                                process_name,
-                                mapping,
-                                duration_secs,
-                                true,
-                                ledger_id,
-                            );
-                        }
+                        lilypad_core::engine::actions::force_stop(&state, &frontend);
                         refresh_tray();
                     }
                     TrayAction::Quit => {
@@ -459,106 +422,7 @@ fn build_window(app: &adw::Application, state: AppState) {
         }
     });
 
-    // Recover every session interrupted by a crash, restart or shutdown, before the monitor
-    // starts polling (so a resumed game is already in current_session and is not tracked again
-    // as new). Still running: resume its record. Gone: credit it up to its last checkpoint --
-    // never "now", so downtime is not billed as play -- and run the normal end path.
-    session_flow::recover_interrupted(&state, &refresh_tray, &app_tx);
-
-    // Two refreshes on very different budgets. Installed games are local files and the scan is
-    // gated on a directory fingerprint, so checking every few seconds costs a few `stat`s and a
-    // newly installed game is matched within seconds instead of up to five minutes later. The
-    // library index is a network fetch, so it stays on the slow cycle (the monitor also
-    // refreshes it on demand before deciding a game is new).
-    {
-        let refresh_state = state.clone();
-        std::thread::spawn(move || {
-            let mut since_library_refresh = LIBRARY_REFRESH_INTERVAL;
-            loop {
-                refresh_state.refresh_installed_games_if_changed();
-                if since_library_refresh >= LIBRARY_REFRESH_INTERVAL {
-                    refresh_state.refresh_library_index();
-                    since_library_refresh = Duration::ZERO;
-                }
-                std::thread::sleep(INSTALL_SCAN_INTERVAL);
-                since_library_refresh += INSTALL_SCAN_INTERVAL;
-            }
-        });
-    }
-
-    // Process monitor: real background threads (lilypad-core, unchanged from the
-    // Tauri build) pushing events consumed here on the GTK main loop.
-    let (mon_tx, mon_rx) = async_channel::unbounded::<MonitorEvent>();
-    monitor_glue::start(&state, mon_tx);
-
-    glib::spawn_future_local({
-        let refresh_tray = refresh_tray.clone();
-        async move {
-            while let Ok(event) = mon_rx.recv().await {
-                match event {
-                    MonitorEvent::SessionStarted { process_name, mapping, ledger_id } => {
-                        session_flow::handle_session_started(
-                            &state,
-                            &process_name,
-                            &mapping,
-                            ledger_id,
-                            chrono::Utc::now().to_rfc3339(),
-                            true,
-                        );
-                        let name = mapping.title.clone().unwrap_or(mapping.process.clone());
-                        notify::show("Tracking Started", &name);
-                        refresh_tray();
-                    }
-                    // Already completed durably by the monitor glue, which also filtered out a
-                    // force-stopped or already-completed session.
-                    MonitorEvent::SessionEnded {
-                        process_name,
-                        mapping,
-                        duration_secs,
-                        ledger_id,
-                    } => {
-                        session_flow::handle_session_ended(
-                            state.clone(),
-                            refresh_tray.clone(),
-                            app_tx.clone(),
-                            process_name,
-                            mapping,
-                            duration_secs,
-                            false,
-                            ledger_id,
-                        );
-                    }
-                    MonitorEvent::UnmappedGameSessionEnded { title, duration_secs, is_replay, saved } => {
-                        let time_str = session_flow::format_duration(duration_secs);
-                        if !saved {
-                            notify::show(
-                                "Session Not Saved",
-                                &format!(
-                                    "{title} ({time_str}) could not be recorded: {}",
-                                    state.store().error().unwrap_or_else(|| "not logged in".into())
-                                ),
-                            );
-                            refresh_tray();
-                            continue;
-                        }
-                        let notif_body = if is_replay {
-                            format!("{title} ({time_str}) is marked as finished in FrogLog. Resolve?")
-                        } else {
-                            format!("{title} ({time_str}) isn't in your FrogLog yet.")
-                        };
-                        let app_tx = app_tx.clone();
-                        notify::show_with_action(
-                            "Session Recorded",
-                            &notif_body,
-                            "Go to New Games",
-                            move || {
-                                let _ = app_tx.send_blocking(AppAction::GoToNewGames);
-                            },
-                        );
-                        refresh_tray();
-                    }
-                }
-            }
-        }
-    });
+    // Detection, recording, recovery and submission: the shared engine, reporting back through
+    // this window, its notifications and the tray.
+    lilypad_core::engine::start(&state, frontend);
 }
