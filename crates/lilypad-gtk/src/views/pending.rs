@@ -148,60 +148,65 @@ pub fn build(state: AppState) -> (gtk4::Widget, Rc<dyn Fn()>) {
     (container.upcast(), reload)
 }
 
-fn build_row(state: AppState, session: PendingSession, on_changed: Rc<dyn Fn()>) -> adw::ActionRow {
+/// The row's subtitle: the session's details, why it is still pending, and, on its own line,
+/// the outcome of the last action on it. Status text lives here rather than beside the buttons:
+/// an unwrapped suffix label takes the row's width first, which squeezed the title to one
+/// character wide.
+fn subtitle_for(session: &PendingSession, reason: &str, status: Option<&str>) -> glib::GString {
     let mut subtitle = format!("{}h · {}", session.hours, session.date);
     if let Some(notes) = &session.notes {
         if !notes.is_empty() {
             subtitle.push_str(&format!(" · {notes}"));
         }
     }
-    subtitle.push_str(&format!("\n{}", session.error));
+    subtitle.push_str(&format!("\n{reason}"));
+    if let Some(status) = status {
+        subtitle.push_str(&format!("\n{status}"));
+    }
+    // AdwActionRow's subtitle is Pango markup, and the reason can be a server-provided message
+    // containing anything.
+    glib::markup_escape_text(&subtitle)
+}
 
-    // AdwActionRow's title/subtitle are Pango markup by default -- escape both, since the
-    // title is a game title (can contain "&", e.g. "Ratchet & Clank") and the subtitle
-    // includes a server-provided error message that could contain anything.
+fn build_row(state: AppState, session: PendingSession, on_changed: Rc<dyn Fn()>) -> adw::ActionRow {
+    // The title is a game title and can contain "&" (e.g. "Ratchet & Clank"): escape it too.
     let row = adw::ActionRow::builder()
         .title(glib::markup_escape_text(&session.title))
-        .subtitle(glib::markup_escape_text(&subtitle))
-        .subtitle_lines(2)
+        .subtitle(subtitle_for(&session, &session.error, None))
+        .subtitle_lines(3)
         .build();
-
-    let status_label = gtk4::Label::new(None);
-    status_label.add_css_class("dim-label");
-    status_label.set_visible(false);
 
     let retry_btn = gtk4::Button::with_label("Retry");
     retry_btn.set_valign(gtk4::Align::Center);
     let delete_btn = gtk4::Button::with_label("Delete");
     delete_btn.set_valign(gtk4::Align::Center);
 
-    row.add_suffix(&status_label);
     row.add_suffix(&retry_btn);
     row.add_suffix(&delete_btn);
 
     retry_btn.connect_clicked({
         let state = state.clone();
-        let session_id = session.id.clone();
-        let status_label = status_label.clone();
+        let session = session.clone();
+        let row = row.clone();
         let delete_btn = delete_btn.clone();
         let on_changed = Rc::clone(&on_changed);
         move |btn| {
             btn.set_sensitive(false);
             delete_btn.set_sensitive(false);
-            status_label.set_text("Submitting…");
-            status_label.set_visible(true);
+            row.set_subtitle(&subtitle_for(&session, &session.error, Some("Submitting…")));
 
             let state = state.clone();
-            let id = session_id.clone();
+            let id = session.id.clone();
             let (tx, rx) = async_channel::bounded(1);
             std::thread::spawn(move || {
                 let _ = tx.send_blocking(retry(&state, &id));
             });
 
             let on_changed = Rc::clone(&on_changed);
-            let status_label = status_label.clone();
             let btn = btn.clone();
             let delete_btn = delete_btn.clone();
+            let row = row.clone();
+            let session = session.clone();
             glib::spawn_future_local(async move {
                 let Ok(result) = rx.recv().await else { return };
                 match result {
@@ -209,7 +214,7 @@ fn build_row(state: AppState, session: PendingSession, on_changed: Rc<dyn Fn()>)
                     Err(e) => {
                         btn.set_sensitive(true);
                         delete_btn.set_sensitive(true);
-                        status_label.set_text(&e);
+                        row.set_subtitle(&subtitle_for(&session, &e, Some("Retry failed")));
                     }
                 }
             });
@@ -217,15 +222,15 @@ fn build_row(state: AppState, session: PendingSession, on_changed: Rc<dyn Fn()>)
     });
 
     delete_btn.connect_clicked({
-        let session_id = session.id.clone();
-        let status_label = status_label.clone();
+        let session = session.clone();
+        let row = row.clone();
         move |_| {
             let Some(account) = state.account() else { return };
-            match state.store().discard(&session_id, &account) {
+            match state.store().discard(&session.id, &account) {
                 Some(_) => on_changed(),
                 None => {
-                    status_label.set_text("Could not delete: storage unavailable");
-                    status_label.set_visible(true);
+                    let reason = state.store().error().unwrap_or_else(|| "Session storage is unavailable".into());
+                    row.set_subtitle(&subtitle_for(&session, &reason, Some("Delete failed")));
                 }
             }
         }
@@ -260,25 +265,21 @@ fn build_unowned_row(state: AppState, record: UnownedRecord, on_changed: Rc<dyn 
         .title(glib::markup_escape_text(&record.summary))
         .title_lines(2)
         .build();
-    let status_label = gtk4::Label::new(None);
-    status_label.add_css_class("error");
-    status_label.set_visible(false);
     let assign_btn = gtk4::Button::with_label("Assign to me");
     assign_btn.set_valign(gtk4::Align::Center);
     let discard_btn = gtk4::Button::with_label("Discard");
     discard_btn.set_valign(gtk4::Align::Center);
-    row.add_suffix(&status_label);
     row.add_suffix(&assign_btn);
     row.add_suffix(&discard_btn);
 
     let report = {
         let state = state.clone();
-        let status_label = status_label.clone();
+        let row = row.clone();
         move |outcome: Option<bool>, on_changed: &Rc<dyn Fn()>| match outcome {
             Some(_) => on_changed(),
             None => {
-                status_label.set_text(&state.store().error().unwrap_or_else(|| "Storage unavailable".into()));
-                status_label.set_visible(true);
+                let reason = state.store().error().unwrap_or_else(|| "Session storage is unavailable".into());
+                row.set_subtitle(&glib::markup_escape_text(&format!("That didn't work: {reason}")));
             }
         }
     };

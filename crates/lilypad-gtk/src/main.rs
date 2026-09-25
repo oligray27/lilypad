@@ -18,9 +18,6 @@ fn main() -> glib::ExitCode {
     let auth = AuthConfig::load_from(&auth_config_path());
     let process_map = ProcessMapConfig::load_from(&process_map_path_for_auth(&auth));
 
-    // Matches the Tauri build's behavior: autostart is enabled unconditionally on launch.
-    autostart::enable();
-
     let state = AppState::new(auth, process_map);
     app::run(state)
 }

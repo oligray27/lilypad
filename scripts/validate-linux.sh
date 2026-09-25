@@ -12,6 +12,9 @@ mkdir -p target/validation
 } | tee target/validation/environment.log
 
 cargo test -p lilypad-core --locked 2>&1 | tee target/validation/core.log
+# Real processes: detection, exit timing, crash recovery, pid reuse (~20 s).
+cargo test -p lilypad-core --locked --test e2e_process -- --ignored --test-threads=1 2>&1 \
+  | tee target/validation/e2e-process.log
 cargo test -p lilypad-gtk --locked 2>&1 | tee target/validation/gtk.log
 dbus-run-session -- cargo test -p lilypad-gtk --locked \
   notify::tests::no_notification_daemon_preserves_the_interception_window \

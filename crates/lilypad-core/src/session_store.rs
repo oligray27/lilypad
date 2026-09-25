@@ -10,8 +10,8 @@ use crate::config::{AuthConfig, PendingGameSubmission, PendingSession, ProcessMa
 use crate::ledger_session::{self, now_secs};
 use crate::monitor::UnmappedSessionStart;
 use crate::session_ledger::{
-    AccountIdentity, LedgerResult, ProcessIdentity, SessionLedger, SessionRecord, SessionTarget,
-    Submission, SubmissionState, LEGACY_FILES,
+    AccountIdentity, LedgerResult, NewGameEntry, ProcessIdentity, SessionLedger, SessionRecord,
+    SessionTarget, Submission, SubmissionState, LEGACY_FILES,
 };
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
@@ -197,6 +197,17 @@ impl SessionStore {
             error: Arc::new(RwLock::new(None)),
             default_server: default_server.into(),
         }
+    }
+
+    /// A store over a ledger and error slot the caller already owns, so a frontend with its own
+    /// storage plumbing (Tauri's `AppState`) can use the shared operations without a second
+    /// connection or a second error state.
+    pub fn from_shared(
+        ledger: Option<Arc<Mutex<SessionLedger>>>,
+        error: Arc<RwLock<Option<String>>>,
+        default_server: &str,
+    ) -> Self {
+        Self { ledger, error, default_server: default_server.into() }
     }
 
     pub fn unavailable(reason: String, default_server: &str) -> Self {
@@ -431,6 +442,13 @@ impl SessionStore {
             .is_some()
     }
 
+    /// Saves what is about to be sent for `id`, before sending it. A crash or lost response
+    /// mid-request then leaves a retry row with the exact payload (notes, privacy, date) rather
+    /// than one reconstructed without them. Best-effort: failing to save must not stop the send.
+    pub fn save_attempt(&self, id: &str, submission: &Submission) -> bool {
+        self.with_ledger("saving a submission before sending", |l| l.set_submission(id, submission)) == Some(true)
+    }
+
     /// Records the server's acknowledgement. `Some(false)`: no pending record under that id.
     pub fn acknowledge(&self, id: &str, account: &AccountIdentity, remote_id: &str) -> Option<bool> {
         let applied = self.with_ledger("recording submission", |l| l.acknowledge(id, account, remote_id))?;
@@ -467,6 +485,17 @@ impl SessionStore {
     pub fn resolve_new_game(&self, account: &AccountIdentity, appid: &str, remote_id: &str) -> Option<bool> {
         self.with_ledger("recording a resolved new game", |l| {
             l.resolve_new_game(Some(account), appid, remote_id)
+        })
+    }
+
+    /// Outer `None`: storage unavailable. Inner `None`: no pending entry for `appid`.
+    pub fn new_game_entry(&self, account: &AccountIdentity, appid: &str) -> Option<Option<NewGameEntry>> {
+        self.with_ledger("reading a new game", |l| l.new_game_entry(Some(account), appid))
+    }
+
+    pub fn set_new_game_target(&self, account: &AccountIdentity, id: &str, remote_id: &str) -> Option<bool> {
+        self.with_ledger("recording a new game's destination", |l| {
+            l.set_new_game_target(Some(account), id, remote_id)
         })
     }
 
@@ -693,6 +722,26 @@ mod tests {
         // Y's own exit gets its own record.
         assert_eq!(active.take_for("Y.EXE").as_deref(), Some("id-y"));
         assert_eq!(active.take(), None);
+    }
+
+    /// A crash or lost response mid-request must leave the exact payload for retry, including
+    /// what the user typed into the popup, not a row reconstructed without it.
+    #[test]
+    fn a_payload_saved_before_sending_survives_an_interrupted_request() {
+        let store = store();
+        let alice = account("alice");
+        let id = store.begin_mapped(Some(alice.clone()), "game", &mapping(), None, None).unwrap();
+        store.complete(&id, now_secs());
+        let mut attempt = submission("unused");
+        attempt.last_error = None;
+        attempt.failed_at = None;
+        assert!(store.save_attempt(&id, &attempt));
+        // LilyPad dies here, before any response. After restart the queue has the real payload.
+        let row = store.pending_session(&id, &alice).unwrap();
+        assert_eq!(row.notes.as_deref(), Some("note"));
+        assert!(!row.is_public && row.spoiler);
+        assert_eq!(row.date, "2026-09-25");
+        assert_eq!(row.error, "Awaiting submission");
     }
 
     #[test]

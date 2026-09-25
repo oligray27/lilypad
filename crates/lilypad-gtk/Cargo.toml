@@ -1,6 +1,6 @@
 [package]
 name = "lilypad-gtk"
-version = "0.6.0"
+version = "0.6.1"
 description = "Native GTK4/libadwaita Lilypad app for Linux"
 edition = "2021"
 rust-version = "1.75"
@@ -32,7 +32,9 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 maintainer = "Oli Gray <kloat64@icloud.com>"
 copyright = "2026, Oli Gray"
 extended-description = "FrogLog game time tracker - runs in the system tray, detects game processes and logs play time. Native GTK4/libadwaita build for Linux."
-depends = "libgtk-4-1, libadwaita-1-0"
+# $auto: exact library minimums (glibc included) computed from the binary by dpkg-shlibdeps.
+# The explicit floors are the GTK/libadwaita feature levels the code is built against.
+depends = "$auto, libgtk-4-1 (>= 4.12), libadwaita-1-0 (>= 1.5)"
 section = "utils"
 priority = "optional"
 maintainer-scripts = "debian"
@@ -54,7 +56,12 @@ assets = [
 # without requiring a logout — mirrors debian/postinst+postrm for the .deb.
 post_install_script = "update-desktop-database -q /usr/share/applications || true; gtk-update-icon-cache -f -t /usr/share/icons/hicolor || true"
 post_uninstall_script = "update-desktop-database -q /usr/share/applications || true; gtk-update-icon-cache -f -t /usr/share/icons/hicolor || true"
+# Automatic requirements are computed with `ldd` on the build machine, which is Debian: they named
+# Debian-only sonames pulled in through GTK (libcurl-gnutls.so.4, libstemmer.so.0d, ...), so the
+# package could never install on Fedora. The real requirements are declared explicitly below.
+auto-req = "no"
 
 [package.metadata.generate-rpm.requires]
-gtk4 = "*"
-libadwaita = "*"
+glibc = ">= 2.39"
+gtk4 = ">= 4.12"
+libadwaita = ">= 1.5"

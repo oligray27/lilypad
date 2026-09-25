@@ -170,36 +170,6 @@ pub fn remote_reference(response: &Value, game_id: i32, game_type: &str) -> Stri
     }
 }
 
-/// Logs each individually-accumulated play session of a New Games entry as its own FrogLog
-/// session, via `submit_one(date, hours, sync_ref)`. Falls back to one entry dated today for an
-/// aggregate-only entry persisted before per-session tracking existed.
-///
-/// Each session's `sync_ref` is derived from the appid and its position, which is what makes a
-/// partly-completed resolution resumable: resolving again replays the same keys, so the server
-/// skips what it already has. `sessions` is only ever appended to, so an index is stable across
-/// retries. Returns how many sessions were logged.
-pub fn log_each_pending_session(
-    entry: &crate::config::PendingGameSubmission,
-    mut submit_one: impl FnMut(String, f64, Option<String>) -> Result<Value, String>,
-) -> Result<usize, String> {
-    let key = |index: usize| Some(format!("newgame:{}#{index}", entry.appid));
-    if entry.sessions.is_empty() {
-        let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-        submit_one(date, entry.hours, key(0))?;
-        return Ok(1);
-    }
-    let total = entry.sessions.len();
-    for (index, session) in entry.sessions.iter().enumerate() {
-        // Logged per session so a resolution that fails partway says how far it got.
-        log::info!(
-            "[LilyPad] logging session {}/{total} for {}: {}h on {}",
-            index + 1, entry.title, session.hours, session.date
-        );
-        submit_one(session.date.clone(), session.hours, key(index))?;
-    }
-    Ok(total)
-}
-
 /// Both frontends present the same actionable failure explanation.
 pub fn explain_failure(error: &str) -> String {
     match ApiFailure::classify(error) {

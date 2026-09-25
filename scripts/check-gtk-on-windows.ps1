@@ -2,8 +2,9 @@
 # libraries and pkg-config are unavailable. The -sys crates' build scripts are told to skip
 # pkg-config and emit a placeholder library name, which is enough for `cargo check`.
 #
-# Expected result: exactly two errors in notify.rs, from notify-rust APIs that only exist on
-# Linux (`show_async`, `get_server_information`). Anything else is a real error. Borrow checking
+# Expected result: errors in notify.rs only, from notify-rust APIs that exist only on Linux
+# (`show_async`, `get_server_information`). Anything else is a real error. Code inside those
+# calls' closures is not checked here; validate-linux.sh covers it. Borrow checking
 # still runs for every other function despite those two, so this catches type and ownership
 # mistakes. It does not replace `scripts/validate-linux.sh` on a real Linux host.
 $ErrorActionPreference = 'Stop'

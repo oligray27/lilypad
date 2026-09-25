@@ -61,15 +61,15 @@ pub(crate) fn client_for(auth: &AuthConfig) -> FroglogClient {
     c
 }
 
-/// The failed-submission payload for a session, saved against its record for retry.
-pub fn failed_submission(
+/// What submitting a session sends, saved against its record before sending (see
+/// `SessionStore::save_attempt`) and again, with the failure, if it fails.
+pub fn submission_for(
     mapping: &ProcessMapping,
     hours: f64,
     date: String,
     notes: Option<String>,
     spoiler: bool,
     is_public: bool,
-    error: &str,
 ) -> Submission {
     Submission {
         game_id: mapping.froglog_id,
@@ -80,9 +80,16 @@ pub fn failed_submission(
         notes,
         spoiler,
         is_public,
-        last_error: Some(explain_failure(error)),
-        failed_at: Some(chrono::Local::now().to_rfc3339()),
+        last_error: None,
+        failed_at: None,
     }
+}
+
+/// `submission` with the reason it failed, for the retry queue.
+pub fn failed(mut submission: Submission, error: &str) -> Submission {
+    submission.last_error = Some(explain_failure(error));
+    submission.failed_at = Some(chrono::Local::now().to_rfc3339());
+    submission
 }
 
 /// Whether the logged-in account may submit `ledger_id`. A session belongs to the account that
@@ -270,10 +277,15 @@ fn submit_now(
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
     let title = mapping.title.clone().unwrap_or_else(|| mapping.process.clone());
     let store = state.store();
+    let notes = Some("Session auto submitted with LilyPad".to_string());
+    let submission = submission_for(mapping, hours, date.clone(), notes.clone(), false, true);
+    if let Some(id) = &ledger_id {
+        store.save_attempt(id, &submission);
+    }
 
     let result = submit_play_session(
-        &client, &mapping.r#type, mapping.froglog_id, Some(date.clone()), hours,
-        Some("Session auto submitted with LilyPad".to_string()), false, true, ledger_id.clone(),
+        &client, &mapping.r#type, mapping.froglog_id, Some(date), hours,
+        notes, false, true, ledger_id.clone(),
     );
     match result {
         Ok(response) => {
@@ -289,11 +301,7 @@ fn submit_now(
         }
         Err(e) => {
             log::warn!("[LilyPad] auto-submit failed for game {}: {e}", mapping.froglog_id);
-            let saved = store.queue_failed(
-                ledger_id.as_deref(),
-                account,
-                failed_submission(mapping, hours, date, None, false, true, &e),
-            );
+            let saved = store.queue_failed(ledger_id.as_deref(), account, failed(submission, &e));
             if saved {
                 notify::show("Session Queued", &format!("{title} — submit failed, open LilyPad to retry"));
             } else {

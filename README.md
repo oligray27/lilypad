@@ -1,98 +1,104 @@
-# Lilypad
+# LilyPad
 
-System tray app for the Froglog suite: tracks game play time and submits sessions or updates hours to your Froglog backend.
+A system tray companion for [FrogLog](https://froglog.co.uk). LilyPad notices when you start a game, times the session, and logs it to your FrogLog profile when you stop — automatically, or after you add notes.
 
-## Requirements
+There are two builds from this repository, sharing the same core:
 
-- Node.js and npm (for Tauri CLI)
-- Rust (stable)
-- Windows or Linux (process detection and tray both work on either)
+- **Windows**: a Tauri app.
+- **Linux**: a native GTK4/libadwaita app.
 
-### Linux system packages (Debian/Ubuntu)
+## Install
 
-```bash
-sudo apt install -y build-essential curl wget file \
-  libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev
-```
+Download from the [latest release](https://github.com/oligray27/lilypad/releases/latest).
 
-On stock GNOME (Wayland or X11), the tray icon needs the [AppIndicator and KStatusNotifierItem Support](https://extensions.gnome.org/extension/615/appindicator-support/) shell extension — GNOME removed native tray support years ago, and this affects every tray-icon app (Discord, Slack, etc.), not just LilyPad.
+### Windows
 
-Window-title disambiguation (used when multiple games share one executable, e.g. `javaw`) uses X11/EWMH and only sees X11 or XWayland-backed windows — it can't see native-Wayland windows, since there's no cross-client window enumeration API on Wayland by design.
+Run `LilyPad_<version>_x64-setup.exe`.
 
-## Development
+### Linux
 
-```bash
-cd lilypad
-npm install
-npm run dev
-```
+| Package | For |
+|---|---|
+| `lilypad-gtk_<version>-1_amd64.deb` | Ubuntu 24.04+, Debian 13+ and derivatives: `sudo apt install ./lilypad-gtk_*.deb` |
+| `lilypad-gtk-<version>-1.x86_64.rpm` | Fedora 40+ and derivatives: `sudo dnf install ./lilypad-gtk-*.rpm` |
+| `LilyPad-x86_64.AppImage` | Anything else with glibc 2.39+: `chmod +x LilyPad-x86_64.AppImage` and run it |
 
-Build:
+Requires GTK 4.12+ and libadwaita 1.5+. The packages declare these; the AppImage bundles them.
 
-```bash
-npm run build
-```
+- **KDE Plasma** shows the tray icon out of the box.
+- **GNOME** needs the [AppIndicator and KStatusNotifierItem Support](https://extensions.gnome.org/extension/615/appindicator-support/) extension for any tray icon. Without it, LilyPad opens its window on every start instead; the ⋮ menu has everything the tray would.
 
-## App icon
+LilyPad adds itself to your login items on first launch.
 
-Put your own icons in **`lilypad/src-tauri/icons/`**. The config expects:
+#### Upgrading from 0.5.x on Linux
 
-| File | Use |
-|------|-----|
-| `icon.ico` | Windows app + taskbar/tray |
-| `32x32.png` | Small icon |
-| `128x128.png` | Medium |
-| `128x128@2x.png` | Retina |
-| `icon.icns` | macOS (if you build on Mac) |
+Your pending sessions and New Games are imported automatically the first time the new version starts. Older versions didn't record which account a session belonged to. Those sessions appear in **Pending Submissions** under *From an earlier LilyPad version*, where you choose **Assign to me** or **Discard**. The old files are left in place as a backup.
 
-**From a single image:** use Tauri’s icon generator (one PNG, at least 512×512 recommended):
+Going back to 0.5.x after upgrading is not supported: anything played since the upgrade is stored only in the new format.
 
-```bash
-cd lilypad
-npm run tauri icon path/to/your-icon.png
-```
+## Using LilyPad
 
-That writes all required sizes into `src-tauri/icons/`. If you only add **`icon.ico`** (e.g. for Windows), the app will use it for the window and system tray; the build currently creates a default green `icon.ico` when the file is missing.
+1. **Log in** with your FrogLog account. LilyPad then runs in the tray.
+2. **Link games** under **Configure…**: pick a running or installed game's executable and the FrogLog entry it belongs to. Steam games you already have in FrogLog are linked automatically the first time you play them.
+3. **Play.** LilyPad shows "Tracking Started" and your profile shows you as playing, if you've turned that on in Configure.
+4. **When you stop**, the session is submitted automatically. For session-tracked and live-service games, a notification first offers **Add Notes** for a short time. If auto-submit is off, a window asks you to submit it or not record it.
 
-## Configuration
+Also:
 
-Config lives under the OS's local-data directory, in a `froglog-lilypad` folder:
+- **New Games**: Steam and watched-folder games that aren't in your FrogLog yet are recorded anyway. **New Games** lets you create the entry, add the time to a game you already have, or dismiss it.
+- **Pending Submissions**: a session that couldn't be sent (offline, logged out) waits here, and **Retry** sends it.
+- **Stop Tracking Current Session** (tray): ends a session that was attributed to the wrong game. You then choose what to do with the time.
+- **Crashes and restarts**: sessions are saved as they happen. If LilyPad or the PC stops mid-game, the session is recovered at the next start, counted up to the last point LilyPad knew the game was running.
 
-| OS | Path |
-|----|------|
+### Where data lives
+
+| OS | Folder |
+|---|---|
 | Windows | `%LOCALAPPDATA%\froglog-lilypad\` |
 | Linux | `~/.local/share/froglog-lilypad/` |
 
-- **API URL**: Set at first login (default: `https://api.froglog.co.uk/api`). Stored with token in `auth.json`.
-- **Process → Game mapping**: Stored in `process-map.json`. Add entries like:
-  ```json
-  {
-    "mappings": [
-      { "process": "hl2.exe", "type": "regular", "froglogId": 42, "title": "Half-Life 2" }
-    ]
-  }
-  ```
-  On Linux, use the binary's name as it appears in `ps`/`/proc` (no extension), e.g. `"process": "hl2"`.
-  When an unknown process triggers a session, you can submit and then add a mapping (future: "Remember this process" in the UI).
+`sessions.sqlite` holds sessions, pending submissions and New Games. `auth.json` holds your login, and `process-map-<account>.json` your game links.
 
-## How to use
+### Known limitations on Linux
 
-1. **Start the app** – Run `npm run dev` (or the built binary). The app minimizes to the **system tray**; the main window may stay hidden.
-2. **Open the window** – Right‑click the Lilypad icon in the tray → click **Show** or **Settings**. The main window opens.
-3. **First time** – You’ll see the **Login** form. Enter API URL (default `https://api.froglog.co.uk/api`), your Froglog username and password, then **Log in**. Next time you open the window you’ll see the main view.
-4. **Add process mappings** – So Lilypad knows which process = which Froglog game, add entries via the tray's **Configure...** menu (or edit `process-map.json` directly, creating it if needed):
-   ```json
-   { "mappings": [
-     { "process": "hl2.exe", "type": "regular", "froglogId": 42, "title": "Half-Life 2" },
-     { "process": "WarThunder.exe", "type": "live", "froglogId": 5, "title": "War Thunder" }
-   ]}
-   ```
-   Use your real Froglog game IDs from the website (backlog = regular, live service = live).
-5. **When you play** – Start a game whose process is in the mapping. Lilypad detects it and starts timing. When you close the game, the main window opens with **Session ended**: time played, optional note, and **Submit to Froglog** (or **Skip**).
+- **Flatpak Steam**: only games you have already linked in Configure are tracked. Unlinked games are not detected as New Games.
+- **Window-title filters** (telling apart games that share one executable, e.g. `java`) only see X11/XWayland windows.
+- **No notification service**: sessions auto-submit without the Add Notes option. Notes can be added afterwards on the FrogLog website.
 
-## How it works
+## Development
 
-1. Runs in the system tray.
-2. Polls running processes every 10s and matches them against your configured mappings.
-3. When a mapped game process starts, a session timer starts.
-4. When the process exits, the window opens and shows time played; you can add a note and submit as a new live-service session or update total hours for a regular game.
+### Windows (Tauri)
+
+```powershell
+npm install
+npm run dev      # tauri dev
+npm run build    # installer in target/release/bundle/nsis
+```
+
+### Linux (GTK)
+
+```bash
+sudo apt install build-essential pkg-config libgtk-4-dev libadwaita-1-dev   # or the Fedora equivalents
+cargo run -p lilypad-gtk
+```
+
+The GTK build needs GTK 4.12+ and libadwaita 1.5+ development files. Its code can also be type-checked on Windows with `scripts/check-gtk-on-windows.ps1`.
+
+### Tests
+
+- `cargo test -p lilypad-core -p lilypad`: unit and integration tests.
+- `scripts/test-all.ps1`: every automated check on Windows and, over SSH, on a Linux build host (see `docs/linux-baseline.md`).
+- `docs/release-test-plan.md`: the manual pre-release checklist.
+
+### Releasing
+
+- **Windows**: `scripts/release.ps1` bumps the patch version, builds, commits, tags, pushes and creates the GitHub release. Use `-NoBump` to release the version already in the manifests.
+- **Linux**: `scripts/release-linux-gtk.sh` builds the `.deb`, `.rpm` and AppImage into `target/release/bundle/linux-<version>/`, with `SHA256SUMS` and `BUILD-INFO.txt`. Build on the oldest distribution you support: the packages need at least the build machine's glibc.
+
+### App icon
+
+Icons live in `src-tauri/icons/`, and both builds use them. To regenerate every size from one PNG (512×512 or larger):
+
+```bash
+npm run tauri icon path/to/icon.png
+```

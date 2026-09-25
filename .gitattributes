@@ -1,2 +1,8 @@
 # Linux validation/release scripts must remain executable by bash after Windows checkouts.
 *.sh text eol=lf
+# Files shipped inside the Linux packages. A Windows checkout (core.autocrlf=true) would give
+# them CRLF endings: the desktop entry's Icon/Exec values then end in "\r" (the AppImage build
+# cannot find the icon, and the menu entry points at a program that doesn't exist), and dpkg
+# cannot run CRLF maintainer scripts.
+*.desktop text eol=lf
+crates/lilypad-gtk/debian/* text eol=lf

@@ -150,6 +150,15 @@ impl SubmissionState {
     }
 }
 
+/// A New Games entry, its record id (which keys its uploads), and the game a previous
+/// resolution already created for it, if one got that far (e.g. `session:42`).
+#[derive(Debug, Clone)]
+pub struct NewGameEntry {
+    pub id: String,
+    pub game: PendingGameSubmission,
+    pub target: Option<String>,
+}
+
 #[derive(Debug)]
 pub struct StoredSession {
     pub record: SessionRecord,
@@ -432,6 +441,73 @@ impl SessionLedger {
             .collect())
     }
 
+    /// The pending New Games entry for `appid`, with its record id and any server-side game a
+    /// previous, unfinished resolution already created for it.
+    pub fn new_game_entry(
+        &self,
+        account: Option<&AccountIdentity>,
+        appid: &str,
+    ) -> LedgerResult<Option<NewGameEntry>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id,record,remote_id FROM sessions WHERE state='pending' ORDER BY rowid",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?))
+        })?;
+        for row in rows {
+            let (id, json, target) = row?;
+            let record: SessionRecord = serde_json::from_str(&json)?;
+            if record.account.as_ref() != account {
+                continue;
+            }
+            if let SessionTarget::LegacyNewGame(game) = record.target {
+                if game.appid == appid {
+                    return Ok(Some(NewGameEntry { id, game, target }));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Records the server-side game a resolution has just created for entry `id`, *before* any
+    /// of its sessions are uploaded. A retry after a later failure then continues against that
+    /// game instead of creating a second one. Setting the same target again is a no-op; a
+    /// different one is refused, since that would split the entry's sessions across two games.
+    pub fn set_new_game_target(
+        &mut self,
+        account: Option<&AccountIdentity>,
+        id: &str,
+        remote_id: &str,
+    ) -> LedgerResult<bool> {
+        if remote_id.is_empty() {
+            return Err("Remote reference for a created game is empty".into());
+        }
+        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(String, Option<String>)> = tx
+            .query_row(
+                "SELECT record,remote_id FROM sessions WHERE id=?1 AND state='pending'",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((json, existing)) = row else { return Ok(false) };
+        let record: SessionRecord = serde_json::from_str(&json)?;
+        if record.account.as_ref() != account {
+            return Err("New game belongs to another account".into());
+        }
+        if !matches!(record.target, SessionTarget::LegacyNewGame(_)) {
+            return Err("Not a New Games entry".into());
+        }
+        match existing.as_deref() {
+            Some(current) if current == remote_id => return Ok(true),
+            Some(current) => return Err(format!("New game was already created as {current}").into()),
+            None => {}
+        }
+        tx.execute("UPDATE sessions SET remote_id=?2 WHERE id=?1", params![id, remote_id])?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Records that the pending new-game entry for `appid` became a real library entry.
     ///
     /// Acknowledged rather than dismissed, and deliberately so: resolving creates a game and
@@ -474,8 +550,10 @@ impl SessionLedger {
         let Some((id, _)) = find_pending_new_game(&tx, account, appid)? else {
             return Ok(false);
         };
+        // COALESCE: dismissing an entry a resolution had already created a game for keeps that
+        // reference, so the row still says what exists server-side.
         tx.execute(
-            "UPDATE sessions SET state=?2,remote_id=?3 WHERE id=?1",
+            "UPDATE sessions SET state=?2,remote_id=COALESCE(?3,remote_id) WHERE id=?1",
             params![id, state, remote_id],
         )?;
         tx.commit()?;

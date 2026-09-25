@@ -197,6 +197,29 @@ impl ApiFailure {
     }
 }
 
+/// What `POST /games` did with a creation request.
+#[derive(Debug, Clone)]
+pub enum GameCreation {
+    Created(serde_json::Value),
+    /// The server found an existing, unfinished playthrough of this game (by IGDB id or by a
+    /// platform link already on another entry) and asked whether to attach to it instead.
+    AlreadyOwned { game_id: i32, title: Option<String> },
+}
+
+impl GameCreation {
+    /// Reads `409 { needs_confirmation, existing_game }`. Any other response is not this.
+    pub fn from_conflict(status: u16, body: &serde_json::Value) -> Option<Self> {
+        if status != 409 || body["needs_confirmation"].as_bool() != Some(true) {
+            return None;
+        }
+        let existing = &body["existing_game"];
+        Some(Self::AlreadyOwned {
+            game_id: i32::try_from(existing["id"].as_i64()?).ok()?,
+            title: existing["title"].as_str().map(str::to_string),
+        })
+    }
+}
+
 /// Renders an HTTP failure so its status survives into the error message, which is what
 /// `ApiFailure::classify` reads back. Prefer this over ad-hoc formatting.
 fn http_error(status: reqwest::StatusCode, body: Option<serde_json::Value>) -> String {
@@ -696,6 +719,45 @@ impl FroglogClient {
     }
 
     /// POST /games — create a game; returns the created row (includes id).
+    /// `POST /games` with an idempotency key, reporting the server's "you already have this"
+    /// answer as an outcome rather than an opaque `409: Conflict`.
+    ///
+    /// `client_ref` lets a retry after a lost response get the game it already created instead
+    /// of a second one (servers without `games.client_ref` ignore the field). `confirm_new`
+    /// sends `confirm_action: "new"`, the explicit "log separately" choice, for a replay.
+    pub fn create_game_keyed(
+        &self,
+        mut payload: serde_json::Value,
+        client_ref: &str,
+        confirm_new: bool,
+    ) -> Result<GameCreation, String> {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("client_ref".into(), serde_json::json!(client_ref));
+            if confirm_new {
+                obj.insert("confirm_action".into(), serde_json::json!("new"));
+            }
+        }
+        let res = self
+            .client
+            .post(self.url("/games"))
+            .headers(self.headers())
+            .json(&payload)
+            .send()
+            .map_err(|e: reqwest::Error| e.to_string())?;
+        let status = res.status();
+        if status.is_success() {
+            return res.json().map(GameCreation::Created).map_err(|e: reqwest::Error| e.to_string());
+        }
+        let body: serde_json::Value = res.json().unwrap_or_default();
+        if let Some(outcome) = GameCreation::from_conflict(status.as_u16(), &body) {
+            return Ok(outcome);
+        }
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err("429: too many games created this hour".to_string());
+        }
+        Err(http_error(status, Some(body)))
+    }
+
     pub fn create_game(&self, payload: serde_json::Value) -> Result<serde_json::Value, String> {
         let res = self
             .client

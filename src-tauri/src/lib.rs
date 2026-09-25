@@ -3,7 +3,8 @@
 // core crate for the GTK frontend, which is not part of this cutover -- see `PLAN.md`.
 use lilypad_core::{api, config, duration, ledger_session, library_match, local_games, monitor, steam};
 use lilypad_core::auto_submit;
-use lilypad_core::submission::{submit_play_session, explain_failure, log_each_pending_session, remote_reference};
+use lilypad_core::submission::{submit_play_session, explain_failure, remote_reference};
+use lilypad_core::resolution;
 use lilypad_core::session_store::find_original_process;
 
 use api::FroglogClient;
@@ -266,6 +267,15 @@ impl AppState {
     fn account(&self) -> Option<AccountIdentity> {
         let auth = self.auth.read().ok()?;
         ledger_session::account_identity(&auth, DEFAULT_API_URL)
+    }
+
+    /// The shared store operations over this state's own ledger and error slot.
+    fn store(&self) -> lilypad_core::session_store::SessionStore {
+        lilypad_core::session_store::SessionStore::from_shared(
+            self.ledger.clone(),
+            Arc::clone(&self.storage_error),
+            DEFAULT_API_URL,
+        )
     }
 
     /// Runs `op` against the ledger, recording any failure for the UI. Returns `None` when the
@@ -647,6 +657,15 @@ fn queue_failed_submission(
     state.with_ledger("queueing an orphaned submission", |l| {
         l.insert(&record, SubmissionState::Pending)
     });
+}
+
+/// Saves what is about to be sent for a session before sending it, so a crash or lost response
+/// mid-request leaves a retry row with the exact payload (notes, privacy, date) rather than one
+/// reconstructed without them. Best-effort: a failed save must not stop the submission.
+fn save_attempt(app: &tauri::AppHandle, ledger_id: Option<&str>, submission: Submission) {
+    if let Some(id) = ledger_id {
+        app.state::<AppState>().store().save_attempt(id, &submission);
+    }
 }
 
 /// Consumes the force-stop block for `process_name` if one is set, returning whether it was.
@@ -1494,6 +1513,11 @@ fn handle_session_ended(
                     let auth2 = auth.clone();
                     let game_type2 = mapping.r#type.clone();
                     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+                    save_attempt(&app, ledger_id.as_deref(), Submission {
+                        game_id: mapping.froglog_id, game_type: mapping.r#type.clone(), title: title_str.clone(),
+                        hours, date: date.clone(), notes: Some("Session auto submitted with LilyPad".to_string()),
+                        spoiler: false, is_public: true, last_error: None, failed_at: None,
+                    });
                     let (tx2, rx2) = tokio::sync::oneshot::channel();
                     let sync_ref = ledger_id.clone();
                     std::thread::spawn(move || {
@@ -1553,6 +1577,12 @@ fn handle_session_ended(
             let game_type2 = mapping2.r#type.clone();
             let date_for_submit = date2.clone();
             let game_type_for_submit = game_type2.clone();
+            save_attempt(&app, ledger_id.as_deref(), Submission {
+                game_id: mapping.froglog_id, game_type: mapping.r#type.clone(),
+                title: mapping.title.clone().unwrap_or_else(|| mapping.process.clone()),
+                hours, date: date.clone(), notes: Some("Session auto submitted with LilyPad".to_string()),
+                spoiler: false, is_public: true, last_error: None, failed_at: None,
+            });
             let sync_ref = ledger_id.clone();
             let (tx, rx) = tokio::sync::oneshot::channel::<Result<serde_json::Value, String>>();
             std::thread::spawn(move || {
@@ -1834,6 +1864,11 @@ fn submit_session(
     let is_public = is_public.unwrap_or(true);
     let ledger_id = submission_ledger_id(&state, ledger_id);
 
+    save_attempt(&app, ledger_id.as_deref(), Submission {
+        game_id, game_type: game_type.clone(), title: title.clone().unwrap_or_default(),
+        hours, date: date.clone(), notes: notes.clone(), spoiler, is_public,
+        last_error: None, failed_at: None,
+    });
     // Reuse the ledger identity on retry. The backend returns an existing session on a
     // confirmed replay; a 409 alone is not an acknowledgement.
     let sync_ref = ledger_id.clone();
@@ -2123,36 +2158,6 @@ fn finish_unmapped_session(app: &tauri::AppHandle, appid: &str) -> Option<f64> {
         l.complete_unmapped(&id, ledger_session::now_secs(), false)
     }).flatten()
 }
-/// Records that a new game was added to the library, naming what it became. Called by every
-/// resolve path.
-///
-/// `how` says which route the user took — the three produce very different server-side outcomes
-/// (a brand-new entry, an attachment to an existing one, a replay alongside a finished one) and
-/// the log is the only place that distinction survives afterwards.
-fn resolve_new_game(
-    state: &AppState,
-    appid: &str,
-    title: &str,
-    game_type: &str,
-    game_id: i32,
-    how: &str,
-    sessions_logged: usize,
-) {
-    let account = state.account();
-    let remote_id = format!("{game_type}:{game_id}");
-    if state
-        .with_ledger("recording a resolved new game", |l| {
-            l.resolve_new_game(account.as_ref(), appid, &remote_id)
-        })
-        .unwrap_or(false)
-    {
-        log::info!(
-            "[LilyPad] new game {title} (appid {appid}) {how} as {remote_id}; \
-             {sessions_logged} session(s) logged"
-        );
-    }
-}
-
 /// Records that the user chose not to add a new game. Distinct from resolving it: the row is
 /// kept either way, and which outcome it was is the thing worth keeping.
 fn dismiss_new_game(state: &AppState, appid: &str) {
@@ -2191,234 +2196,64 @@ fn search_igdb_games(state: tauri::State<AppState>, query: String) -> Result<Vec
     client.search_igdb(&query)
 }
 
-/// Resolves a pending game submission by creating a brand-new FrogLog game entry for it.
-/// `igdb_title` is the exact title of the IGDB search result the user picked; enriched details
-/// for it are fetched fresh (via `fetch_game_details`) rather than trusting the lightweight
-/// search result, since `/search/fetch` returns the richer, create-ready field set.
+/// Runs a New Games resolution through the shared, retry-safe resolver
+/// (`lilypad_core::resolution`), then links the exe and refreshes the library.
+///
+/// Credentials and account come from one snapshot, and the library is a snapshot too, so no
+/// lock is held across the network calls.
+fn resolve_pending(
+    state: &AppState,
+    appid: &str,
+    choice: resolution::Choice,
+) -> Result<resolution::Resolution, String> {
+    let auth = state.auth.read().unwrap().clone();
+    let client = api_client(&auth).ok_or("Not logged in")?;
+    let account = ledger_session::account_identity(&auth, DEFAULT_API_URL).ok_or("Not logged in")?;
+    let library = state.library_index_arc.read().unwrap().clone();
+    let resolved = resolution::resolve(&client, &state.store(), &account, &library, appid, choice)?;
+    resolution::link_resolved(&state.process_map_arc, &auth, &resolved);
+    // Without this the library only refreshes every 5 minutes -- relaunching the same game
+    // shortly after would still look new (or still finished) and be prompted about again.
+    refresh_library_index_state(state);
+    Ok(resolved)
+}
+
+/// The game a resolution ended up on: the one it created, or the existing one it attached to.
+fn resolved_game(state: &AppState, resolved: resolution::Resolution) -> Result<serde_json::Value, String> {
+    match resolved.created {
+        Some(created) => Ok(created),
+        None => {
+            let auth = state.auth.read().unwrap().clone();
+            api_client(&auth).ok_or("Not logged in")?.get_game_raw(resolved.game_id)
+        }
+    }
+}
+
+/// Resolves a pending game submission by creating a brand-new FrogLog game entry for it, or
+/// attaching to the entry the user already has for the same game.
 #[tauri::command]
 fn resolve_pending_game_as_new(
     state: tauri::State<AppState>,
     appid: String,
     igdb_title: String,
 ) -> Result<serde_json::Value, String> {
-    let pending = new_games_for(&state);
-    let entry = pending
-        .iter()
-        .find(|p| p.appid == appid)
-        .ok_or("Pending submission not found")?
-        .clone();
-
-    let auth = state.auth.read().unwrap();
-    let client = api_client(&auth).ok_or("Not logged in")?;
-
-    // If IGDB has no exact match for the confirmed title (`/search/fetch` can fail even when
-    // `/search` just found it, for a handful of titles), fall back to `igdb_title` itself — the
-    // title the user actually confirmed — never `entry.title`, which is only LilyPad's original
-    // guess (literally the exe's folder name for a non-Steam game, often full of release-group
-    // junk like "-DenuvOwO [PORTABLE]").
-    let mut payload = client
-        .fetch_game_details(&igdb_title)
-        .unwrap_or_else(|_| serde_json::json!({ "title": igdb_title.clone() }));
-    let obj = payload.as_object_mut().ok_or("Unexpected response shape")?;
-
-    // Game-identity redesign, LilyPad slice: if the confirmed IGDB title's igdb_id already
-    // matches an existing, not-yet-finished FrogLog entry -- e.g. the same game already
-    // logged from a different platform, with no Steam appid overlap at all, the exact case
-    // the appid-only `resolve_by_appid` tier in monitor.rs structurally can't see -- attach
-    // this session to it instead of silently creating a duplicate row. Mirrors that tier's
-    // own "not finished -> just resume" behavior (no confirmation prompt there either). A
-    // FINISHED match is deliberately left as today's behavior (falls through and creates a
-    // new entry -- the genuine-replay case): unlike ResultCard.jsx's web equivalent of this
-    // exact feature, there's no natural place for a mid-command confirmation prompt in this
-    // synchronous command model. Narrower scope, not an oversight -- mirrors the same trim
-    // already made for routes/wishlist.js's /move-to-games on the web side.
-    if let Some(igdb_id) = obj.get("igdb_id").and_then(|v| v.as_i64()) {
-        let matched = state.library_index_arc.read().unwrap().resolve_by_igdb_id(igdb_id).cloned();
-        if let Some(resolved) = matched {
-            if !library_match::is_finished_status(&resolved.status) {
-                resolve_existing_pending_impl(&state, &client, &auth, &appid, &resolved.game_type, resolved.id, &resolved.title)?;
-                return client.get_game_raw(resolved.id);
-            }
-        }
-    }
-
-    // /search/fetch names this field "dev_country"; POST /games expects "studio_country".
-    if let Some(country) = obj.remove("dev_country") {
-        obj.insert("studio_country".to_string(), country);
-    }
-    obj.insert("is_public".to_string(), serde_json::json!(true));
-    // Session-tracked, matching how LilyPad actually recorded this play time (discrete
-    // sessions, not a single running total) — hours go in via add_game_session below rather
-    // than hours_played, same as a session-tracked game's aggregate is always computed.
-    obj.insert("session_tracking".to_string(), serde_json::json!(true));
-    obj.insert("sessions_public".to_string(), serde_json::json!(true));
-    // Start date is when LilyPad first saw this game being played, not today (when the user
-    // finally got around to resolving it) — first_seen_secs is exactly that.
-    if let Some(start_date) = chrono::DateTime::from_timestamp(entry.first_seen_secs as i64, 0)
-        .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
-    {
-        obj.insert("start_date".to_string(), serde_json::json!(start_date));
-    }
-    // Prefer our own detected Steam appid over whatever (possibly null) match IGDB found —
-    // ours is known-accurate since it's literally how this session was detected. The backend
-    // column is numeric, so parse it rather than sending the string appid as-is.
-    if let Ok(appid_num) = entry.appid.parse::<i64>() {
-        obj.insert("steam_app_id".to_string(), serde_json::json!(appid_num));
-    } else {
-        // Real bug found live 2026-08-18: `fetch_game_details`'s payload (via the backend's
-        // /search/fetch, GET above) resolves the confirmed IGDB title's OWN Steam SKU
-        // mapping -- "does this game happen to also be sold on Steam at all" -- entirely
-        // independent of how *this* session was actually detected. For the vast majority
-        // of commercial PC titles that answer is yes, so `obj` already carries a real
-        // `steam_app_id` at this point even for a non-Steam detection (a pirated copy,
-        // GOG/Epic/itch.io release, or any other watched-directory game with a synthetic
-        // `local:<path>` id) -- left alone, that stale id silently survived into the
-        // create payload below and gave a non-Steam play a real Steam platform link (and,
-        // with it, an active but permanently-empty Trophies tab, since there's no
-        // legitimate way to sync real Steam unlock data for a copy never actually
-        // launched through Steam). Explicitly cleared here, not just left un-set.
-        obj.remove("steam_app_id");
-        // `platform_chips` is POST /games' actual accepted mechanism as of 2026-08-18 --
-        // the plain `platform` string this used to send here had already gone silently
-        // dead by the time this ran (that route stopped reading it), so this is also a
-        // real functional fix, not just a rename.
-        obj.insert("platform_chips".to_string(), serde_json::json!(["PC (Non-Steam)"]));
-        // No legitimate way to sync real achievement data for a non-Steam detection --
-        // disabled by default rather than shipping an always-empty Trophies tab.
-        obj.insert("no_achievements".to_string(), serde_json::json!(true));
-    }
-
-    let created = client.create_game(payload)?;
-    let created_id = created.get("id").and_then(|v| v.as_i64()).ok_or("Created game missing id")?;
-    // The confirmed/matched title, not `entry.title` (LilyPad's original guess — literally the
-    // exe's folder name for a non-Steam game) — that's what should show up in the tray/session
-    // popup/notifications going forward.
-    let created_title = created.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());
-
-    let logged = log_each_pending_session(&entry, |date, hours, sync_ref| {
-        client.add_game_session(
-            created_id as i32,
-            Some(date),
-            Some(hours),
-            Some("Session logged from LilyPad".to_string()),
-            false,
-            true,
-            sync_ref,
-        )
-    })?;
-
-    resolve_new_game(
-        &state, &appid, &entry.title, "session", created_id as i32, "created", logged,
-    );
-
-    // Link the exe to the newly-created game so future sessions are tracked normally instead
-    // of falling through detection again. Best-effort: a failure here shouldn't fail the
-    // resolve itself, and older pending entries (persisted before exe_name existed) have
-    // nothing to link.
-    if !entry.exe_name.is_empty() {
-        if let Err(e) = config::link_process_mapping(
-            &state.process_map_arc,
-            &auth,
-            entry.exe_name.clone(),
-            "session".to_string(),
-            created_id as i32,
-            created_title.or_else(|| Some(entry.title.clone())),
-        ) {
-            log::warn!("[LilyPad] failed to link newly-created game's exe: {e}");
-        }
-    }
-
-    Ok(created)
+    let resolved = resolve_pending(&state, &appid, resolution::Choice::New { igdb_title })?;
+    resolved_game(&state, resolved)
 }
 
-/// Resolves a pending game submission flagged as a possible replay (`entry.replay_of` is
-/// `Some`) by creating a brand-new FrogLog game entry for it — distinct from the old
-/// Completed/DNF entry, which is left untouched. Mirrors `resolve_pending_game_as_new`, but
-/// skips the IGDB lookup entirely: the game is already known (same Steam appid as the existing
-/// entry), so this just fetches that entry's own details via `GET /games/{id}` and reuses them
-/// as the starting point for the new row, rather than re-deriving them from an IGDB search.
-/// `replay: true` is set explicitly rather than relying on the backend's title-based auto-detect
-/// on `POST /games` — we already know for certain this is the same title, no guessing needed.
+/// Resolves a pending game submission flagged as a possible replay by creating a new entry
+/// alongside the Completed/DNF one, which is left untouched.
 #[tauri::command]
 fn resolve_pending_game_as_replay(
     state: tauri::State<AppState>,
     appid: String,
 ) -> Result<serde_json::Value, String> {
-    let pending = new_games_for(&state);
-    let entry = pending
-        .iter()
-        .find(|p| p.appid == appid)
-        .ok_or("Pending submission not found")?
-        .clone();
-    let replay_of = entry.replay_of.clone().ok_or("Pending submission has no replay match")?;
-
-    let auth = state.auth.read().unwrap();
-    let client = api_client(&auth).ok_or("Not logged in")?;
-
-    let mut payload = client.get_game_raw(replay_of.id)?;
-    let obj = payload.as_object_mut().ok_or("Unexpected response shape")?;
-    // Strip everything identity/progress-related from the old entry -- this is a fresh
-    // playthrough, not a continuation, so none of it should carry over.
-    for field in ["id", "hours_played", "start_date", "end_date", "status", "status_override", "user_id", "created_at"] {
-        obj.remove(field);
-    }
-    obj.insert("dnf".to_string(), serde_json::json!(false));
-    obj.insert("session_tracking".to_string(), serde_json::json!(true));
-    // Public sessions regardless of what the old entry had -- LilyPad-created games
-    // default to public session tracking.
-    obj.insert("sessions_public".to_string(), serde_json::json!(true));
-    obj.insert("replay".to_string(), serde_json::json!(true));
-    if let Some(start_date) = chrono::DateTime::from_timestamp(entry.first_seen_secs as i64, 0)
-        .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
-    {
-        obj.insert("start_date".to_string(), serde_json::json!(start_date));
-    }
-
-    let created = client.create_game(payload)?;
-    let created_id = created.get("id").and_then(|v| v.as_i64()).ok_or("Created game missing id")?;
-    let created_title = created.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());
-
-    let logged = log_each_pending_session(&entry, |date, hours, sync_ref| {
-        client.add_game_session(
-            created_id as i32,
-            Some(date),
-            Some(hours),
-            Some("Session logged from LilyPad".to_string()),
-            false,
-            true,
-            sync_ref,
-        )
-    })?;
-
-    resolve_new_game(
-        &state, &appid, &entry.title, "session", created_id as i32, "logged as a replay", logged,
-    );
-
-    // Link the exe to the newly-created replay entry, not the old one, so future sessions of
-    // this playthrough are tracked against it instead of falling through detection again.
-    if !entry.exe_name.is_empty() {
-        if let Err(e) = config::link_process_mapping(
-            &state.process_map_arc,
-            &auth,
-            entry.exe_name.clone(),
-            "session".to_string(),
-            created_id as i32,
-            created_title.or(Some(replay_of.title)),
-        ) {
-            log::warn!("[LilyPad] failed to link newly-created replay's exe: {e}");
-        }
-    }
-
-    // Without this, the library index only refreshes every 5 minutes -- relaunching the same
-    // appid shortly after resolving it here would still see the old Completed/DNF entry and
-    // prompt the replay question all over again instead of auto-linking to the new entry.
-    refresh_library_index_state(&state);
-
-    Ok(created)
+    let resolved = resolve_pending(&state, &appid, resolution::Choice::Replay)?;
+    resolved_game(&state, resolved)
 }
 
-/// Resolves a pending game submission by logging its accumulated hours against a game/live
-/// service entry the user already has in their FrogLog library.
+/// Resolves a pending game submission by logging its sessions against a game/live-service
+/// entry the user already has.
 #[tauri::command]
 fn resolve_pending_game_as_existing(
     state: tauri::State<AppState>,
@@ -2427,110 +2262,12 @@ fn resolve_pending_game_as_existing(
     game_id: i32,
     game_title: String,
 ) -> Result<(), String> {
-    let auth = state.auth.read().unwrap();
-    let client = api_client(&auth).ok_or("Not logged in")?;
-    resolve_existing_pending_impl(&state, &client, &auth, &appid, &game_type, game_id, &game_title)
-}
-
-/// Shared body for "log a pending submission's accumulated hours against an existing
-/// games/live-service entry, then link the exe to it" -- extracted from
-/// `resolve_pending_game_as_existing` (user explicitly picked from the "Map to Existing"
-/// dropdown) so `resolve_pending_game_as_new`'s own igdb_id match check can reuse it too
-/// (attaching instead of creating a duplicate when the confirmed IGDB title already matches
-/// an existing, not-yet-finished entry -- see that function).
-///
-/// Takes an already-built `client`/`auth` rather than re-deriving them from `state.auth`
-/// itself, so a caller that already holds `state.auth`'s read guard (like
-/// `resolve_pending_game_as_new`) doesn't have to acquire a second one on the same thread --
-/// `std::sync::RwLock`'s same-thread reentrant-read behavior is explicitly unspecified/
-/// platform-dependent, and this project already hit a real self-deadlock from a very similar
-/// reentrant-lock mistake once (see the "already-owned auto-link" fix history for
-/// `process_map_arc` in `monitor.rs`).
-fn resolve_existing_pending_impl(
-    state: &AppState,
-    client: &FroglogClient,
-    auth: &AuthConfig,
-    appid: &str,
-    game_type: &str,
-    game_id: i32,
-    game_title: &str,
-) -> Result<(), String> {
-    let pending = new_games_for(&state);
-    let entry = pending
-        .iter()
-        .find(|p| p.appid == appid)
-        .ok_or("Pending submission not found")?
-        .clone();
-
-    // Anything mapped here should end up session-tracked, not "regular" (a single running
-    // hours_played total) -- matches the silent already-owned auto-link path (see the comment
-    // in monitor.rs). enable_session_tracking is idempotent and preserves any pre-existing hours
-    // as a "Pre-tracked hours" session, same flow as enabling it manually on the website.
-    let effective_game_type = if game_type.eq_ignore_ascii_case("live") {
-        "live".to_string()
-    } else {
-        if let Err(e) = client.enable_session_tracking(game_id) {
-            log::warn!("[LilyPad] failed to enable session tracking: {e}");
-        }
-        // If this game is currently Completed/DNF, logging a fresh session against it means
-        // it's being played again -- clear its end date so it reads as "In Progress" instead of
-        // silently piling hours onto a game that still looks finished. No-op otherwise.
-        if let Err(e) = client.resume_finished_game(game_id) {
-            log::warn!("[LilyPad] failed to resume finished game: {e}");
-        }
-        // Best-effort: if this pending submission was actually detected via a real
-        // Steam appid, make sure the existing game we're attaching to gains that link --
-        // see FroglogClient::attach_steam_app_id_if_missing's doc comment for why this
-        // was silently missing before. No-ops for a non-Steam (`local:<path>`) detection.
-        if let Ok(appid_num) = entry.appid.parse::<i64>() {
-            if let Err(e) = client.attach_steam_app_id_if_missing(game_id, appid_num) {
-                log::warn!("[LilyPad] failed to attach steam_app_id: {e}");
-            }
-        }
-        "session".to_string()
-    };
-    let notes = Some("Logged from LilyPad's untracked-session detection".to_string());
-    let logged = log_each_pending_session(&entry, |date, hours, sync_ref| {
-        if effective_game_type == "live" {
-            client.add_live_service_session(game_id, Some(date), Some(hours), notes.clone(), false, true, sync_ref)
-        } else {
-            client.add_game_session(game_id, Some(date), Some(hours), notes.clone(), false, true, sync_ref)
-        }
-    })?;
-    // Best-effort: a game picked here might be a Steam-bulk-imported entry that was never
-    // actually started (status "Imported", no start_date) -- now that a real session's been
-    // logged against it, transition it to "In Progress". No-op if it isn't "Imported".
-    if let Err(e) = client.fix_imported_status_if_needed(game_id, &effective_game_type) {
-        log::warn!("[LilyPad] failed to fix imported status: {e}");
-    }
-    resolve_new_game(
-        state, appid, game_title, &effective_game_type, game_id, "mapped to an existing entry",
-        logged,
-    );
-
-    // Link the exe to this game so future sessions are tracked normally instead of falling
-    // through detection again. Uses the existing game's own confirmed title (from the caller),
-    // not `entry.title` (LilyPad's original guess). Best-effort, same as resolve_pending_game_as_new.
-    if !entry.exe_name.is_empty() {
-        if let Err(e) = config::link_process_mapping(
-            &state.process_map_arc,
-            auth,
-            entry.exe_name.clone(),
-            effective_game_type,
-            game_id,
-            Some(game_title.to_string()),
-        ) {
-            log::warn!("[LilyPad] failed to link exe to existing game: {e}");
-        }
-    }
-
-    // Without this, the library index only refreshes every 5 minutes -- relaunching the same
-    // exe shortly after resolving it here would still see the old Completed/DNF status and
-    // prompt the replay question all over again instead of resuming normally. Matches the GTK
-    // build's `resolve_as_existing`, which already does this.
-    refresh_library_index_state(state);
-
-    Ok(())
+    resolve_pending(
+        &state,
+        &appid,
+        resolution::Choice::Existing { game_type, game_id, title: game_title },
+    )
+    .map(|_| ())
 }
 
 /// Cancel the live/session auto-submit countdown and open the session popup so the user can add notes.

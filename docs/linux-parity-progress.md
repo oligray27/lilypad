@@ -158,4 +158,83 @@ Log capture: `tee` without `-a` overwrote the log on each launch, so only the la
 
 Flatpak Steam could not be tested on this machine. By reading the code, it is expected to track mapped games (matched by executable name) but not detect unmapped or already-owned games. The sandbox reports library paths in `libraryfolders.vdf`, and `/proc/<pid>/exe`, as seen inside the sandbox, not the host paths the installed-games scan uses. Also, `find_steam_root` stops at the first Steam install it finds, so a machine with both native and Flatpak Steam only scans one.
 
+## 2026-09-25 — Phase 4: retry-safe New Games resolution and submissions
+
+### Shared resolver (`lilypad-core::resolution`)
+
+The Tauri and GTK frontends each had their own copy of new/replay/existing resolution (about 340 and 300 lines, nearly identical). Both now call `resolution::resolve`, with a narrow `ResolveApi` trait for failure testing. Every step is safe to repeat:
+
+- **Destination recorded before uploading.** Once a game is created, or an existing one chosen, `SessionLedger::set_new_game_target` stores it on the still-pending entry (in `remote_id`). A retry continues against that game whatever the user picks next, so an entry's sessions cannot be split across two games, and a crash or failure after creation cannot produce a second game.
+- **Keyed game creation.** `POST /games` now carries `client_ref = newgame:<record id>` (`FroglogClient::create_game_keyed`), so a lost create *response* is answered on retry with the game the first attempt made. This needs the backend change below; older servers ignore the field.
+- **Per-entry upload keys.** `sync_ref` is now `newgame:<record id>#<index>` instead of `newgame:<appid>#<index>`. The appid form made a later batch for the same game reuse the first batch's keys. If both batches were logged against the same entry, the server answered the second batch's sessions with the first batch's and **silently dropped them**.
+- **"Already owned" handled.** `POST /games` answers `409 needs_confirmation` when the server sees an unfinished playthrough the local index missed; the body has no `error` field, so LilyPad reported a bare `409: Conflict` and the resolve failed. That is now parsed (`GameCreation::AlreadyOwned`) and treated as "attach to that entry". Replays send `confirm_action: "new"`, the user's explicit choice.
+- Settling is last, and a settle failure after everything uploaded says that retrying is safe. Dismissing an entry whose game was already created keeps that reference (`COALESCE`).
+
+Five resolver tests use a fake server with FrogLog's idempotency behaviour: lost create response (one game), upload failure after creation (resumes on the same game even with a different choice, each sitting exactly once), a later batch for the same game (not dropped), server-side "already owned" (attached, nothing created), and another account's entry (refused).
+
+### Payload saved before sending
+
+`SessionStore::save_attempt` stores what is about to be sent (notes, privacy, date) on the session's record before the request, in all GTK and Tauri submit paths. Previously it was stored only after a failure, so a crash or lost response mid-request left a retry row reconstructed without the popup's notes and privacy settings. New store test.
+
+### Backend change (not deployed)
+
+- `backend/scripts/add_games_client_ref.sql`: nullable `games.client_ref` plus a unique partial index on `(user_id, client_ref)`.
+- `routes/games.js` `POST /`: a supplied `client_ref` that already exists returns that game immediately. This happens *before* identity resolution, which would otherwise answer a retry with `needs_confirmation`. The insert uses `ON CONFLICT ... DO NOTHING` to settle a race. `API_DOCUMENTATION.md` updated.
+- **Deploy order: run the SQL first**, then deploy the route. The route writes the column, so the reverse order makes every LilyPad-created game fail until the migration runs. The website never sends `client_ref`, so it is unaffected either way.
+
+### Known limitation
+
+A New Games resolution that was **partly uploaded by Windows v0.6.0** and is then retried after upgrading uses the new key format, so the sittings it had already uploaded would be sent again. This needs a failed resolution left pending across the upgrade.
+
+### Validation
+
+Windows: 129 core, 2 migration and 2 Tauri tests; Tauri builds with no warnings. Linux: 132 core, 2 migration and 25 GTK tests, notification test and release build. GTK type-check clean apart from the two known Linux-only notify.rs errors.
+
+**Deployed and verified live (2026-09-25).** The user ran the migration, deployed the route, and resolved a real New Games entry on Bazzite (Dead Cells → `session:14231`). A read-only check of the shared database shows it end to end: game 14231 has `client_ref = newgame:8f85b9f2-…`, which is the ledger record's id; its session has `sync_ref = newgame:8f85b9f2-…#0`; `idx_games_client_ref` exists; and there are no duplicate `client_ref`s. The failure paths (lost response, partial upload) are covered by the resolver tests only; they have not been reproduced against the live server.
+
+## 2026-09-25 — Phase 5: GTK workflows and desktop integration
+
+Most of Phase 5's workflow items landed with the Phase 2 cutover: record-based popup actions, terminal queued state, explicit discard, account-filtered views, ownership resolution, and tray counts that treat "unknown" as distinct from zero. This slice adds:
+
+- **No status banner (decision).** An `AdwBanner` for storage failures, a stale library and a missing tray was built and then removed at the user's request. Those conditions are logged; storage failures also still surface in the queue views ("unavailable" rather than empty), in the tray counts, and as a startup notification.
+- **No alternative route to Add Notes (decision).** A tray "Add Notes" item was built and then removed at the user's request. The notification's button is the only in-app way to intercept an auto-submission; without a notification daemon the session submits when the window ends, and notes can be added afterwards on the FrogLog website. This closes plan item 5.4 as out of scope.
+- **No tray.** When no StatusNotifier host exists (e.g. GNOME without the AppIndicator extension), `ksni` refuses to register. The window is then shown on every start. A new header-bar menu (Configure, Pending Submissions, New Games, About, Log Out, Quit) routes through the same `TrayAction` handler as the tray, so Quit and Log Out are always reachable. Verified on Bazzite under a private D-Bus session with no tray host or notification daemon: the tray registration failed as expected, LilyPad kept running, and second-instance activation passed.
+- **Autostart.** It uses `$APPIMAGE` when set, since `current_exe()` inside an AppImage is a temporary `/tmp/.mount_*` path that is gone after a reboot. The `Exec` value is escaped per the Desktop Entry spec (quoting for spaces and reserved characters, `%%`, backslash layers), so a path with a space no longer splits into two arguments. Registration moved into the primary instance's startup, and a failure is shown as a notification. Autostart is still re-registered on every launch, matching the Windows build.
+- **Notification waiter threads bounded.** "Go to New Games" notifications waited on a blocking thread until the notification closed. KDE never reports an expired notification as closed, so one thread per notification lived for the rest of the run. The wait now uses the async API with a 10-minute limit.
+
+Validation: Linux 132 core, 2 migration and GTK tests (including 3 new autostart-escaping tests), notification test, release build, and the no-tray smoke test all passed.
+
+Not verifiable here and left for the end-to-end run: how the header menu looks and behave on the real KDE desktop, a GNOME session, keyboard navigation, scaling, and light/dark appearance.
+
+## 2026-09-25 — Pre-release test suite
+
+- `scripts/test-all.ps1` runs every automated check on Windows and Linux (via the Bazzite container) and prints PASS/FAIL/SKIP per check. First full run: all 9 checks passed.
+- `crates/lilypad-core/tests/e2e_process.rs`: three real-process tests (ignored by default, about 20 s). The "game" is a renamed copy of the test binary: it is detected by the real monitor, recorded, and ended with its real duration; crash recovery resumes a still-running game and closes a stopped one at its checkpoint; and a reused pid with a different start time is not resumed. Passing on Windows and Linux; `validate-linux.sh` now runs them.
+- `docs/release-test-plan.md`: the manual checklist for what automation cannot reach (real games, Proton, notifications, tray, upgrades, Windows regression).
+- `scripts/show-ledger.py`: read-only dump of a session store, used by the checklist to spot stuck or duplicated records.
+
+## 2026-09-25 — Phase 6: release 0.6.1 (built and qualified; not published)
+
+- **Version 0.6.1** set in all five manifests and `Cargo.lock`, for both builds. Publishing is left to the user's `scripts/release.ps1`, run with `-NoBump`, since without it the script bumps the patch version again.
+- **Supported floor: glibc 2.39, GTK 4.12, libadwaita 1.5**, i.e. Ubuntu 24.04+, Debian 13+, Fedora 40+. The build container is Debian 13, and the release binary's highest glibc symbol is `GLIBC_2.39`. The `.deb` now declares `$auto` (exact shared-library minimums via `dpkg-shlibdeps`) plus the GTK/libadwaita floors; the `.rpm` requires `gtk4 >= 4.12` and `libadwaita >= 1.5` (previously unversioned).
+- **`release-linux-gtk.sh` made reproducible.** It builds with `--locked`, writes to a fresh `target/release/bundle/linux-<version>/` (so a stale package can't be uploaded), fails unless exactly one package of each kind for this version was produced, and writes `SHA256SUMS` and `BUILD-INFO.txt` (commit, OS, rustc, GTK/libadwaita, highest glibc symbol, and the hashes of the downloaded linuxdeploy tools).
+- **`test-linux-packages.sh`** installs the packages into clean Ubuntu 24.04, Debian 13 and Fedora 41 containers and checks dependency resolution, missing libraries, and desktop/icon files. It also tests upgrading over the last published `.deb` (0.5.5) and `.rpm` (0.5.0).
+- **README rewritten** for both builds: install per format, the GNOME tray note, upgrading from 0.5.x, usage, data locations, Linux limitations, development, tests and releasing.
+- **`docs/release-notes-0.6.1.md`**: draft notes for the GitHub release.
+
+Build findings:
+- **CRLF in shipped files (fixed).** This Windows working copy (`core.autocrlf=true`) had CRLF in `data/uk.co.froglog.lilypad.desktop` and `debian/postinst`/`postrm`. Packages built from it would have shipped a desktop entry whose `Icon=`/`Exec=` values end in `\r`, and maintainer scripts dpkg cannot run; the AppImage build failed outright ("Could not find suitable icon"). `.gitattributes` now forces LF for `*.desktop` and `crates/lilypad-gtk/debian/*`, the three files were re-checked-out, and `release-linux-gtk.sh` refuses to package any file with CRLF. The version read from a CRLF `Cargo.toml` also carried a `\r`; that is stripped.
+- **linuxdeploy pinned** to `1-alpha-20251107-1` and the GTK plugin to commit `7a3fbc3`, instead of "continuous"/"master". Their hashes are in `BUILD-INFO.txt`.
+- **AppImage runs through XWayland.** linuxdeploy's GTK plugin hook exports `GDK_BACKEND=x11`, as it did for the 0.5.5 AppImage. On Wayland desktops it therefore needs XWayland (present on KDE and GNOME). The `.deb`/`.rpm` builds use native Wayland.
+- **Built:** `lilypad-gtk_0.6.1-1_amd64.deb` (Depends: `libadwaita-1-0 (>= 1.5)`, `libc6 (>= 2.39)`, `libglib2.0-0t64 (>= 2.54.0)`, `libgtk-4-1 (>= 4.12)`), `lilypad-gtk-0.6.1-1.x86_64.rpm`, and `LilyPad-x86_64.AppImage`, with `SHA256SUMS` and `BUILD-INFO.txt`. Windows: `LilyPad_0.6.1_x64-setup.exe` (plus an `.msi`) built with `npm run build`.
+- **AppImage on KDE:** run from a folder with spaces in its path, it started, handed a second launch to the running copy, and registered autostart as `Exec="…/appimage test/My Apps/LilyPad-x86_64.AppImage"`: the real file, correctly quoted.
+- **The `.rpm` never installed on Fedora (fixed).** `cargo-generate-rpm` computes requirements with `ldd` on the build machine (Debian), which produced Debian-only sonames (`libcurl-gnutls.so.4`, `libstemmer.so.0d`, …). The published 0.5.0 `.rpm` has the same problem and cannot be installed with `dnf`. `auto-req = "no"`; the requirements are now explicit (`glibc >= 2.39`, `gtk4 >= 4.12`, `libadwaita >= 1.5`).
+- **Package qualification (`test-linux-packages.sh`), all passed:** fresh `.deb` on Ubuntu 24.04 and Debian 13; fresh `.rpm` on Fedora 41; `.deb` upgrade from 0.5.5; `.rpm` upgrade from 0.5.0 (the old package force-installed with `--nodeps`, since it cannot install normally). The final AppImage also passed the desktop smoke test with v0.5.5 data (5 records migrated).
+- **Final gate:** `test-all.ps1`, all 9 checks passed on the 0.6.1 code. Artifacts copied to `target/release/bundle/linux-0.6.1/` on Windows, with checksums verified.
+- **SHA-256:** `.deb` `f93c9308…9f0280`, `.rpm` `758e3777…94377f`, AppImage `439f2b99…cdf4` (full values in `SHA256SUMS`).
+
+**Deferred by decision (2026-09-25), not open work:**
+- On KDE the auto-submit popup shows for 5 s, but the submission still waits the full 25 s, because Plasma does not report expiry as a close. Left as is.
+- Flatpak Steam: expected to track mapped games only (see the second test run). No path translation for now; to be listed as a known limitation at release.
+
 Real sessions on Bazzite are still required: a native Steam game, a Proton game (short and 16+ character `.exe` names), a Flatpak Steam launch, a watched non-Steam directory, force-stop followed immediately by another launch, a game running before LilyPad starts, and a LilyPad kill mid-session. Two things in particular to confirm: what a Proton game's process tree actually reports (comm/exe of the Wine process and of the wrapper), and that an unmapped Proton session now lasts as long as the game.

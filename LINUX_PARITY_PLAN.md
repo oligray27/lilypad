@@ -4,7 +4,7 @@ Prepared 2026-09-25. Planning only; no application changes or deployments perfor
 
 Implementation started with Phase 0 on 2026-09-25. See [the baseline record](docs/linux-baseline.md) for verified release artifacts, tests, CI preparation and outstanding Linux/environment checks. Phase 0 is not yet complete.
 
-Phase 1 is in progress: submission/retry rules and the auto-submit timer are now shared and validated on Windows and Linux. Phase 2's GTK ledger cutover is done and passes Linux tests, build and KDE smoke tests (including a legacy-data upgrade). Phase 3's code work is done (stale-waiter fixes in both frontends, Proton-safe exit detection, truncated names, exe-path backfill) and unit-tested; its exit gate still needs real game sessions. See [implementation progress](docs/linux-parity-progress.md) for completed work and remaining migration boundaries.
+Phase 1 is in progress: submission/retry rules and the auto-submit timer are now shared and validated on Windows and Linux. Phase 2's GTK ledger cutover is done and passes Linux tests, build and KDE smoke tests (including a legacy-data upgrade). Phase 3's code work is done (stale-waiter fixes in both frontends, Proton-safe exit detection, truncated names, exe-path backfill) and has been exercised in real sessions on Bazzite. Phase 4 (shared retry-safe resolution, keyed game creation) is done and verified live against the deployed backend. Phase 5's code work is done (status banner, tray Add Notes, no-tray support, AppImage-safe autostart); its visual/desktop checks remain. Phase 6 (packaging and release) has not started. See [implementation progress](docs/linux-parity-progress.md) for completed work and remaining migration boundaries.
 
 ## Target and recommendation
 

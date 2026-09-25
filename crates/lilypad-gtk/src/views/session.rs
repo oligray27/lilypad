@@ -213,6 +213,10 @@ fn submit(
     }
     let client = session_flow::client_for(&auth);
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let submission = session_flow::submission_for(mapping, hours, date.clone(), notes.clone(), spoiler, is_public);
+    if let Some(id) = &ledger_id {
+        store.save_attempt(id, &submission);
+    }
     let result = lilypad_core::submission::submit_play_session(
         &client, &mapping.r#type, mapping.froglog_id, Some(date.clone()), hours,
         notes.clone(), spoiler, is_public, ledger_id.clone(),
@@ -229,8 +233,7 @@ fn submit(
         }
         Err(e) => {
             let explanation = lilypad_core::submission::explain_failure(&e);
-            let submission = session_flow::failed_submission(mapping, hours, date, notes, spoiler, is_public, &e);
-            if store.queue_failed(ledger_id.as_deref(), account, submission) {
+            if store.queue_failed(ledger_id.as_deref(), account, session_flow::failed(submission, &e)) {
                 Attempt::Queued(format!("Submission failed; the session is saved in Pending Submissions. {explanation}"))
             } else {
                 Attempt::Failed(format!(

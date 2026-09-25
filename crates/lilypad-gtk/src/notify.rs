@@ -91,28 +91,46 @@ pub fn show(summary: &str, body: &str) {
 /// action). Runs on its own thread since `wait_for_action` blocks until the user interacts or
 /// the notification closes — safe to call from the GTK main loop, `on_action` should just send
 /// a message back to it rather than touch any GTK widget directly.
+///
+/// The wait is bounded by `ACTION_WAIT`. KDE Plasma moves an expired notification into its
+/// history without reporting it closed, so an unbounded wait kept one thread alive per
+/// notification for as long as LilyPad ran.
 pub fn show_with_action(summary: &str, body: &str, action_label: &str, on_action: impl FnOnce() + Send + 'static) {
+    const ACTION_WAIT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+    use notify_rust::NotificationResponse;
     let summary = summary.to_string();
     let body = body.to_string();
     let action_label = action_label.to_string();
     std::thread::spawn(move || {
-        match notify_rust::Notification::new()
-            .summary(&summary)
-            .body(&body)
-            .appname("LilyPad")
-            .icon(&icon_ref("uk.co.froglog.lilypad"))
-            .action("default", &action_label)
-            .show()
-        {
-            Ok(handle) => {
-                handle.wait_for_action(|action| {
-                    if action != "__closed" {
+        let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(runtime) => runtime,
+            Err(e) => return log::warn!("[LilyPad] notification failed: {e}"),
+        };
+        runtime.block_on(async move {
+            let mut notification = notify_rust::Notification::new();
+            notification
+                .summary(&summary)
+                .body(&body)
+                .appname("LilyPad")
+                .icon(&icon_ref("uk.co.froglog.lilypad"))
+                .action("default", &action_label);
+            let handle = match notification.show_async().await {
+                Ok(handle) => handle,
+                Err(e) => return log::warn!("[LilyPad] notification failed: {e}"),
+            };
+            let waited = tokio::time::timeout(
+                ACTION_WAIT,
+                handle.wait_for_action_async(move |response| {
+                    if matches!(response, NotificationResponse::Default | NotificationResponse::Action(_)) {
                         on_action();
                     }
-                });
+                }),
+            )
+            .await;
+            if waited.is_err() {
+                log::debug!("[LilyPad] stopped waiting for a click on an old notification");
             }
-            Err(e) => log::warn!("[LilyPad] notification failed: {e}"),
-        }
+        });
     });
 }
 

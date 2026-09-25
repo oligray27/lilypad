@@ -101,16 +101,67 @@ fn build_window(app: &adw::Application, state: AppState) {
         state.set_store(store);
     }
 
+    // Matches the Tauri build: autostart is (re)registered on every launch, so it follows the
+    // binary or AppImage actually in use.
+    if let Err(e) = crate::autostart::enable() {
+        log::warn!("[LilyPad] autostart: {e}");
+        notify::show("LilyPad won't start at login", &e);
+    }
+
     // Tray, built before the views so its refresh closure can be handed to them.
     // Arc<Mutex<_>> (not Rc<RefCell<_>>) because auto-submit results need to
     // refresh the tray from a background thread (session_flow.rs), not just the
     // GTK main thread.
     let tray_handle: Arc<Mutex<Option<ksni::blocking::Handle<LilypadTray>>>> = Arc::new(Mutex::new(None));
     let (action_tx, action_rx) = async_channel::unbounded::<TrayAction>();
-    *tray_handle.lock().unwrap() = tray::spawn(state.clone(), action_tx);
+    // No StatusNotifier host (e.g. GNOME without the AppIndicator extension): LilyPad still runs,
+    // but everything the tray offered has to be reachable from the window instead.
+    let tray_available = {
+        let handle = tray::spawn(state.clone(), action_tx.clone());
+        let available = handle.is_some();
+        *tray_handle.lock().unwrap() = handle;
+        available
+    };
     let refresh_tray = tray::make_refresh_tray(tray_handle);
 
     let header_bar = adw::HeaderBar::new();
+
+    // Everything the tray menu offers, reachable without one. Routed through the same
+    // `TrayAction` handler as the tray itself, so both behave identically.
+    {
+        let menu = gtk4::gio::Menu::new();
+        let navigation = gtk4::gio::Menu::new();
+        navigation.append(Some("Configure…"), Some("app.configure"));
+        navigation.append(Some("Pending Submissions"), Some("app.pending"));
+        navigation.append(Some("New Games"), Some("app.new-games"));
+        navigation.append(Some("About LilyPad"), Some("app.about"));
+        menu.append_section(None, &navigation);
+        let session = gtk4::gio::Menu::new();
+        session.append(Some("Log Out"), Some("app.logout"));
+        session.append(Some("Quit LilyPad"), Some("app.quit"));
+        menu.append_section(None, &session);
+        for (name, action) in [
+            ("configure", TrayAction::ShowMappings),
+            ("pending", TrayAction::ShowPending),
+            ("new-games", TrayAction::ShowNewGames),
+            ("about", TrayAction::ShowMain),
+            ("logout", TrayAction::Logout),
+            ("quit", TrayAction::Quit),
+        ] {
+            let simple = gtk4::gio::SimpleAction::new(name, None);
+            let tx = action_tx.clone();
+            simple.connect_activate(move |_, _| {
+                let _ = tx.send_blocking(action.clone());
+            });
+            app.add_action(&simple);
+        }
+        let menu_button = gtk4::MenuButton::builder()
+            .icon_name("open-menu-symbolic")
+            .tooltip_text("Menu")
+            .menu_model(&menu)
+            .build();
+        header_bar.pack_end(&menu_button);
+    }
 
     // Shared across every stack page (see the header-bar comment below); shown/hidden per
     // page by the `visible-child-name` handler wired up after the stack is built.
@@ -253,7 +304,8 @@ fn build_window(app: &adw::Application, state: AppState) {
         window.set_default_size(w, h);
     }
 
-    if !state.logged_in() {
+    // Without a tray there is no other way in, so the window is shown on every start.
+    if !state.logged_in() || !tray_available {
         window.present();
     }
 

@@ -6,6 +6,7 @@ pub mod ledger_session;
 pub mod library_match;
 pub mod local_games;
 pub mod monitor;
+pub mod resolution;
 pub mod session_persistence;
 pub mod session_ledger;
 pub mod session_store;
