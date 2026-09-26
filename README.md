@@ -1,6 +1,6 @@
 # LilyPad
 
-A system tray companion for [FrogLog](https://froglog.co.uk). LilyPad notices when you start a game, times the session, and logs it to your FrogLog profile when you stop — automatically, or after you add notes.
+A system tray companion for [FrogLog](https://froglog.co.uk). LilyPad notices when you start a game, times the session, and logs it to your FrogLog profile when you stop.
 
 There are three builds from this repository, sharing the same core:
 
