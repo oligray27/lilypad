@@ -51,11 +51,31 @@ if ($NoBump) {
     Add-Content 'package.json' ''
 
     # --- Update Cargo.toml version fields (first `version = "..."` in [package]) ---
-    foreach ($CargoToml in @('src-tauri/Cargo.toml', 'crates/lilypad-core/Cargo.toml', 'crates/lilypad-gtk/Cargo.toml')) {
+    # Every build must carry the release's version: each one's update check compares its own
+    # version with the latest release tag (lilypad-core updates.rs), so one left behind would
+    # tell its users to update to the version they already have.
+    foreach ($CargoToml in @('src-tauri/Cargo.toml', 'crates/lilypad-core/Cargo.toml', 'crates/lilypad-gtk/Cargo.toml', 'crates/lilypad-engine/Cargo.toml')) {
         $Cargo = Get-Content $CargoToml -Raw
         $Cargo = $Cargo -replace '(?m)^version = "[^"]+"', "version = `"$New`""
         Set-Content $CargoToml $Cargo -NoNewline
     }
+
+    # --- Update the Decky plugin's package.json and lockfile ---
+    # decky/build-plugin.sh requires package.json to match the engine's version. Rewritten with
+    # Node (already required) so the files keep their own formatting and line endings.
+    node -e @'
+const fs = require('fs');
+const version = process.argv[1];
+for (const file of ['decky/package.json', 'decky/package-lock.json']) {
+  const raw = fs.readFileSync(file, 'utf8');
+  const eol = raw.includes('\r\n') ? '\r\n' : '\n';
+  const json = JSON.parse(raw);
+  json.version = version;
+  if (json.packages && json.packages['']) json.packages[''].version = version;
+  fs.writeFileSync(file, JSON.stringify(json, null, 2).replace(/\n/g, eol) + eol);
+}
+'@ $New
+    if ($LASTEXITCODE -ne 0) { throw "Could not update the Decky plugin's version" }
 }
 
 # --- Build ---
@@ -68,7 +88,8 @@ if ($LASTEXITCODE -ne 0) {
 if (-not $NoBump) {
     # --- Commit version bump ---
     git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml `
-        crates/lilypad-core/Cargo.toml crates/lilypad-gtk/Cargo.toml Cargo.lock
+        crates/lilypad-core/Cargo.toml crates/lilypad-gtk/Cargo.toml crates/lilypad-engine/Cargo.toml `
+        decky/package.json decky/package-lock.json Cargo.lock
     git commit -m "chore: release v$New"
 
     # --- Tag ---
