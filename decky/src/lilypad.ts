@@ -10,6 +10,8 @@ export interface Status {
   logged_in: boolean;
   username: string | null;
   now_tracking: string | null;
+  /** How long the current session has run, in seconds, when the status was read. */
+  now_tracking_secs: number | null;
   pending: number | null;
   new_games: number | null;
   decisions: number;
@@ -21,6 +23,9 @@ export interface Decision {
   title: string;
   time: string;
   hours: number;
+  /** Session-tracked and live-service games take notes, spoiler and visibility. */
+  takes_notes: boolean;
+  forced: boolean;
 }
 
 export interface PendingSession {
@@ -62,14 +67,21 @@ export interface IgdbResult {
 export interface Settings {
   share_now_playing: boolean;
   detect_unmapped: boolean;
-  /** Sent with every session; empty for none. */
+  /** Sent with every auto-submitted session; empty for none. */
   session_note: string;
+  /** Off: the session dialog opens as each game closes instead. */
+  auto_submit: boolean;
 }
 
 export type Attempt =
   | { outcome: "submitted" }
   | { outcome: "queued"; message: string }
   | { outcome: "failed"; message: string };
+
+export type Retried =
+  | { outcome: "submitted" }
+  /** Its game was deleted from FrogLog, so it went to New Games under this title. */
+  | { outcome: "moved_to_new_games"; title: string };
 
 export type Choice =
   | { kind: "new"; igdb_title: string }

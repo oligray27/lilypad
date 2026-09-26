@@ -45,11 +45,10 @@ pub trait Frontend: Send + Sync + 'static {
     /// takes it or the interception window ends. See `auto_submit`.
     fn auto_submit_prompt(&self, title: &str, time: &str) -> Result<Outcome, String>;
 
-    /// Submit every finished session as soon as it ends, with the Gaming Mode note, whatever
-    /// the auto-submit settings say. For a frontend with nowhere to add notes (Gaming Mode).
-    /// A force-stopped session is still left to the user.
-    fn submits_every_session(&self) -> bool {
-        false
+    /// How this frontend wants finished sessions submitted. A force-stopped session is always
+    /// left to the user, whatever this says.
+    fn submit_policy(&self, _state: &EngineState) -> SubmitPolicy {
+        SubmitPolicy::Settings
     }
 
     /// An unlisted game's session went into New Games.
@@ -64,6 +63,18 @@ pub trait Frontend: Send + Sync + 'static {
 }
 
 pub type FrontendRef = Arc<dyn Frontend>;
+
+/// How finished sessions are submitted (`Frontend::submit_policy`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitPolicy {
+    /// The per-game-type auto-submit settings, with an Add Notes prompt for session-tracked and
+    /// live-service games (the desktop app).
+    Settings,
+    /// Every session as soon as it ends, with the Gaming Mode note.
+    Always,
+    /// Every session is left to the user (`needs_decision`).
+    Ask,
+}
 
 /// Opens the durable store (importing the pre-ledger JSON queues once) into `state`. Call only
 /// from the single running instance, before `start`. Returns the error to show, if any.

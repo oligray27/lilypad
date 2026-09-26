@@ -1,10 +1,10 @@
-// Full-screen dialogs for the parts that need more room than the Quick Access panel: a stopped
-// session, the pending queue, and resolving New Games.
+// Full-screen dialogs for the parts that need more room than the Quick Access panel: a finished
+// session to submit, the pending queue, and resolving New Games.
 
-import { ConfirmModal, DialogButton, Dropdown, Field, Focusable, ModalRoot, TextField, showModal } from "@decky/ui";
+import { ConfirmModal, DialogButton, Dropdown, Field, Focusable, ModalRoot, TextField, ToggleField, showModal } from "@decky/ui";
 import { useEffect, useState } from "react";
 import {
-  Attempt, Choice, Decision, IgdbResult, LibraryGame, NewGame, PendingSession, call, errorText,
+  Attempt, Choice, Decision, IgdbResult, LibraryGame, NewGame, PendingSession, Retried, call, errorText,
 } from "./lilypad";
 
 interface ModalProps {
@@ -14,8 +14,13 @@ interface ModalProps {
 const rowStyle = { display: "flex", gap: "8px", flexWrap: "wrap" as const, marginTop: "6px" };
 const errorStyle = { color: "#ff7b6b", marginTop: "8px" };
 
-/** Submit a force-stopped session or don't record it. */
+/** A finished session: submit it (with notes for session-tracked and live-service games) or
+ * don't record it. Mirrors the desktop app's session window, wording included. Closing it
+ * without choosing leaves the session in the panel's list. */
 export function DecisionModal({ decision, closeModal }: ModalProps & { decision: Decision }) {
+  const [notes, setNotes] = useState("");
+  const [spoiler, setSpoiler] = useState(false);
+  const [hidden, setHidden] = useState(false);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [done, setDone] = useState(false);
@@ -24,7 +29,7 @@ export function DecisionModal({ decision, closeModal }: ModalProps & { decision:
     setBusy(true);
     setMessage(null);
     try {
-      const attempt = await call<Attempt>("decision_submit", { id: decision.id });
+      const attempt = await call<Attempt>("decision_submit", { id: decision.id, notes, spoiler, is_public: !hidden });
       if (attempt.outcome === "submitted") return closeModal?.();
       setMessage(attempt.message);
       // Queued: saved for retry, nothing more to decide here.
@@ -49,8 +54,16 @@ export function DecisionModal({ decision, closeModal }: ModalProps & { decision:
 
   return (
     <ModalRoot onCancel={closeModal}>
-      <h2 style={{ margin: 0 }}>Session Stopped</h2>
-      <div style={{ opacity: 0.8, marginBottom: "12px" }}>{decision.title} · {decision.time}</div>
+      {/* Named, since it opens over Steam's own UI with nothing else saying where it came from. */}
+      <h2 style={{ margin: 0 }}>{decision.forced ? "LilyPad: Session Ended (Forced)" : "LilyPad: Session Ended"}</h2>
+      <div style={{ opacity: 0.8, marginBottom: "12px" }}>{decision.title} – {decision.time}</div>
+      {decision.takes_notes && !done && (
+        <>
+          <TextField label="Notes (optional)" value={notes} onChange={(e) => setNotes(e.target.value)} />
+          <ToggleField label="Contains spoilers" checked={spoiler} onChange={setSpoiler} />
+          <ToggleField label="Hide from public" checked={hidden} onChange={setHidden} />
+        </>
+      )}
       {message && <div style={done ? { marginTop: "8px" } : errorStyle}>{message}</div>}
       <Focusable style={rowStyle}>
         {done ? (
@@ -58,7 +71,7 @@ export function DecisionModal({ decision, closeModal }: ModalProps & { decision:
         ) : (
           <>
             <DialogButton disabled={busy} onClick={submit}>Submit to FrogLog</DialogButton>
-            <DialogButton disabled={busy} onClick={discard}>Don't record</DialogButton>
+            <DialogButton disabled={busy} onClick={discard}>Do not record session</DialogButton>
           </>
         )}
       </Focusable>
@@ -71,6 +84,7 @@ export function PendingModal({ closeModal }: ModalProps) {
   const [rows, setRows] = useState<PendingSession[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [status, setStatus] = useState<Record<string, string>>({});
+  const [notice, setNotice] = useState<string | null>(null);
 
   const load = () =>
     call<PendingSession[]>("pending").then(setRows).catch((e) => setError(errorText(e)));
@@ -79,7 +93,10 @@ export function PendingModal({ closeModal }: ModalProps) {
   const act = async (row: PendingSession, cmd: "pending_retry" | "pending_delete", verb: string) => {
     setStatus((s) => ({ ...s, [row.id]: `${verb}…` }));
     try {
-      await call(cmd, { id: row.id });
+      const result = await call<Retried | null>(cmd, { id: row.id });
+      if (result?.outcome === "moved_to_new_games") {
+        setNotice(`${row.title} no longer exists in FrogLog, so its session was moved to New Games as ${result.title}.`);
+      }
       await load();
     } catch (e) {
       setStatus((s) => ({ ...s, [row.id]: `${verb === "Submitting" ? "Retry" : "Delete"} failed: ${errorText(e)}` }));
@@ -89,6 +106,7 @@ export function PendingModal({ closeModal }: ModalProps) {
   return (
     <ModalRoot onCancel={closeModal}>
       <h2 style={{ marginTop: 0 }}>Pending Submissions</h2>
+      {notice && <div style={{ marginBottom: "8px" }}>{notice}</div>}
       {error && <div style={errorStyle}>{error}</div>}
       {rows === null && !error && <div>Loading…</div>}
       {rows?.length === 0 && <div>No pending submissions.</div>}
@@ -171,7 +189,8 @@ function CreateModal({ game, onResolved, closeModal }: ModalProps & { game: NewG
   );
 }
 
-/** Log a New Games entry's sessions against a game the user already has. */
+/** "Map to Existing": log a New Games entry's sessions against a game the user already has.
+ * Wording matches the desktop apps' New Games view. */
 function ExistingModal({ game, onResolved, closeModal }: ModalProps & { game: NewGame; onResolved: () => void }) {
   const [library, setLibrary] = useState<LibraryGame[] | null>(null);
   const [selected, setSelected] = useState<number | null>(null);
@@ -201,8 +220,8 @@ function ExistingModal({ game, onResolved, closeModal }: ModalProps & { game: Ne
 
   return (
     <ModalRoot onCancel={closeModal}>
-      <h2 style={{ marginTop: 0 }}>Add {game.title}'s time to a game you have</h2>
-      {library === null && !error && <div>Loading your library…</div>}
+      <h2 style={{ marginTop: 0 }}>Map {game.title} to Existing</h2>
+      {library === null && !error && <div>Loading…</div>}
       {library && (
         <Dropdown
           rgOptions={library.map((g, i) => ({ data: i, label: label(g) }))}
@@ -211,9 +230,12 @@ function ExistingModal({ game, onResolved, closeModal }: ModalProps & { game: Ne
           onChange={(option) => setSelected(option.data as number)}
         />
       )}
+      <div style={{ opacity: 0.8, fontSize: "0.85em", marginTop: "8px" }}>
+        If the selected game is already marked Completed or DNF, logging hours here will clear its end date and return it to "In Progress" status.
+      </div>
       {error && <div style={errorStyle}>{error}</div>}
       <Focusable style={rowStyle}>
-        <DialogButton disabled={busy || selected === null} onClick={confirm}>Add time</DialogButton>
+        <DialogButton disabled={busy || selected === null} onClick={confirm}>Log Hours</DialogButton>
         <DialogButton onClick={closeModal}>Cancel</DialogButton>
       </Focusable>
     </ModalRoot>
@@ -287,7 +309,7 @@ export function NewGamesModal({ closeModal }: ModalProps) {
             ) : (
               <>
                 <DialogButton onClick={() => showModal(<CreateModal game={game} onResolved={load} />)}>Add to FrogLog</DialogButton>
-                <DialogButton onClick={() => showModal(<ExistingModal game={game} onResolved={load} />)}>Add to a game I have</DialogButton>
+                <DialogButton onClick={() => showModal(<ExistingModal game={game} onResolved={load} />)}>Map to Existing</DialogButton>
               </>
             )}
             <DialogButton onClick={() => dismiss(game)}>Dismiss</DialogButton>

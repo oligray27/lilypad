@@ -181,6 +181,30 @@ fn heal_orphaned_mapping(
     })
 }
 
+/// Whether `mapping` points at a game that has been deleted from FrogLog. Missing from the cached
+/// library is not enough: it can be minutes old, and a game added and linked in the meantime is
+/// not in it yet. So the library is fetched again, and only a successful fetch that still lacks
+/// the game counts. Never true for a live-service mapping (the index has no by-id view of those),
+/// or before the library has loaded at all.
+fn mapping_is_dead(
+    mapping: &ProcessMapping,
+    library_index: &Arc<RwLock<LibraryIndex>>,
+    refresh_library_index: &Arc<dyn Fn() -> bool + Send + Sync>,
+) -> bool {
+    if mapping.r#type.eq_ignore_ascii_case("live") {
+        return false;
+    }
+    let missing = |index: &LibraryIndex| index.is_loaded() && index.resolve_by_id(mapping.froglog_id).is_none();
+    if !missing(&library_index.read().unwrap()) {
+        return false;
+    }
+    log::info!(
+        "[LilyPad] {} #{} (linked to {}) is not in the cached library; refreshing before treating the link as dead",
+        mapping.r#type, mapping.froglog_id, mapping.process
+    );
+    refresh_library_index() && missing(&library_index.read().unwrap())
+}
+
 /// Starts tracking a play session for an already-mapped exe whose target game looks like an
 /// unacknowledged possible replay (see `check_mapped_game_needs_replay_prompt`), instead of the
 /// normal `on_session_started`/`on_session_ended` flow — reuses the same background wait-thread
@@ -1003,6 +1027,19 @@ pub struct ActiveSession {
     pub started_at: Instant,
 }
 
+impl ActiveSession {
+    /// The session's length so far: the same clock its submitted duration is taken from.
+    pub fn elapsed_secs(&self) -> u64 {
+        self.started_at.elapsed().as_secs()
+    }
+
+    /// "Hades (1h 23m)", for tray menus and tooltips.
+    pub fn label(&self) -> String {
+        let title = self.mapping.title.clone().unwrap_or_else(|| self.process_name.clone());
+        format!("{title} ({})", crate::duration::format_session_duration(self.elapsed_secs() as f64))
+    }
+}
+
 /// Clears `current_session` only if it is still the session for `process_name`.
 pub fn clear_session_for(current_session: &RwLock<Option<ActiveSession>>, process_name: &str) {
     let mut current = current_session.write().unwrap();
@@ -1070,6 +1107,9 @@ fn run_wait_thread(
 /// the caller should persist it. The *current* launch is tracked immediately using that same
 /// mapping (via the normal `on_session_started`/`on_session_ended` callbacks) rather than
 /// waiting for a later one, since e.g. a WMI process-start event never refires on its own.
+/// `on_dead_mapping(mapping)` fires when a running game's mapping points at an entry deleted
+/// from FrogLog (see `mapping_is_dead`); the caller must remove it from `config` before
+/// returning, and the game is then detected as unmapped.
 #[allow(clippy::too_many_arguments)]
 pub fn run_poll_loop(
     config: Arc<RwLock<ProcessMapConfig>>,
@@ -1085,6 +1125,7 @@ pub fn run_poll_loop(
     on_unmapped_session_started: impl Fn(UnmappedSessionStart) + Send + Sync + 'static,
     on_unmapped_session_ended: impl Fn(String, String, String, f64, Option<ResolvedLibraryGame>) + Send + Sync + 'static,
     on_already_owned_game_needs_link: impl Fn(ProcessMapping) + Send + Sync + 'static,
+    on_dead_mapping: impl Fn(ProcessMapping) + Send + Sync + 'static,
 ) {
     let (tx, rx) = mpsc::channel::<(String, ProcessMapping, f64)>();
 
@@ -1133,6 +1174,9 @@ pub fn run_poll_loop(
         let on_unmapped_started_poll = Arc::clone(&on_unmapped_started);
         let on_unmapped_ended_poll = Arc::clone(&on_unmapped_ended);
         let on_already_owned_poll = Arc::clone(&on_already_owned);
+        // Called on this thread with `current_session` locked: it must not touch that, and it
+        // must drop the mapping from `config` before returning, or the next scan tracks it again.
+        let on_dead_mapping_poll = on_dead_mapping;
 
         std::thread::spawn(move || {
             let mut system = System::new_all();
@@ -1337,6 +1381,18 @@ pub fn run_poll_loop(
                                     }
                                     None => mapping,
                                 };
+                                // Its game was deleted on the website and nothing re-resolves it.
+                                // Tracking it would only fail to submit, launch after launch, so
+                                // unlink it instead: from the next scan the game is detected like
+                                // any game not in FrogLog, and its sessions go to New Games.
+                                if mapping_is_dead(&mapping, &library_index_poll, &refresh_library_poll) {
+                                    log::warn!(
+                                        "[LilyPad] {} is linked to {} #{}, which no longer exists in FrogLog; unlinking it",
+                                        mapping.process, mapping.r#type, mapping.froglog_id
+                                    );
+                                    on_dead_mapping_poll(mapping);
+                                    continue 'proc_scan;
+                                }
                                 let replay = check_mapped_game_needs_replay_prompt(&mapping, &library_index_poll.read().unwrap());
                                 if let Some(resolved) = replay {
                                     start_replay_prompt_tracking(
@@ -1782,6 +1838,64 @@ mod tests {
         };
         let installed_games: Arc<RwLock<Vec<InstalledGame>>> = Arc::new(RwLock::new(vec![]));
         assert!(heal_orphaned_mapping(&mapping, None, &[], &installed_games, &library_index).is_none());
+    }
+
+    #[test]
+    fn a_mapping_is_dead_only_when_a_fresh_library_still_lacks_its_game() {
+        let mapping = |r#type: &str, froglog_id| ProcessMapping {
+            process: "Celeste.exe".to_string(),
+            r#type: r#type.to_string(),
+            froglog_id,
+            title: Some("Celeste".to_string()),
+            title_filter: None,
+            exe_path: None,
+        };
+        let refreshes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // A refresh that installs `fresh` (or fails, with `None`), counting how often it runs.
+        let refresher = |index: &Arc<RwLock<LibraryIndex>>, fresh: Option<LibraryIndex>| -> Arc<dyn Fn() -> bool + Send + Sync> {
+            let (index, refreshes) = (Arc::clone(index), Arc::clone(&refreshes));
+            Arc::new(move || {
+                refreshes.fetch_add(1, Ordering::SeqCst);
+                match &fresh {
+                    Some(fresh) => {
+                        *index.write().unwrap() = fresh.clone();
+                        true
+                    }
+                    None => false,
+                }
+            })
+        };
+        let with = |ids: &[i32]| {
+            let games: Vec<_> = ids.iter().map(|&id| sample_game(id, "Celeste", 504230, true)).collect();
+            LibraryIndex::build(&games, &[], &[])
+        };
+
+        // Present in the cache: trusted, no network.
+        let index = Arc::new(RwLock::new(with(&[7])));
+        assert!(!mapping_is_dead(&mapping("session", 7), &index, &refresher(&index, None)));
+        assert_eq!(refreshes.load(Ordering::SeqCst), 0);
+
+        // Deleted: missing from the cache and from a fresh fetch.
+        let index = Arc::new(RwLock::new(with(&[])));
+        assert!(mapping_is_dead(&mapping("session", 7), &index, &refresher(&index, Some(with(&[])))));
+
+        // Linked to a game added since the cache was built: the fresh fetch has it.
+        let index = Arc::new(RwLock::new(with(&[])));
+        assert!(!mapping_is_dead(&mapping("session", 7), &index, &refresher(&index, Some(with(&[7])))));
+
+        // Offline: the fetch fails, so nothing is concluded.
+        let index = Arc::new(RwLock::new(with(&[])));
+        assert!(!mapping_is_dead(&mapping("session", 7), &index, &refresher(&index, None)));
+
+        // No library yet (or logged out): an empty index proves nothing.
+        let index = Arc::new(RwLock::new(LibraryIndex::default()));
+        let before = refreshes.load(Ordering::SeqCst);
+        assert!(!mapping_is_dead(&mapping("session", 7), &index, &refresher(&index, Some(with(&[])))));
+        assert_eq!(refreshes.load(Ordering::SeqCst), before);
+
+        // Live-service entries are not in the by-id view, so they are never judged.
+        let index = Arc::new(RwLock::new(with(&[])));
+        assert!(!mapping_is_dead(&mapping("live", 7), &index, &refresher(&index, Some(with(&[])))));
     }
 
     #[test]

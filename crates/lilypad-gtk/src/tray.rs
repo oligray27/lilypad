@@ -84,7 +84,7 @@ impl ksni::Tray for LilypadTray {
     }
 
     fn tool_tip(&self) -> ksni::ToolTip {
-        let title = if let Some(game) = self.state.now_tracking_title() {
+        let title = if let Some(game) = self.state.now_tracking_label() {
             format!("LilyPad - Now Tracking: {game}")
         } else {
             "LilyPad - FrogLog Auto Tracker".into()
@@ -103,7 +103,7 @@ impl ksni::Tray for LilypadTray {
         // wait-thread holds its own clone of the ProcessMapping and the monitor skips all
         // start-detection while a session is live, so mapping edits and library refreshes
         // only affect future sessions, never the one in progress.
-        if let Some(title) = self.state.now_tracking_title() {
+        if let Some(title) = self.state.now_tracking_label() {
             items.push(
                 StandardItem {
                     label: format!("Now Tracking: {title}"),

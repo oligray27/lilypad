@@ -374,6 +374,29 @@ impl SessionStore {
         })
     }
 
+    /// The process a pending mapped session was recorded for, and the mapping it was tracked
+    /// under. `None` for anything else (or when storage is unavailable).
+    pub fn mapped_session(&self, id: &str) -> Option<(String, ProcessMapping)> {
+        self.with_ledger("reading a session", |l| Ok(l.get(id)?))
+            .flatten()
+            .and_then(|stored| match stored.record.target {
+                SessionTarget::Mapped(mapping) => Some((stored.record.process.executable, mapping)),
+                _ => None,
+            })
+    }
+
+    /// Moves a pending session whose game was deleted from FrogLog into New Games under `appid`.
+    /// Returns the entry's new total hours, or `None` if nothing was moved.
+    pub fn move_to_new_games(&self, id: &str, account: &AccountIdentity, appid: &str, title: &str) -> Option<f64> {
+        let total = self
+            .with_ledger("moving a session to New Games", |l| l.move_to_new_games(id, account, appid, title, now_secs()))
+            .flatten();
+        if let Some(total) = total {
+            log::info!("[LilyPad] session {id} moved to New Games as {title} (appid {appid}); {total}h awaiting resolution");
+        }
+        total
+    }
+
     /// The recorded owner of `id`. Outer `None`: unknown (unavailable/missing record).
     pub fn owner(&self, id: &str) -> Option<Option<AccountIdentity>> {
         self.with_ledger("reading a session owner", |l| Ok(l.get(id)?.map(|s| s.record.account)))

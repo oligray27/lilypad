@@ -262,6 +262,16 @@ impl EngineState {
             .map(|s| s.mapping.title.clone().unwrap_or_else(|| s.process_name.clone()))
     }
 
+    /// How long the current session has run, in seconds.
+    pub fn now_tracking_secs(&self) -> Option<u64> {
+        self.current_session.read().unwrap().as_ref().map(|s| s.elapsed_secs())
+    }
+
+    /// The current game with its length so far, e.g. "Hades (1h 23m)".
+    pub fn now_tracking_label(&self) -> Option<String> {
+        self.current_session.read().unwrap().as_ref().map(|s| s.label())
+    }
+
     /// Re-scans Steam's installed games and every configured watched directory, replacing
     /// `installed_games` in one go. Called by the periodic background refresh and immediately
     /// after adding/removing a watched directory, so a newly added folder is picked up right

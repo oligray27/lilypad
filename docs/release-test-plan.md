@@ -51,7 +51,7 @@ bash scripts/test-linux-packages.sh <linux-<version> package dir> <previous-rele
 
 ### B. Native Linux game
 
-- [ ] **Launch a mapped native game.** *Expect:* "Tracking Started" notification within a few seconds; tray icon and tooltip show "Now Tracking".
+- [ ] **Launch a mapped native game.** *Expect:* "Tracking Started" notification within a few seconds; tray icon and tooltip show "Now Tracking" with the session length (e.g. "(12m)"), which goes up within about 30 s of each minute passing, in the tooltip and the tray menu.
 - [ ] **Online presence**: turn "share now playing" on mid-game. *Expect:* you appear as playing on the website within ~2 minutes.
 - [ ] **Quit after at least a minute, auto-submit on.** *Expect:* popup shows for about 5 s, then the session appears on the website with the right length.
 - [ ] **Add Notes** from the notification. *Expect:* session window opens; notes, spoiler and hide-from-public are saved on the website.
@@ -75,7 +75,9 @@ bash scripts/test-linux-packages.sh <linux-<version> package dir> <previous-rele
 ### E. Failures and retries
 
 - [ ] **Offline end of session**: disconnect, finish a game, reconnect. *Expect:* "Session Queued"; Pending shows it with a readable reason. Retry while still offline shows "Submitting…" and then "Retry failed" on its own line under the reason, and the row keeps its layout. Retry once back online submits it once.
-- [ ] **Deleted game**: delete a mapped game on the website, then play it. *Expect:* the session queues with "no longer exists"; the next launch re-resolves (New Games or the new entry) rather than failing again.
+- [ ] **Deleted game**: delete a linked Steam game on the website, then play it. *Expect:* no "Tracking Started" for the old link; the session goes to New Games ("Session Recorded … isn't in your FrogLog yet") and the link is gone from Configure. Log: "no longer exists in FrogLog; unlinking it".
+- [ ] **Deleted mid-session**: start a linked game, delete it on the website, then quit. *Expect (Linux and Gaming Mode):* "Session Recorded" and the session is in New Games, not Pending. *Windows:* it goes to Pending; the next launch goes to New Games.
+- [ ] **Old Pending row for a deleted game**: Retry it. *Expect:* it leaves Pending and appears in New Games (Gaming Mode also says so above the list).
 - [ ] **Library refresh failure**: disconnect the network for over 5 minutes, then launch an owned but unmapped game. *Expect:* it is not filed as a New Game (the last good library copy is kept); the log says "could not refresh the library".
 
 ### F. Crash recovery and force-stop
@@ -112,11 +114,12 @@ bash scripts/test-linux-packages.sh <linux-<version> package dir> <previous-rele
 Install the plugin zip via Decky settings > Developer > Install Plugin from ZIP. Engine log: `~/homebrew/logs/LilyPad/engine.log`.
 
 - [ ] **Open the LilyPad panel** in the Quick Access Menu. *Expect:* the LilyPad icon on its tab; logged in as the desktop app's account (shared data).
-- [ ] **Play a linked game.** *Expect:* "Tracking Started" toast; the panel shows it under Now.
-- [ ] **Quit it** (any game type, whatever the desktop app's auto-submit settings). *Expect:* "Session Auto-Submitted" toast straight away; the session is on the website once, with the session message as its note.
+- [ ] **Play a linked game.** *Expect:* "Tracking Started" toast; the panel shows "Now Tracking: {game}" with "HH:MM:SS - this session" below it, a clock that ticks while the panel is open and matches the time played after closing and reopening it.
+- [ ] **Quit it, Auto-submit on** (any game type, whatever the desktop app's auto-submit settings). *Expect:* "Session Auto-Submitted" toast straight away; the session is on the website once, with the session message as its note.
+- [ ] **Turn Auto-submit off, play and quit a session-tracked game.** *Expect:* the "LilyPad: Session Ended" dialog opens on its own once the game has closed, with Notes (optional), Contains spoilers and Hide from public; the on-screen keyboard works; submitted notes and privacy show on the website. For a regular game, the dialog has no notes fields. "Do not record session" logs nothing. Closing the dialog leaves the session under Sessions to submit (not in Pending Submissions).
 - [ ] **Change the session message**, then blank it. *Expect:* the next sessions carry the new message, then no note; the desktop app's own sessions are unaffected.
-- [ ] **Unlinked Steam game.** *Expect:* "Session Recorded" toast; resolvable from New Games (search, existing game, dismiss).
-- [ ] **Stop tracking** from the panel. *Expect:* "Session Stopped" toast; the session waits under Stopped sessions (Submit or Don't record); the game is not re-tracked until relaunched.
+- [ ] **Unlinked Steam game.** *Expect:* "Session Recorded" toast; resolvable from New Games (Add to FrogLog, Map to Existing, dismiss). Added to FrogLog, its sessions' note is "Session logged from LilyPad via SteamOS".
+- [ ] **Stop tracking** from the panel. *Expect:* the "LilyPad: Session Ended (Forced)" dialog opens (Submit to FrogLog / Do not record session); closed without choosing, the session waits under Sessions to submit, and is not also listed in (or counted by) Pending Submissions; the game is not re-tracked until relaunched. Restarting the plugin before choosing moves it to Pending Submissions.
 - [ ] **Switch to Desktop Mode with a game running, then back.** *Expect:* the desktop app takes over (engine log: "handing over tracking"); the session continues and is submitted once; back in Gaming Mode the panel tracks again.
 - [ ] **Log in from the panel** after logging out. *Expect:* the on-screen keyboard works; the panel returns to the normal view.
 
@@ -124,7 +127,7 @@ Install the plugin zip via Decky settings > Developer > Install Plugin from ZIP.
 
 Windows shares the session code, and several fixes changed it (stale waiter after force-stop, deleted-game detection, New Games resolution, saving submissions before sending).
 
-- [ ] Track a game, auto-submit it, and check the website.
+- [ ] Track a game, auto-submit it, and check the website. While it runs, the tray tooltip and menu show the session length and it updates.
 - [ ] Stop Tracking, then immediately launch another game (as in section F).
 - [ ] Kill LilyPad mid-game and restart with the game still running (as in section F).
 - [ ] Resolve a New Games entry (Create new) and check a single game is created.

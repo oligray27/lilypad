@@ -1,27 +1,31 @@
 //! The engine's `Frontend` in Gaming Mode: everything becomes a protocol event for the Decky
 //! plugin, which shows Steam toasts and its Quick Access panel.
 //!
-//! Gaming Mode has no notes: every finished session is submitted as soon as it ends, with the
-//! user's Gaming Mode note. Only a force-stopped session (probably the wrong game) waits for the
-//! user to submit it or not record it.
+//! With the plugin's auto-submit switch on (the default), every finished session is submitted as
+//! soon as it ends, with the user's Gaming Mode note. With it off, each one waits for the user,
+//! who is shown the session dialog (notes, submit or not) as the game closes. A force-stopped
+//! session (probably the wrong game) always waits.
 
 use crate::protocol::Out;
 use lilypad_core::auto_submit::Outcome;
 use lilypad_core::engine::flow::{format_duration, round_hours};
-use lilypad_core::engine::{Frontend, SessionEndedData};
+use lilypad_core::engine::{EngineState, Frontend, SessionEndedData, SubmitPolicy};
 use serde::Serialize;
 use serde_json::json;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-/// A stopped session waiting for the user in the panel. Its ledger record is already pending,
-/// so if the user never answers it simply stays in Pending Submissions.
+/// A finished session waiting for the user. Its ledger record is already pending, so if the
+/// user never answers (and the engine restarts) it simply shows in Pending Submissions.
 #[derive(Debug, Clone, Serialize)]
 pub struct Decision {
     pub id: String,
     pub title: String,
     pub time: String,
     pub hours: f64,
+    /// Live-service and session-tracked games take notes, spoiler and visibility.
+    pub takes_notes: bool,
+    pub forced: bool,
     #[serde(skip)]
     pub data: SessionEndedData,
 }
@@ -71,19 +75,25 @@ impl Frontend for DeckyFrontend {
             title: data.mapping.title.clone().unwrap_or_else(|| data.mapping.process.clone()),
             time: format_duration(data.duration_secs),
             hours: round_hours(data.duration_secs),
+            takes_notes: matches!(data.mapping.r#type.to_ascii_lowercase().as_str(), "live" | "session"),
+            forced: data.forced,
             data,
         };
         self.decisions.lock().unwrap().push(decision.clone());
         self.out.event("needs_decision", json!({ "decision": decision }));
     }
 
-    /// Never reached: `submits_every_session` skips the Add Notes prompt.
+    /// Never reached: neither of this frontend's policies uses the Add Notes prompt.
     fn auto_submit_prompt(&self, _title: &str, _time: &str) -> Result<Outcome, String> {
         Ok(Outcome::Submit)
     }
 
-    fn submits_every_session(&self) -> bool {
-        true
+    fn submit_policy(&self, state: &EngineState) -> SubmitPolicy {
+        if state.process_map.read().unwrap().gaming_mode_ask {
+            SubmitPolicy::Ask
+        } else {
+            SubmitPolicy::Always
+        }
     }
 
     fn new_game_recorded(&self, title: &str, time: &str, is_replay: bool) {

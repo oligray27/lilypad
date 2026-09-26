@@ -170,13 +170,17 @@ pub fn remote_reference(response: &Value, game_id: i32, game_type: &str) -> Stri
     }
 }
 
-/// Both frontends present the same actionable failure explanation.
+/// Both frontends present the same actionable failure explanation. Short, since it is shown in
+/// narrow places (a Pending Submissions row, a Steam dialog); the raw error, which for a network
+/// failure includes the whole request URL, is for the log, not the user.
 pub fn explain_failure(error: &str) -> String {
     match ApiFailure::classify(error) {
         ApiFailure::NotFound => "This game no longer exists in FrogLog — it was probably deleted. Discard this session, or re-add the game and play it again to re-link it.".into(),
         ApiFailure::Unauthorized => "Not signed in to FrogLog. Log in again, then retry.".into(),
         ApiFailure::RateLimited => "FrogLog asked LilyPad to slow down. Retry in a moment.".into(),
-        ApiFailure::Transient => format!("Could not reach FrogLog ({error}). Retry when back online."),
+        // Transient covers both a request that never reached FrogLog and a 5xx from it.
+        ApiFailure::Transient if error.starts_with('5') => "FrogLog had a problem saving this session. Retry in a moment.".into(),
+        ApiFailure::Transient => "Error submitting session, check connection.".into(),
         ApiFailure::Rejected => format!("FrogLog rejected this session ({error})."),
         ApiFailure::Conflict => "FrogLog has not confirmed this session yet. Retry in a moment.".into(),
     }
@@ -305,6 +309,13 @@ mod tests {
         assert_eq!(ApiFailure::classify(&error), ApiFailure::Conflict);
         assert!(ApiFailure::classify(&error).is_worth_retrying());
         assert!(explain_failure(&error).contains("not confirmed"));
+    }
+
+    #[test]
+    fn a_network_failure_is_explained_without_the_raw_error() {
+        let offline = "error sending request for url (https://api.froglog.co.uk/api/games/14233/sessions)";
+        assert_eq!(explain_failure(offline), "Error submitting session, check connection.");
+        assert_eq!(explain_failure("503: Service Unavailable"), "FrogLog had a problem saving this session. Retry in a moment.");
     }
 
     fn pending() -> PendingSession {

@@ -123,6 +123,18 @@ fn build_window(app: &adw::Application, state: AppState) {
     };
     let refresh_tray = tray::make_refresh_tray(tray_handle);
 
+    // Keeps the session length in the tray tooltip and menu current while a game runs.
+    {
+        let state = state.clone();
+        let refresh_tray = refresh_tray.clone();
+        glib::timeout_add_seconds_local(30, move || {
+            if state.now_tracking_title().is_some() {
+                refresh_tray();
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
     let header_bar = adw::HeaderBar::new();
 
     // Everything the tray menu offers, reachable without one. Routed through the same

@@ -3,6 +3,7 @@
 
 use super::flow::{self, client_for, failed, may_submit, submission_for};
 use super::{EngineState, FrontendRef};
+use crate::api::ApiFailure;
 use crate::config::ProcessMapping;
 use crate::ledger_session::now_secs;
 use crate::resolution::{self, Choice, Resolution};
@@ -65,6 +66,20 @@ pub fn submit_decision(
             Attempt::Submitted
         }
         Err(e) => {
+            if ApiFailure::classify(&e) == ApiFailure::NotFound {
+                let moved = match &ledger_id {
+                    Some(id) => flow::move_to_new_games(state, id),
+                    None => {
+                        flow::unlink_deleted_game(state, mapping);
+                        None
+                    }
+                };
+                if let Some(name) = moved {
+                    return Attempt::Queued(format!(
+                        "This game no longer exists in FrogLog, so the session was moved to New Games as {name}."
+                    ));
+                }
+            }
             let explanation = explain_failure(&e);
             if store.queue_failed(ledger_id.as_deref(), account, failed(submission, &e)) {
                 Attempt::Queued(format!("Submission failed; the session is saved in Pending Submissions. {explanation}"))
@@ -91,8 +106,17 @@ pub fn discard_session(state: &EngineState, ledger_id: Option<&str>) -> Result<(
     }
 }
 
+/// How a successful retry of a pending session ended.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(tag = "outcome", content = "title", rename_all = "snake_case")]
+pub enum Retried {
+    Submitted,
+    /// Its game had been deleted from FrogLog, so it went to New Games under this title.
+    MovedToNewGames(String),
+}
+
 /// Resubmits one pending record for the logged-in account and acknowledges it.
-pub fn retry_pending(state: &EngineState, id: &str) -> Result<(), String> {
+pub fn retry_pending(state: &EngineState, id: &str) -> Result<Retried, String> {
     // Credentials and ownership come from the same snapshot, so a logout/login mid-request can
     // neither submit this row with another token nor acknowledge it for the wrong owner.
     let (auth, account) = state.auth_and_account().ok_or("Not logged in")?;
@@ -102,23 +126,34 @@ pub fn retry_pending(state: &EngineState, id: &str) -> Result<(), String> {
         .pending_session(id, &account)
         .ok_or_else(|| store.error().unwrap_or_else(|| "Session not found for this account".into()))?;
     let client = client_for(&auth);
-    let result = retry_play_session(&client, &session, Some(session.id.clone())).map_err(|e| explain_failure(&e))?;
+    let result = match retry_play_session(&client, &session, Some(session.id.clone())) {
+        Ok(result) => result,
+        Err(e) => {
+            if ApiFailure::classify(&e) == ApiFailure::NotFound {
+                if let Some(name) = flow::move_to_new_games(state, id) {
+                    return Ok(Retried::MovedToNewGames(name));
+                }
+            }
+            return Err(explain_failure(&e));
+        }
+    };
     let remote = remote_reference(&result.response, result.game_id, &result.game_type);
     match store.acknowledge(id, &account, &remote) {
-        Some(true) => Ok(()),
+        Some(true) => Ok(Retried::Submitted),
         Some(false) => Err("The session changed while submitting; check its recorded status".into()),
         None => Err("Submitted, but the result could not be saved. Retrying reuses the same session key.".into()),
     }
 }
 
 /// Resolves the logged-in account's New Games entry for `appid`, then links its executable and
-/// refreshes the library so the next launch is tracked normally.
-pub fn resolve_new_game(state: &EngineState, appid: &str, choice: Choice) -> Result<Resolution, String> {
+/// refreshes the library so the next launch is tracked normally. `created_note` is
+/// `resolution::CREATED_NOTE` or `CREATED_NOTE_STEAMOS`, depending on which frontend asked.
+pub fn resolve_new_game(state: &EngineState, appid: &str, choice: Choice, created_note: &str) -> Result<Resolution, String> {
     let (auth, account) = state.auth_and_account().ok_or("Not logged in")?;
     let client = client_for(&auth);
     // A snapshot, so no lock is held across the network calls.
     let library = state.library_index.read().unwrap().clone();
-    let resolved = resolution::resolve(&client, &state.store(), &account, &library, appid, choice)?;
+    let resolved = resolution::resolve(&client, &state.store(), &account, &library, appid, choice, created_note)?;
     resolution::link_resolved(&state.process_map, &auth, &resolved);
     state.refresh_library_index();
     Ok(resolved)

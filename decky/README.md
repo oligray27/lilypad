@@ -1,13 +1,16 @@
 # LilyPad for Decky
 
-LilyPad in Steam Gaming Mode (Steam Deck, Bazzite and other gamescope sessions). It tracks the games you play and submits every session to FrogLog as soon as the game closes. Gaming Mode has no notes: each session is sent with one message you choose in the plugin's settings (blank for none). Notes can be added on the FrogLog website.
+LilyPad in Steam Gaming Mode (Steam Deck, Bazzite and other gamescope sessions). It tracks the games you play and logs them to FrogLog:
+
+- **Auto-submit on** (the default): every session is submitted as soon as the game closes, with a message you choose in the plugin's settings (blank for none).
+- **Auto-submit off**: when a game closes, a dialog asks you to submit the session, with notes, spoiler and visibility for session-tracked and live-service games, or not record it. A session you close the dialog on waits under *Sessions to submit* in the Quick Access Menu.
 
 The Quick Access Menu has:
 
-- what is being tracked, and stopping a session attributed to the wrong game (you then submit its time or don't record it)
+- what is being tracked and for how long, and stopping a session attributed to the wrong game (the same dialog then asks what to do with the time)
 - Pending Submissions: retry or delete
-- New Games: add to FrogLog, add the time to a game you already have, log as a replay, or dismiss
-- login, the session message, and "show what I'm playing" settings
+- New Games: add to FrogLog, map to a game you already have, log as a replay, or dismiss
+- login, auto-submit, the session message, and "Mirror online presence to FrogLog" settings
 
 Toasts tell you when tracking starts, when a session has been submitted, and when a game isn't in your FrogLog yet.
 

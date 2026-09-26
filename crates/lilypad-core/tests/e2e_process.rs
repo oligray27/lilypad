@@ -148,6 +148,7 @@ fn a_real_game_is_detected_recorded_and_ended_with_its_real_duration() {
         |_| {},
         |_, _, _, _, _| {},
         |_| {},
+        |_| {},
     );
 
     match rx.recv_timeout(Duration::from_secs(20)) {

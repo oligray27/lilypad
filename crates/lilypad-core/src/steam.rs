@@ -289,6 +289,51 @@ pub fn find_installed_game_for_exe<'a>(
     games.iter().find(|g| path_starts_with(exe_path, &g.install_dir))
 }
 
+/// How deep below an install directory `find_installed_game_by_executable` looks for a game's
+/// executable (e.g. `bin/win64/game.exe` is 2).
+const EXECUTABLE_SEARCH_DEPTH: usize = 5;
+
+/// The installed game a mapped executable belongs to, for filing its sessions under New Games
+/// once the FrogLog entry it was linked to has been deleted. A recorded path decides when there
+/// is one. Otherwise each install directory is searched for a file of that name, and only a
+/// single match counts: names like `game.exe` are shared between games, and filing the time
+/// under the wrong one would be worse than leaving it in Pending Submissions.
+pub fn find_installed_game_by_executable<'a>(
+    executable: &str,
+    exe_path: Option<&Path>,
+    games: &'a [InstalledGame],
+) -> Option<&'a InstalledGame> {
+    if let Some(found) = exe_path
+        .filter(|path| !crate::config::is_shared_game_host(path))
+        .and_then(|path| find_installed_game_for_exe(path, games))
+    {
+        return Some(found);
+    }
+    let mut matches = games.iter().filter(|g| dir_contains_file(&g.install_dir, executable, EXECUTABLE_SEARCH_DEPTH));
+    let first = matches.next()?;
+    if matches.any(|g| g.appid != first.appid) {
+        log::info!("[LilyPad] {executable} is in more than one installed game; not guessing which");
+        return None;
+    }
+    Some(first)
+}
+
+/// Whether `dir`, or a directory up to `depth` levels below it, holds a file called `name`
+/// (any case). Symlinked directories are not followed, so a link loop cannot trap it.
+fn dir_contains_file(dir: &Path, name: &str, depth: usize) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else { return false };
+    let mut subdirs = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else { continue };
+        if kind.is_dir() {
+            subdirs.push(entry.path());
+        } else if entry.file_name().to_str().is_some_and(|n| n.eq_ignore_ascii_case(name)) {
+            return true;
+        }
+    }
+    depth > 0 && subdirs.iter().any(|d| dir_contains_file(d, name, depth - 1))
+}
+
 #[cfg(windows)]
 fn path_starts_with(path: &Path, prefix: &Path) -> bool {
     let path_lower = path.to_string_lossy().to_lowercase();
@@ -455,6 +500,32 @@ mod tests {
         let exe = install_dir.join("portal2.exe");
         let found = find_installed_game_for_exe(&exe, &games);
         assert_eq!(found.unwrap().appid, "620");
+    }
+
+    #[test]
+    fn finds_a_game_by_its_executable_only_when_one_game_has_it() {
+        let root = tempfile::tempdir().unwrap();
+        let game = |appid: &str, dir: &str| {
+            let install_dir = root.path().join(dir);
+            std::fs::create_dir_all(install_dir.join("bin").join("win64")).unwrap();
+            InstalledGame { appid: appid.into(), name: dir.into(), install_dir }
+        };
+        let celeste = game("504230", "Celeste");
+        let other = game("1", "Other");
+        let third = game("2", "Third");
+        std::fs::write(celeste.install_dir.join("Celeste.exe"), b"").unwrap();
+        std::fs::write(other.install_dir.join("bin").join("win64").join("game.exe"), b"").unwrap();
+        std::fs::write(third.install_dir.join("game.exe"), b"").unwrap();
+        let games = vec![celeste, other, third];
+
+        // Found by name, in any case, with no recorded path (a Proton game's path is Wine's).
+        assert_eq!(find_installed_game_by_executable("celeste.exe", None, &games).unwrap().appid, "504230");
+        // Shared by two games: refuse to guess.
+        assert!(find_installed_game_by_executable("game.exe", None, &games).is_none());
+        // A recorded path settles it.
+        let pinned = games[1].install_dir.join("bin").join("win64").join("game.exe");
+        assert_eq!(find_installed_game_by_executable("game.exe", Some(&pinned), &games).unwrap().appid, "1");
+        assert!(find_installed_game_by_executable("missing.exe", None, &games).is_none());
     }
 
     #[test]

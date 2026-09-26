@@ -569,27 +569,23 @@ fn complete_session(state: &AppState, id: &str, ended_at: u64) -> Completion {
 /// happened. The session already in flight still fails and queues; it can be discarded from
 /// Pending Submissions, and it is not silently lost.
 fn drop_dead_mapping(app: &tauri::AppHandle, process: &str, game_type: &str, froglog_id: i32) {
-    let state = app.state::<AppState>();
     log::warn!(
         "[LilyPad] game {froglog_id} no longer exists; removing the mapping for {process} that was \
          auto-linked to it and refreshing the library"
     );
-    let mut map = state.process_map_arc.read().unwrap().clone();
-    let before = map.mappings.len();
-    map.mappings.retain(|m| {
-        !(m.froglog_id == froglog_id
-            && m.r#type.eq_ignore_ascii_case(game_type)
-            && m.process.eq_ignore_ascii_case(process))
-    });
-    if map.mappings.len() != before {
-        if let Err(e) = map.save_to(&process_map_path_for_auth(&state.auth.read().unwrap())) {
-            log::warn!("[LilyPad] could not save the process map after removing a dead mapping: {e}");
-            return;
-        }
-        *state.process_map_arc.write().unwrap() = map;
-    }
+    unlink_dead_mapping(app, process, game_type, froglog_id);
     // The cached library is demonstrably out of date -- it just claimed a game that is gone.
-    refresh_library_index_state(&state);
+    refresh_library_index_state(&app.state::<AppState>());
+}
+
+/// Removes a mapping whose game no longer exists (in memory at once, then saved), so the next
+/// launch is detected as a game not in FrogLog rather than tracked against a dead id.
+fn unlink_dead_mapping(app: &tauri::AppHandle, process: &str, game_type: &str, froglog_id: i32) {
+    let state = app.state::<AppState>();
+    let auth = state.auth.read().unwrap().clone();
+    if let Err(e) = config::remove_dead_mapping(&state.process_map_arc, &auth, process, game_type, froglog_id) {
+        log::warn!("[LilyPad] could not save the process map after removing a dead mapping: {e}");
+    }
 }
 
 /// Queues a session for retry after a failed submission.
@@ -1672,16 +1668,21 @@ fn handle_session_ended(
     });
 }
 
-fn build_tray_menu(app: &tauri::AppHandle, logged_in: bool, game_title: Option<String>) -> Result<Menu<Wry>, Box<dyn std::error::Error + Send + Sync>> {
+/// The tray menu's "Now Tracking" item, kept so `tick_session_length` can update its text in
+/// place (rebuilding the whole menu every 30 s could disturb it while it is open).
+static TRACKING_STATUS_ITEM: Mutex<Option<tauri::menu::MenuItem<Wry>>> = Mutex::new(None);
+
+/// `game_label` is the tracked game with its length so far (`ActiveSession::label`).
+fn build_tray_menu(app: &tauri::AppHandle, logged_in: bool, game_label: Option<String>) -> Result<Menu<Wry>, Box<dyn std::error::Error + Send + Sync>> {
     let quit_item = PredefinedMenuItem::quit(app, Some("Quit"))?;
     // While tracking, the status/stop items are *prepended* to the normal menu rather than
     // replacing it. Configure (and everything reachable from it) is safe during a session:
     // the active session's wait-thread holds its own clone of the ProcessMapping, and the
     // monitor skips all start-detection while current_session is occupied, so mapping edits,
     // library refreshes, and rescans can only affect *future* sessions, never the live one.
-    let tracking_items = if let Some(ref title) = game_title {
+    let tracking_items = if let Some(ref label) = game_label {
         Some((
-            MenuItemBuilder::with_id("tracking_status", format!("Now Tracking: {}", title))
+            MenuItemBuilder::with_id("tracking_status", format!("Now Tracking: {}", label))
                 .enabled(false)
                 .build(app)?,
             MenuItemBuilder::with_id("force_stop_tracking", "Stop Tracking Current Session").build(app)?,
@@ -1689,6 +1690,7 @@ fn build_tray_menu(app: &tauri::AppHandle, logged_in: bool, game_title: Option<S
     } else {
         None
     };
+    *TRACKING_STATUS_ITEM.lock().unwrap() = tracking_items.as_ref().map(|(status, _)| status.clone());
     if logged_in {
         let assign_exes_item = MenuItemBuilder::with_id("assign_exes", "Configure...").build(app)?;
         let about_item = MenuItemBuilder::with_id("about", "About").build(app)?;
@@ -1737,22 +1739,39 @@ fn build_tray_menu(app: &tauri::AppHandle, logged_in: bool, game_title: Option<S
 fn update_tray_state(app: &tauri::AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
     let logged_in = state.auth.read().unwrap().token.is_some();
-    let game_title = {
-        let sess = state.current_session_arc.read().unwrap();
-        sess.as_ref().map(|s| s.mapping.title.clone().unwrap_or_else(|| s.process_name.clone()))
-    };
-    let menu = build_tray_menu(app, logged_in, game_title.clone()).map_err(|e| e.to_string())?;
+    let game_label = state.current_session_arc.read().unwrap().as_ref().map(ActiveSession::label);
+    let menu = build_tray_menu(app, logged_in, game_label.clone()).map_err(|e| e.to_string())?;
     if let Some(tray) = app.tray_by_id("main") {
         tray.set_menu(Some(menu)).map_err(|e| e.to_string())?;
-        if let Some(ref title) = game_title {
+        if let Some(ref label) = game_label {
             let _ = tray.set_icon(Some(TRAY_ICON_NOWPLAYING.clone()));
-            let _ = tray.set_tooltip(Some(format!("LilyPad - Now Tracking: {}", title)));
+            let _ = tray.set_tooltip(Some(format!("LilyPad - Now Tracking: {}", label)));
         } else {
             let _ = tray.set_icon(Some(TRAY_ICON.clone()));
             let _ = tray.set_tooltip(Some("LilyPad - FrogLog Auto Tracker".to_string()));
         }
     }
     Ok(())
+}
+
+/// Keeps the session length in the tray tooltip and "Now Tracking" item current while a game
+/// runs. Only the text changes; a session starting or ending still goes through
+/// `update_tray_state`.
+fn tick_session_length(app: tauri::AppHandle) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(30));
+        let label = app.state::<AppState>().current_session_arc.read().unwrap().as_ref().map(ActiveSession::label);
+        let Some(label) = label else { continue };
+        let handle = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            if let Some(item) = TRACKING_STATUS_ITEM.lock().unwrap().as_ref() {
+                let _ = item.set_text(format!("Now Tracking: {label}"));
+            }
+            if let Some(tray) = handle.tray_by_id("main") {
+                let _ = tray.set_tooltip(Some(format!("LilyPad - Now Tracking: {label}")));
+            }
+        });
+    });
 }
 
 #[tauri::command]
@@ -2210,7 +2229,7 @@ fn resolve_pending(
     let client = api_client(&auth).ok_or("Not logged in")?;
     let account = ledger_session::account_identity(&auth, DEFAULT_API_URL).ok_or("Not logged in")?;
     let library = state.library_index_arc.read().unwrap().clone();
-    let resolved = resolution::resolve(&client, &state.store(), &account, &library, appid, choice)?;
+    let resolved = resolution::resolve(&client, &state.store(), &account, &library, appid, choice, resolution::CREATED_NOTE)?;
     resolution::link_resolved(&state.process_map_arc, &auth, &resolved);
     // Without this the library only refreshes every 5 minutes -- relaunching the same game
     // shortly after would still look new (or still finished) and be prompted about again.
@@ -2837,6 +2856,7 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
+            tick_session_length(handle.clone());
 
             // Show login window on first launch (no saved credentials)
             if !logged_in {
@@ -2896,6 +2916,7 @@ pub fn run() {
             // and put it through the normal end-of-session path.
             recover_interrupted_sessions(&app_handle);
 
+            let handle_dead_mapping = app_handle.clone();
             run_poll_loop(
                 config,
                 current_session,
@@ -3100,6 +3121,15 @@ pub fn run() {
                                 drop_dead_mapping(&handle_dead, &mapping_process, &game_type, froglog_id);
                             }
                         });
+                    }
+                },
+                // The monitor has just confirmed against a fresh library that this game is
+                // gone, so only the mapping needs dropping; the tray is unaffected (nothing
+                // started tracking).
+                {
+                    let handle = handle_dead_mapping;
+                    move |mapping: ProcessMapping| {
+                        unlink_dead_mapping(&handle, &mapping.process, &mapping.r#type, mapping.froglog_id);
                     }
                 },
             );

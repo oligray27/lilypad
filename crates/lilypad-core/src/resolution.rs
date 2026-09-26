@@ -80,8 +80,17 @@ pub struct Resolution {
     pub created: Option<Value>,
 }
 
+/// The note on the sessions uploaded into a game a resolution has just created, from the desktop
+/// apps and from Steam Gaming Mode (the Decky plugin) respectively.
+pub const CREATED_NOTE: &str = "Session logged from LilyPad";
+pub const CREATED_NOTE_STEAMOS: &str = "Session logged from LilyPad via SteamOS";
+
+/// The note on sessions logged against a game the user already had.
+const ATTACHED_NOTE: &str = "Logged from LilyPad's untracked-session detection";
+
 /// Resolves the logged-in account's New Games entry for `appid`. `library` is a snapshot of the
-/// cached library index, used to attach instead of creating a duplicate.
+/// cached library index, used to attach instead of creating a duplicate. `created_note` is
+/// `CREATED_NOTE` or `CREATED_NOTE_STEAMOS`, for the sessions of a game this creates.
 pub fn resolve(
     api: &impl ResolveApi,
     store: &SessionStore,
@@ -89,6 +98,7 @@ pub fn resolve(
     library: &LibraryIndex,
     appid: &str,
     choice: Choice,
+    created_note: &str,
 ) -> Result<Resolution, String> {
     let entry = store
         .new_game_entry(account, appid)
@@ -107,15 +117,15 @@ pub fn resolve(
             Choice::Existing { title, .. } if !title.is_empty() => title.clone(),
             _ => entry.game.title.clone(),
         };
-        return upload_and_settle(api, store, account, &entry, &game_type, game_id, title, None, false);
+        return upload_and_settle(api, store, account, &entry, &game_type, game_id, title, None, None);
     }
 
     match choice {
         Choice::Existing { game_type, game_id, title } => {
             attach(api, store, account, &entry, &game_type, game_id, title)
         }
-        Choice::New { igdb_title } => create_new(api, store, account, library, &entry, &igdb_title),
-        Choice::Replay => create_replay(api, store, account, &entry),
+        Choice::New { igdb_title } => create_new(api, store, account, library, &entry, &igdb_title, created_note),
+        Choice::Replay => create_replay(api, store, account, &entry, created_note),
     }
 }
 
@@ -193,7 +203,7 @@ fn attach(
         "session"
     };
     record_target(store, account, entry, effective_type, game_id)?;
-    upload_and_settle(api, store, account, entry, effective_type, game_id, title, None, false)
+    upload_and_settle(api, store, account, entry, effective_type, game_id, title, None, None)
 }
 
 fn create_new(
@@ -203,6 +213,7 @@ fn create_new(
     library: &LibraryIndex,
     entry: &NewGameEntry,
     igdb_title: &str,
+    created_note: &str,
 ) -> Result<Resolution, String> {
     // If IGDB has no exact match for the confirmed title, fall back to that title itself --
     // never `entry.title`, which is only LilyPad's guess (for a non-Steam game, literally the
@@ -250,7 +261,7 @@ fn create_new(
             let game_id = created_id(&created)?;
             let title = created["title"].as_str().map(str::to_string).unwrap_or_else(|| igdb_title.to_string());
             record_target(store, account, entry, "session", game_id)?;
-            upload_and_settle(api, store, account, entry, "session", game_id, title, Some(created), true)
+            upload_and_settle(api, store, account, entry, "session", game_id, title, Some(created), Some(created_note))
         }
         // The server knows this is an unfinished playthrough the user already has (by IGDB id,
         // or a platform link already on that entry), which the local index had not caught.
@@ -268,6 +279,7 @@ fn create_replay(
     store: &SessionStore,
     account: &AccountIdentity,
     entry: &NewGameEntry,
+    created_note: &str,
 ) -> Result<Resolution, String> {
     let replay_of = entry.game.replay_of.clone().ok_or("Pending submission has no replay match")?;
     let mut payload = api.get_game_raw(replay_of.id)?;
@@ -290,7 +302,7 @@ fn create_replay(
             let game_id = created_id(&created)?;
             let title = created["title"].as_str().map(str::to_string).unwrap_or_else(|| replay_of.title.clone());
             record_target(store, account, entry, "session", game_id)?;
-            upload_and_settle(api, store, account, entry, "session", game_id, title, Some(created), true)
+            upload_and_settle(api, store, account, entry, "session", game_id, title, Some(created), Some(created_note))
         }
         GameCreation::AlreadyOwned { game_id, title } => {
             attach(api, store, account, entry, "session", game_id, title.unwrap_or(replay_of.title))
@@ -308,14 +320,12 @@ fn upload_and_settle(
     game_id: i32,
     title: String,
     created: Option<Value>,
-    created_here: bool,
+    // `Some(note)` when this resolution created the game.
+    created_note: Option<&str>,
 ) -> Result<Resolution, String> {
     let live = game_type.eq_ignore_ascii_case("live");
-    let notes = if created_here {
-        "Session logged from LilyPad"
-    } else {
-        "Logged from LilyPad's untracked-session detection"
-    };
+    let created_here = created_note.is_some();
+    let notes = created_note.unwrap_or(ATTACHED_NOTE);
     let logged = upload_sessions(&entry.game, &entry.id, |date, hours, sync_ref| {
         api.add_session(live, game_id, AddSessionBody {
             date: Some(date), hours: Some(hours), notes: Some(notes.to_string()),
@@ -413,6 +423,8 @@ mod tests {
         /// Create succeeds on the server but the response is lost, once.
         lose_create_response: RefCell<bool>,
         already_owned: Option<i32>,
+        /// Every uploaded session's note, in order.
+        notes: RefCell<Vec<Option<String>>>,
     }
 
     impl SessionApi for FakeServer {
@@ -423,6 +435,7 @@ mod tests {
                 *self.fail_upload_at.borrow_mut() = None;
                 return Err("error sending request".into());
             }
+            self.notes.borrow_mut().push(body.notes.clone());
             self.sessions.borrow_mut().entry((game_id, body.sync_ref.unwrap())).or_insert(body.hours.unwrap());
             Ok(json!({ "id": n }))
         }
@@ -467,8 +480,8 @@ mod tests {
         let (store, account) = setup(2);
         let api = FakeServer { lose_create_response: RefCell::new(true), ..Default::default() };
         let library = LibraryIndex::default();
-        assert!(resolve(&api, &store, &account, &library, "620", new_game()).is_err());
-        let done = resolve(&api, &store, &account, &library, "620", new_game()).unwrap();
+        assert!(resolve(&api, &store, &account, &library, "620", new_game(), CREATED_NOTE).is_err());
+        let done = resolve(&api, &store, &account, &library, "620", new_game(), CREATED_NOTE).unwrap();
         assert_eq!(*api.creates.borrow(), 1, "the retry must get the game the first attempt created");
         assert_eq!(done.game_id, 101);
         assert_eq!(api.sessions.borrow().len(), 2);
@@ -481,12 +494,12 @@ mod tests {
         // Second session upload fails: the game exists and one session is on the server.
         let api = FakeServer { fail_upload_at: RefCell::new(Some(1)), ..Default::default() };
         let library = LibraryIndex::default();
-        assert!(resolve(&api, &store, &account, &library, "620", new_game()).is_err());
+        assert!(resolve(&api, &store, &account, &library, "620", new_game(), CREATED_NOTE).is_err());
         assert_eq!(store.new_game_entry(&account, "620").unwrap().unwrap().target.as_deref(), Some("session:101"));
 
         // Even choosing differently on the retry cannot split the entry across two games.
         let retry = Choice::Existing { game_type: "session".into(), game_id: 7, title: "Other".into() };
-        let done = resolve(&api, &store, &account, &library, "620", retry).unwrap();
+        let done = resolve(&api, &store, &account, &library, "620", retry, CREATED_NOTE).unwrap();
         assert_eq!(done.game_id, 101);
         assert_eq!(*api.creates.borrow(), 1);
         let sessions = api.sessions.borrow();
@@ -500,10 +513,10 @@ mod tests {
         let api = FakeServer::default();
         let library = LibraryIndex::default();
         let existing = || Choice::Existing { game_type: "session".into(), game_id: 7, title: "Portal 2".into() };
-        resolve(&api, &store, &account, &library, "620", existing()).unwrap();
+        resolve(&api, &store, &account, &library, "620", existing(), CREATED_NOTE).unwrap();
         // Played again later, before a mapping existed: a new entry for the same appid.
         store.record_new_game(&account, "620", "Portal 2", "portal2", 2.0, None).unwrap();
-        resolve(&api, &store, &account, &library, "620", existing()).unwrap();
+        resolve(&api, &store, &account, &library, "620", existing(), CREATED_NOTE).unwrap();
         assert_eq!(api.sessions.borrow().len(), 2, "the second batch's session must not be dropped as a duplicate");
     }
 
@@ -511,7 +524,7 @@ mod tests {
     fn a_game_the_server_says_is_already_owned_is_attached_not_duplicated() {
         let (store, account) = setup(1);
         let api = FakeServer { already_owned: Some(55), ..Default::default() };
-        let done = resolve(&api, &store, &account, &LibraryIndex::default(), "620", new_game()).unwrap();
+        let done = resolve(&api, &store, &account, &LibraryIndex::default(), "620", new_game(), CREATED_NOTE).unwrap();
         assert_eq!((done.game_type.as_str(), done.game_id), ("session", 55));
         assert!(done.created.is_none());
         assert_eq!(*api.creates.borrow(), 0);
@@ -519,11 +532,25 @@ mod tests {
     }
 
     #[test]
+    fn sessions_carry_the_callers_note_for_a_created_game_and_the_attach_note_otherwise() {
+        let (store, account) = setup(1);
+        let api = FakeServer::default();
+        resolve(&api, &store, &account, &LibraryIndex::default(), "620", new_game(), CREATED_NOTE_STEAMOS).unwrap();
+        store.record_new_game(&account, "620", "Portal 2", "portal2", 1.0, None).unwrap();
+        let existing = Choice::Existing { game_type: "session".into(), game_id: 7, title: "Portal 2".into() };
+        resolve(&api, &store, &account, &LibraryIndex::default(), "620", existing, CREATED_NOTE_STEAMOS).unwrap();
+        assert_eq!(
+            *api.notes.borrow(),
+            vec![Some(CREATED_NOTE_STEAMOS.to_string()), Some(ATTACHED_NOTE.to_string())]
+        );
+    }
+
+    #[test]
     fn another_accounts_entry_cannot_be_resolved() {
         let (store, _) = setup(1);
         let bob = AccountIdentity { server: SERVER.into(), account_id: "bob".into() };
         let api = FakeServer::default();
-        assert!(resolve(&api, &store, &bob, &LibraryIndex::default(), "620", new_game()).is_err());
+        assert!(resolve(&api, &store, &bob, &LibraryIndex::default(), "620", new_game(), CREATED_NOTE).is_err());
         assert_eq!(*api.creates.borrow(), 0);
     }
 }

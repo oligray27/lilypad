@@ -154,6 +154,7 @@ pub fn start(state: &EngineState, tx: mpsc::Sender<MonitorEvent>) {
     let state_for_unmapped_end = state.clone();
     let state_for_link = state.clone();
     let state_for_library_refresh = state.clone();
+    let state_for_dead = state.clone();
     run_poll_loop(
         state.process_map.clone(),
         state.current_session.clone(),
@@ -234,6 +235,14 @@ pub fn start(state: &EngineState, tx: mpsc::Sender<MonitorEvent>) {
                     state.refresh_library_index();
                 }
             });
+        },
+        move |mapping: ProcessMapping| {
+            let auth = state_for_dead.auth.read().unwrap().clone();
+            if let Err(e) = config::remove_dead_mapping(
+                &state_for_dead.process_map, &auth, &mapping.process, &mapping.r#type, mapping.froglog_id,
+            ) {
+                log::warn!("[LilyPad] could not save the process map after removing a dead mapping: {e}");
+            }
         },
     );
 }

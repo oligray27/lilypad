@@ -6,8 +6,8 @@
 //! code runs, so a crash anywhere in here leaves a pending session rather than nothing; a
 //! successful submission acknowledges that record, and a failed one attaches its payload to it.
 
-use super::{EngineState, FrontendRef, DEFAULT_API_URL};
-use crate::api::FroglogClient;
+use super::{EngineState, FrontendRef, SubmitPolicy, DEFAULT_API_URL};
+use crate::api::{ApiFailure, FroglogClient};
 use crate::auto_submit::Outcome;
 use crate::config::{AuthConfig, ProcessMapping};
 use crate::ledger_session::{self, now_secs};
@@ -87,6 +87,45 @@ pub fn submission_for(
         last_error: None,
         failed_at: None,
     }
+}
+
+/// Unlinks a game whose FrogLog entry has been deleted, so its next launch is detected as a game
+/// not in FrogLog (New Games) instead of failing to submit again, and re-reads the library.
+pub fn unlink_deleted_game(state: &EngineState, mapping: &ProcessMapping) {
+    log::warn!(
+        "[LilyPad] {} #{} no longer exists in FrogLog; unlinking {}",
+        mapping.r#type, mapping.froglog_id, mapping.process
+    );
+    let auth = state.auth.read().unwrap().clone();
+    if let Err(e) = crate::config::remove_dead_mapping(
+        &state.process_map, &auth, &mapping.process, &mapping.r#type, mapping.froglog_id,
+    ) {
+        log::warn!("[LilyPad] could not save the process map after removing a dead mapping: {e}");
+    }
+    state.refresh_library_index();
+}
+
+/// A session failed to submit because its game has been deleted from FrogLog: unlinks the game
+/// and moves the session into New Games, under the installed game its executable belongs to.
+/// Returns that game's name. `None` leaves the session where it is, in Pending Submissions:
+/// LilyPad could not tell which installed game it was (e.g. an executable linked by hand from
+/// outside any Steam library or watched folder).
+pub fn move_to_new_games(state: &EngineState, ledger_id: &str) -> Option<String> {
+    let store = state.store();
+    let (executable, mapping) = store.mapped_session(ledger_id)?;
+    unlink_deleted_game(state, &mapping);
+    let account = state.account()?;
+    let game = {
+        let games = state.installed_games.read().unwrap();
+        let exe_path = mapping.exe_path.as_deref().map(std::path::Path::new);
+        crate::steam::find_installed_game_by_executable(&executable, exe_path, &games).cloned()
+    };
+    let Some(game) = game else {
+        log::info!("[LilyPad] could not tell which installed game {executable} is; leaving session {ledger_id} in Pending Submissions");
+        return None;
+    };
+    store.move_to_new_games(ledger_id, &account, &game.appid, &game.name)?;
+    Some(game.name)
 }
 
 /// `submission` with the reason it failed, for the retry queue.
@@ -211,12 +250,19 @@ pub fn handle_session_ended(
 
     let hours = round_hours(duration_secs);
 
-    if frontend.submits_every_session() {
-        let notes = gaming_mode_note(&state);
-        std::thread::spawn(move || {
-            submit_now(&state, &frontend, &auth, account, &mapping, hours, duration_secs, notes, true, ledger_id);
-        });
-        return;
+    match frontend.submit_policy(&state) {
+        SubmitPolicy::Always => {
+            let notes = gaming_mode_note(&state);
+            std::thread::spawn(move || {
+                submit_now(&state, &frontend, &auth, account, &mapping, hours, duration_secs, notes, true, ledger_id);
+            });
+            return;
+        }
+        SubmitPolicy::Ask => {
+            frontend.needs_decision(decide(false));
+            return;
+        }
+        SubmitPolicy::Settings => {}
     }
 
     let auto_submit = {
@@ -311,6 +357,20 @@ fn submit_now(
         }
         Err(e) => {
             log::warn!("[LilyPad] auto-submit failed for game {}: {e}", mapping.froglog_id);
+            if ApiFailure::classify(&e) == ApiFailure::NotFound {
+                let moved = match &ledger_id {
+                    Some(id) => move_to_new_games(state, id),
+                    None => {
+                        unlink_deleted_game(state, mapping);
+                        None
+                    }
+                };
+                if let Some(name) = moved {
+                    frontend.new_game_recorded(&name, &format_duration(duration_secs), false);
+                    frontend.changed();
+                    return;
+                }
+            }
             let saved = store.queue_failed(ledger_id.as_deref(), account, failed(submission, &e));
             if saved {
                 frontend.notify("Session Queued", &format!("{title} — submit failed, open LilyPad to retry"));
@@ -393,4 +453,58 @@ fn resume(state: EngineState, frontend: FrontendRef, record: SessionRecord, mapp
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ProcessMapConfig;
+    use crate::engine::{Frontend, SubmitPolicy};
+    use crate::session_ledger::SessionLedger;
+    use crate::session_store::SessionStore;
+    use std::sync::{Arc, Mutex};
+
+    /// Records what the engine asked of it; submits nothing itself.
+    struct Recorder {
+        policy: SubmitPolicy,
+        decisions: Mutex<Vec<SessionEndedData>>,
+        prompts: Mutex<usize>,
+    }
+
+    impl Frontend for Recorder {
+        fn notify(&self, _: &str, _: &str) {}
+        fn changed(&self) {}
+        fn needs_decision(&self, data: SessionEndedData) {
+            self.decisions.lock().unwrap().push(data);
+        }
+        fn auto_submit_prompt(&self, _: &str, _: &str) -> Result<Outcome, String> {
+            *self.prompts.lock().unwrap() += 1;
+            Ok(Outcome::AddNotes)
+        }
+        fn submit_policy(&self, _: &EngineState) -> SubmitPolicy {
+            self.policy
+        }
+    }
+
+    #[test]
+    fn with_auto_submit_off_every_finished_session_is_left_to_the_user() {
+        // The desktop app's settings would auto-submit this session game; Ask overrides them.
+        let map = ProcessMapConfig { auto_submit_session: true, auto_submit_regular: true, ..Default::default() };
+        let auth = AuthConfig { base_url: Some("http://127.0.0.1:9".into()), token: Some("t".into()), username: Some("alice".into()) };
+        let state = EngineState::new(auth, map);
+        state.set_store(SessionStore::from_ledger(SessionLedger::open(std::path::Path::new(":memory:")).unwrap(), DEFAULT_API_URL));
+        let recorder = Arc::new(Recorder { policy: SubmitPolicy::Ask, decisions: Mutex::new(Vec::new()), prompts: Mutex::new(0) });
+        let frontend: FrontendRef = recorder.clone();
+        let mapping = ProcessMapping {
+            process: "Celeste.exe".into(), r#type: "session".into(), froglog_id: 7,
+            title: Some("Celeste".into()), title_filter: None, exe_path: None,
+        };
+
+        handle_session_ended(state, frontend, "Celeste.exe".into(), mapping, 3600.0, false, None);
+
+        let decisions = recorder.decisions.lock().unwrap();
+        assert_eq!(decisions.len(), 1, "the session dialog must be asked for");
+        assert!(!decisions[0].forced);
+        assert_eq!(*recorder.prompts.lock().unwrap(), 0, "no Add Notes prompt: the dialog has notes");
+    }
 }

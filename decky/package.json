@@ -1,6 +1,6 @@
 {
   "name": "lilypad-decky",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "LilyPad for Steam Gaming Mode: FrogLog play-time tracking in the Quick Access Menu",
   "type": "module",
   "scripts": {

@@ -109,6 +109,9 @@ pub struct LibraryIndex {
     by_appid: HashMap<String, ResolvedLibraryGame>,
     by_id: HashMap<i32, ResolvedLibraryGame>,
     by_igdb_id: HashMap<i64, ResolvedLibraryGame>,
+    /// Built from a successful fetch. The default index (before the first fetch, or after
+    /// logout) is empty because nothing is known, not because the user owns nothing.
+    loaded: bool,
 }
 
 impl LibraryIndex {
@@ -216,7 +219,12 @@ impl LibraryIndex {
             }
         }
 
-        Self { steam_appids, normalized_titles, by_appid, by_id, by_igdb_id }
+        Self { steam_appids, normalized_titles, by_appid, by_id, by_igdb_id, loaded: true }
+    }
+
+    /// Whether this index came from a successful fetch of the user's library.
+    pub fn is_loaded(&self) -> bool {
+        self.loaded
     }
 
     pub fn contains(&self, appid: &str, title: &str) -> bool {

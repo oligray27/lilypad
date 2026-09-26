@@ -3,7 +3,7 @@
 
 use crate::frontend::DeckyFrontend;
 use lilypad_core::config::{process_map_path_for_auth, AuthConfig};
-use lilypad_core::engine::flow::{client_for, gaming_mode_note, DEFAULT_AUTO_SUBMIT_NOTE};
+use lilypad_core::engine::flow::{client_for, DEFAULT_AUTO_SUBMIT_NOTE};
 use lilypad_core::engine::{actions, EngineState, Frontend, FrontendRef, DEFAULT_API_URL};
 use lilypad_core::resolution::Choice;
 use serde::Deserialize;
@@ -29,18 +29,35 @@ fn to_value<T: serde::Serialize>(value: T) -> Result<Value, String> {
 #[derive(Deserialize)]
 struct Login { username: String, password: String }
 
-/// The desktop app's per-type auto-submit settings don't apply here: Gaming Mode submits
-/// every session, so the panel leaves them alone.
+/// The desktop app's per-type auto-submit settings don't apply here: Gaming Mode has its own
+/// single switch, so the panel leaves them alone.
 #[derive(Deserialize)]
 struct Settings {
     share_now_playing: Option<bool>,
     detect_unmapped: Option<bool>,
-    /// Sent with every session; blank for none.
+    /// Sent with every auto-submitted session; blank for none.
     session_note: Option<String>,
+    /// Off: ask on game close instead.
+    auto_submit: Option<bool>,
 }
 
 #[derive(Deserialize)]
 struct Id { id: String }
+
+#[derive(Deserialize)]
+struct DecisionSubmit {
+    id: String,
+    #[serde(default)]
+    notes: Option<String>,
+    #[serde(default)]
+    spoiler: bool,
+    #[serde(default = "yes")]
+    is_public: bool,
+}
+
+fn yes() -> bool {
+    true
+}
 
 #[derive(Deserialize)]
 struct AppId { appid: String }
@@ -78,11 +95,16 @@ impl Engine {
             "pending" => {
                 let account = self.state.account().ok_or("Not logged in")?;
                 let store = self.state.store();
-                to_value(store.pending_sessions(&account).ok_or_else(|| store.error().unwrap_or_default())?)
+                let mut rows = store.pending_sessions(&account).ok_or_else(|| store.error().unwrap_or_default())?;
+                let waiting = self.awaiting_decision();
+                rows.retain(|row| !waiting.contains(&row.id));
+                to_value(rows)
             }
             "pending_retry" => {
                 let Id { id } = args(a)?;
-                actions::retry_pending(&self.state, &id).map(|_| json!(null))
+                let retried = actions::retry_pending(&self.state, &id)?;
+                self.frontend.changed();
+                to_value(retried)
             }
             "pending_delete" => {
                 let Id { id } = args(a)?;
@@ -118,17 +140,35 @@ impl Engine {
         let auth = self.state.auth.read().unwrap().clone();
         let store = self.state.store();
         let counts = if tracking { store.counts(self.state.account().as_ref()) } else { Default::default() };
+        // Counted from the rows themselves, so a stopped session of another account (still in
+        // the list after a switch) is never subtracted from this one's.
+        let waiting = self.awaiting_decision();
+        let hidden = match (tracking, self.state.account()) {
+            (true, Some(account)) => store
+                .pending_sessions(&account)
+                .map(|rows| rows.iter().filter(|r| waiting.contains(&r.id)).count())
+                .unwrap_or(0),
+            _ => 0,
+        };
         json!({
             "version": env!("CARGO_PKG_VERSION"),
             "tracking": tracking,
             "logged_in": auth.token.is_some(),
             "username": auth.username,
             "now_tracking": self.state.now_tracking_title(),
-            "pending": counts.pending.map(|p| p + counts.unowned.unwrap_or(0)),
+            "now_tracking_secs": self.state.now_tracking_secs(),
+            "pending": counts.pending.map(|p| p.saturating_sub(hidden) +counts.unowned.unwrap_or(0)),
             "new_games": counts.new_games,
             "decisions": self.frontend.decisions.lock().unwrap().len(),
             "storage_error": if tracking { store.error() } else { None },
         })
+    }
+
+    /// Records of stopped sessions waiting in the panel's Stopped sessions list. Each is already
+    /// pending (so nothing is lost if the engine stops before the user decides), but it is
+    /// listed there rather than in Pending Submissions until then.
+    fn awaiting_decision(&self) -> Vec<String> {
+        self.frontend.decisions.lock().unwrap().iter().filter_map(|d| d.data.ledger_id.clone()).collect()
     }
 
     fn login(&self, Login { username, password }: Login) -> Result<Value, String> {
@@ -153,6 +193,7 @@ impl Engine {
             "share_now_playing": map.share_now_playing,
             "detect_unmapped": !map.disable_unmapped_game_detection,
             "session_note": map.gaming_mode_note.clone().unwrap_or_else(|| DEFAULT_AUTO_SUBMIT_NOTE.to_string()),
+            "auto_submit": !map.gaming_mode_ask,
         })
     }
 
@@ -165,16 +206,25 @@ impl Engine {
         if let Some(v) = s.share_now_playing { map.share_now_playing = v; }
         if let Some(v) = s.detect_unmapped { map.disable_unmapped_game_detection = !v; }
         if let Some(v) = s.session_note { map.gaming_mode_note = Some(v.trim().to_string()); }
+        if let Some(v) = s.auto_submit { map.gaming_mode_ask = !v; }
         map.save_to(&process_map_path_for_auth(&auth)).map_err(|e| format!("Could not save settings: {e}"))?;
         *self.state.process_map.write().unwrap() = map;
         Ok(self.settings())
     }
 
-    fn decision_submit(&self, Id { id }: Id) -> Result<Value, String> {
+    /// Submits a session the user decided on in the session dialog, with their notes (none if
+    /// blank) and privacy, as the desktop app's session window does.
+    fn decision_submit(&self, d: DecisionSubmit) -> Result<Value, String> {
+        let id = d.id;
         let decision = self.frontend.find_decision(&id).ok_or("That session has already been dealt with")?;
+        let (notes, spoiler, is_public) = if decision.takes_notes {
+            (d.notes.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()), d.spoiler, d.is_public)
+        } else {
+            (None, false, true)
+        };
         let attempt = actions::submit_decision(
             &self.state, &decision.data.mapping, decision.data.ledger_id.clone(), decision.hours,
-            gaming_mode_note(&self.state), false, true,
+            notes, spoiler, is_public,
         );
         // Submitted, or safely in Pending Submissions: either way nothing is left to decide here.
         if !matches!(attempt, actions::Attempt::Failed(_)) {
@@ -198,7 +248,7 @@ impl Engine {
             ChoiceArgs::Replay => Choice::Replay,
             ChoiceArgs::Existing { game_type, game_id, title } => Choice::Existing { game_type, game_id, title },
         };
-        let resolved = actions::resolve_new_game(&self.state, &appid, choice)?;
+        let resolved = actions::resolve_new_game(&self.state, &appid, choice, lilypad_core::resolution::CREATED_NOTE_STEAMOS)?;
         self.frontend.changed();
         Ok(json!({ "game_type": resolved.game_type, "game_id": resolved.game_id, "title": resolved.title, "sessions_logged": resolved.sessions_logged }))
     }

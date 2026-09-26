@@ -90,6 +90,11 @@ pub struct ProcessMapConfig {
     /// submits every session without asking. `None` is the standard note, an empty string none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gaming_mode_note: Option<String>,
+    /// Gaming Mode's auto-submit switch turned off: instead of submitting, the Decky plugin asks
+    /// on game close (notes, submit or not). Stored inverted so existing configs keep
+    /// auto-submitting.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gaming_mode_ask: bool,
 }
 
 impl ProcessMapConfig {
@@ -289,9 +294,9 @@ pub fn is_shared_game_host(path: &std::path::Path) -> bool {
 }
 
 /// Removes the mapping of `process` to a game that turned out not to exist, saving the account's
-/// map. Returns whether one was removed. The auto-link path builds mappings from the cached
-/// library, which can still list a game deleted on the website since the last refresh; left in
-/// place, every future launch would track against an id the server 404s on.
+/// map. Returns whether one was removed. Left in place, every future launch would track against
+/// an id the server 404s on. The mapping is dropped in memory even if saving fails, so this
+/// session does not keep tracking against it; the error is still returned for logging.
 pub fn remove_dead_mapping(
     process_map_arc: &std::sync::Arc<std::sync::RwLock<ProcessMapConfig>>,
     auth: &AuthConfig,
@@ -299,18 +304,20 @@ pub fn remove_dead_mapping(
     game_type: &str,
     froglog_id: i32,
 ) -> Result<bool, String> {
-    let mut map = process_map_arc.read().unwrap().clone();
-    let before = map.mappings.len();
-    map.mappings.retain(|m| {
-        !(m.froglog_id == froglog_id
-            && m.r#type.eq_ignore_ascii_case(game_type)
-            && m.process.eq_ignore_ascii_case(process))
-    });
-    if map.mappings.len() == before {
-        return Ok(false);
-    }
+    let map = {
+        let mut map = process_map_arc.write().unwrap();
+        let before = map.mappings.len();
+        map.mappings.retain(|m| {
+            !(m.froglog_id == froglog_id
+                && m.r#type.eq_ignore_ascii_case(game_type)
+                && m.process.eq_ignore_ascii_case(process))
+        });
+        if map.mappings.len() == before {
+            return Ok(false);
+        }
+        map.clone()
+    };
     map.save_to(&process_map_path_for_auth(auth)).map_err(|e| e.to_string())?;
-    *process_map_arc.write().unwrap() = map;
     Ok(true)
 }
 

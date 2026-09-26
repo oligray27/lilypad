@@ -4,18 +4,18 @@
 
 use crate::state::AppState;
 use lilypad_core::engine::actions::resolve_new_game;
-use lilypad_core::resolution::Choice;
+use lilypad_core::resolution::{Choice, CREATED_NOTE};
 
 /// Creates a brand-new FrogLog entry from the IGDB title the user confirmed.
 pub fn resolve_as_new(state: &AppState, appid: &str, igdb_title: &str) -> Result<serde_json::Value, String> {
-    let resolved = resolve_new_game(state, appid, Choice::New { igdb_title: igdb_title.to_string() })?;
+    let resolved = resolve_new_game(state, appid, Choice::New { igdb_title: igdb_title.to_string() }, CREATED_NOTE)?;
     // Attached to an existing entry instead (the same game, already owned): report that entry.
     Ok(resolved.created.unwrap_or_else(|| serde_json::json!({ "id": resolved.game_id, "title": resolved.title })))
 }
 
 /// Creates a new entry as a replay of the Completed/DNF entry this appid matched.
 pub fn resolve_as_replay(state: &AppState, appid: &str) -> Result<serde_json::Value, String> {
-    let resolved = resolve_new_game(state, appid, Choice::Replay)?;
+    let resolved = resolve_new_game(state, appid, Choice::Replay, CREATED_NOTE)?;
     Ok(resolved.created.unwrap_or_else(|| serde_json::json!({ "id": resolved.game_id, "title": resolved.title })))
 }
 
@@ -27,10 +27,11 @@ pub fn resolve_as_existing(
     game_id: i32,
     game_title: &str,
 ) -> Result<(), String> {
-    resolve_new_game(state, appid, Choice::Existing {
-        game_type: game_type.to_string(),
-        game_id,
-        title: game_title.to_string(),
-    })
+    resolve_new_game(
+        state,
+        appid,
+        Choice::Existing { game_type: game_type.to_string(), game_id, title: game_title.to_string() },
+        CREATED_NOTE,
+    )
     .map(|_| ())
 }

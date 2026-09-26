@@ -13,7 +13,7 @@ import { Decision, EngineEvent, Settings, Status, call, errorText, publish, subs
 
 const openPanel = () => Navigation.OpenQuickAccessMenu(QuickAccessTab.Decky);
 
-/** Toasts for engine events, shown even while the panel is closed (i.e. mid-game). */
+/** Toasts and dialogs for engine events, shown even while the panel is closed (i.e. mid-game). */
 function toastFor(event: EngineEvent) {
   const s = (key: string) => String(event[key] ?? "");
   switch (event.event) {
@@ -23,15 +23,12 @@ function toastFor(event: EngineEvent) {
     case "session_started":
       toaster.toast({ title: "Tracking Started", body: s("title") });
       break;
-    case "needs_decision": {
-      const decision = event.decision as Decision;
-      toaster.toast({
-        title: "Session Stopped",
-        body: `${decision.title} (${decision.time}). Tap to submit it or not record it.`,
-        onClick: () => showModal(<DecisionModal decision={decision} />),
-      });
+    // A session to submit (auto-submit off, or stopped from the panel): open the session dialog
+    // straight away, as the desktop app opens its window. By the time a game's exit is noticed,
+    // Steam's own UI is back in front.
+    case "needs_decision":
+      showModal(<DecisionModal decision={event.decision as Decision} />);
       break;
-    }
     case "new_game_recorded":
       toaster.toast({
         title: "Session Recorded",
@@ -82,7 +79,8 @@ function LoginSection({ onDone }: { onDone: () => void }) {
   );
 }
 
-/** The note sent with every session. Saved when the field loses focus, not on each keystroke. */
+/** The note sent with every auto-submitted session. Saved when the field loses focus, not on
+ * each keystroke. */
 function NoteField({ saved, onSaved }: { saved: string; onSaved: (settings: Settings) => void }) {
   const [note, setNote] = useState(saved);
   const [error, setError] = useState<string | null>(null);
@@ -101,7 +99,7 @@ function NoteField({ saved, onSaved }: { saved: string; onSaved: (settings: Sett
   return (
     <TextField
       label="Session message"
-      description={error ?? "Sent with every session. Leave blank for none."}
+      description={error ?? "Sent with every auto-submitted session. Leave blank for none."}
       value={note}
       onChange={(e) => setNote(e.target.value)}
       onBlur={save}
@@ -126,10 +124,20 @@ function SettingsSection() {
   return (
     <PanelSection title="Settings">
       <PanelSectionRow>
-        <NoteField saved={settings.session_note} onSaved={setSettings} />
+        <ToggleField
+          label="Auto-submit sessions"
+          description={settings.auto_submit ? undefined : "When a game closes, LilyPad asks you to submit the session, with notes."}
+          checked={settings.auto_submit}
+          onChange={set("auto_submit")}
+        />
       </PanelSectionRow>
+      {settings.auto_submit && (
+        <PanelSectionRow>
+          <NoteField saved={settings.session_note} onSaved={setSettings} />
+        </PanelSectionRow>
+      )}
       <PanelSectionRow>
-        <ToggleField label="Show what I'm playing on FrogLog" checked={settings.share_now_playing} onChange={set("share_now_playing")} />
+        <ToggleField label="Mirror online presence to FrogLog" checked={settings.share_now_playing} onChange={set("share_now_playing")} />
       </PanelSectionRow>
       <PanelSectionRow>
         <ToggleField
@@ -141,6 +149,25 @@ function SettingsSection() {
       </PanelSectionRow>
     </PanelSection>
   );
+}
+
+/** HH:MM:SS, e.g. 01:02:03. */
+function clock(totalSecs: number): string {
+  const s = Math.max(0, Math.floor(totalSecs));
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${pad(Math.floor(s / 3600))}:${pad(Math.floor((s % 3600) / 60))}:${pad(s % 60)}`;
+}
+
+/** The current game and a session clock that ticks locally from the engine's last reading. */
+function NowTracking({ title, secs }: { title: string; secs: number }) {
+  const [startedAt, setStartedAt] = useState(() => Date.now() - secs * 1000);
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => setStartedAt(Date.now() - secs * 1000), [title, secs]);
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+  return <Field label={`Now Tracking: ${title}`} description={`${clock((now - startedAt) / 1000)} - this session`} />;
 }
 
 function Content() {
@@ -211,9 +238,11 @@ function Content() {
       {status.storage_error && (
         <PanelSection><PanelSectionRow><Field label="Storage problem" description={status.storage_error} /></PanelSectionRow></PanelSection>
       )}
-      <PanelSection title="Now">
+      <PanelSection>
         <PanelSectionRow>
-          <Field label={status.now_tracking ? `Tracking ${status.now_tracking}` : "Not tracking a game"} />
+          {status.now_tracking
+            ? <NowTracking title={status.now_tracking} secs={status.now_tracking_secs ?? 0} />
+            : <Field label="Not tracking a game" />}
         </PanelSectionRow>
         {status.now_tracking && (
           <PanelSectionRow><ButtonItem layout="below" onClick={stopTracking}>Stop tracking this session</ButtonItem></PanelSectionRow>
@@ -221,7 +250,7 @@ function Content() {
       </PanelSection>
 
       {decisions.length > 0 && (
-        <PanelSection title="Stopped sessions">
+        <PanelSection title="Sessions to submit">
           {decisions.map((d) => (
             <PanelSectionRow key={d.id}>
               <ButtonItem layout="below" label={`${d.title} · ${d.time}`} onClick={() => showModal(<DecisionModal decision={d} />)}>

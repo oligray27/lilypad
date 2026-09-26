@@ -1,6 +1,6 @@
 [package]
 name = "lilypad-engine"
-version = "0.6.1"
+version = "0.6.2"
 description = "Headless LilyPad tracking engine for Steam Gaming Mode, driven by the Decky plugin over stdin/stdout"
 edition = "2021"
 rust-version = "1.89"

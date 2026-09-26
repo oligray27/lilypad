@@ -426,6 +426,37 @@ impl SessionLedger {
         Ok(Some(total))
     }
 
+    /// Moves a pending mapped session whose game was deleted from FrogLog into the New Games
+    /// entry for `appid`, settling the session in the same transaction, so it is never in both
+    /// queues or neither. Keeps its recorded length and play date. `Ok(None)`: not a pending
+    /// mapped session of `account`.
+    pub fn move_to_new_games(
+        &mut self,
+        id: &str,
+        account: &AccountIdentity,
+        appid: &str,
+        title: &str,
+        now: u64,
+    ) -> LedgerResult<Option<f64>> {
+        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let json: Option<String> = tx
+            .query_row("SELECT record FROM sessions WHERE id=?1 AND state='pending'", [id], |row| row.get(0))
+            .optional()?;
+        let Some(json) = json else { return Ok(None) };
+        let record: SessionRecord = serde_json::from_str(&json)?;
+        if record.account.as_ref() != Some(account) || !matches!(record.target, SessionTarget::Mapped(_)) {
+            return Ok(None);
+        }
+        let session = pending_session_from_record(&record)?;
+        let total = accumulate_new_game(
+            &tx, Some(account), appid, title, &record.process.executable,
+            session.hours, None, session.date, now,
+        )?;
+        tx.execute("UPDATE sessions SET state='dismissed' WHERE id=?1", [id])?;
+        tx.commit()?;
+        Ok(Some(total))
+    }
+
     /// Games played but not yet in the library, for this account, oldest first.
     pub fn new_games(
         &self,
@@ -1062,6 +1093,36 @@ mod tests {
         let mut expected = legacy[0].clone();
         expected.id = record.id;
         assert_eq!(serde_json::to_value(row).unwrap(), serde_json::to_value(expected).unwrap());
+    }
+
+    #[test]
+    fn a_session_for_a_deleted_game_moves_to_new_games_once_with_its_own_length_and_date() {
+        let mut ledger = SessionLedger::open(Path::new(":memory:")).unwrap();
+        let mut record = mapped_session();
+        record.submission = Some(submission());
+        ledger.insert(&record, SubmissionState::Pending).unwrap();
+        let owner = record.account.clone().unwrap();
+        let other = AccountIdentity { server: owner.server.clone(), account_id: "other".into() };
+
+        // Only the owner's pending session moves.
+        assert_eq!(ledger.move_to_new_games(&record.id, &other, "504230", "Celeste", 100).unwrap(), None);
+        let total = ledger.move_to_new_games(&record.id, &owner, "504230", "Celeste", 100).unwrap();
+        assert_eq!(total, Some(submission().hours));
+
+        let games = ledger.new_games(Some(&owner)).unwrap();
+        assert_eq!(games.len(), 1);
+        assert_eq!((games[0].appid.as_str(), games[0].title.as_str()), ("504230", "Celeste"));
+        assert_eq!(games[0].sessions[0].date, submission().date);
+        assert_eq!(games[0].exe_name, record.process.executable);
+        // Out of Pending Submissions, and a second move does nothing.
+        assert!(ledger.pending_sessions(&owner).unwrap().is_empty());
+        assert_eq!(ledger.move_to_new_games(&record.id, &owner, "504230", "Celeste", 200).unwrap(), None);
+        assert_eq!(ledger.new_games(Some(&owner)).unwrap()[0].session_count, 1);
+
+        // An unmapped or New Games record is never moved this way.
+        let unmapped = session();
+        ledger.insert(&unmapped, SubmissionState::Pending).unwrap();
+        assert_eq!(ledger.move_to_new_games(&unmapped.id, &owner, "1", "X", 100).unwrap(), None);
     }
 
     #[test]

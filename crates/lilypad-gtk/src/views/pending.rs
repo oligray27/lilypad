@@ -210,7 +210,9 @@ fn build_row(state: AppState, session: PendingSession, on_changed: Rc<dyn Fn()>)
             glib::spawn_future_local(async move {
                 let Ok(result) = rx.recv().await else { return };
                 match result {
-                    Ok(()) => on_changed(),
+                    // Submitted, or moved to New Games (its game was deleted): either way it has
+                    // left this list, and the reload shows the New Games count.
+                    Ok(_) => on_changed(),
                     Err(e) => {
                         btn.set_sensitive(true);
                         delete_btn.set_sensitive(true);

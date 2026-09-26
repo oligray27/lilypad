@@ -2687,7 +2687,7 @@ dependencies = [
 
 [[package]]
 name = "lilypad"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "chrono",
  "dirs 5.0.1",
@@ -2711,7 +2711,7 @@ dependencies = [
 
 [[package]]
 name = "lilypad-core"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "chrono",
  "dirs 5.0.1",
@@ -2730,7 +2730,7 @@ dependencies = [
 
 [[package]]
 name = "lilypad-engine"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "chrono",
  "env_logger",
@@ -2743,7 +2743,7 @@ dependencies = [
 
 [[package]]
 name = "lilypad-gtk"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "async-channel",
  "chrono",
