@@ -13,3 +13,4 @@ pub mod session_ledger;
 pub mod session_store;
 pub mod steam;
 pub mod submission;
+pub mod updates;

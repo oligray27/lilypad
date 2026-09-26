@@ -17,7 +17,7 @@ if (!isDevServer) {
 const VIEW_SIZE = {
   loginView: { width: 560, height: 328 },
   mainView: { width: 550, height: 444 },
-  mappingsView: { width: 642, height: 780 },
+  mappingsView: { width: 642, height: 810 }, // keep in step with lib.rs's DEFAULT_HEIGHT
   sessionView: { width: 440, height: 165 },
   pendingView: { width: 550, height: 480 },
   watchedDirsView: { width: 550, height: 480 },
@@ -526,13 +526,28 @@ async function loadNewGamesView() {
   });
 }
 
+// Newer release found by the Rust-side checker ({version, url}), or null. Set from
+// `get_update_info` on load and kept current by the `update-available` event.
+let availableUpdate = null;
+
 function loadVersion() {
   window.__TAURI__.app.getVersion().then((v) => {
+    const update = availableUpdate
+      ? ` · <a href="#" class="ext-link" data-url="${escapeAttr(availableUpdate.url)}">Update to v${escapeHtml(availableUpdate.version)}</a>`
+      : '';
     document.querySelectorAll('.app-version').forEach((el) => {
-      el.innerHTML = `v${v} <a href="#" class="ext-link" data-url="https://github.com/oligray27/lilypad/releases/latest" title="View releases">(?)</a>`;
+      el.innerHTML = `v${v} <a href="#" class="ext-link" data-url="https://github.com/oligray27/lilypad/releases/latest" title="View releases">(?)</a>${update}`;
     });
   }).catch(() => {});
 }
+
+invoke('get_update_info').then((update) => {
+  if (update) { availableUpdate = update; loadVersion(); }
+}).catch(() => {});
+listen('update-available', (event) => {
+  availableUpdate = event.payload;
+  loadVersion();
+});
 
 // --- Mappings view: table of games with exe column ---
 let mappingsAllRows = [];
@@ -710,6 +725,12 @@ async function loadMappingsView() {
     if (shareNowEl) shareNowEl.checked = !!mc.share_now_playing;
     const detectUnmappedEl = $('detectUnmappedGames');
     if (detectUnmappedEl) detectUnmappedEl.checked = !mc.disable_unmapped_game_detection;
+  }).catch(() => {});
+  // App-wide, not per account (unlike the settings above): its own file, also written by the
+  // installer's "Automatically check for updates?" question.
+  invoke('get_update_checks').then((enabled) => {
+    const el = $('checkForUpdates');
+    if (el) el.checked = !!enabled;
   }).catch(() => {});
   // Pending notice — runs independently so it always shows even if game data fetch fails
   invoke('get_pending_sessions').catch(() => []).then((pendingSessions) => {
@@ -1292,6 +1313,7 @@ app.innerHTML = `
       <label class="mappings-auto-submit-label"><input type="checkbox" id="mappingsAutoSubmitLive" /> Auto-submit live service sessions</label>
       <label class="mappings-auto-submit-label"><input type="checkbox" id="shareNowPlaying" /> Enable online presence on FrogLog</label>
       <label class="mappings-auto-submit-label"><input type="checkbox" id="detectUnmappedGames" /> Detect games not in your FrogLog library</label>
+      <label class="mappings-auto-submit-label"><input type="checkbox" id="checkForUpdates" /> Check for LilyPad updates automatically</label>
       <div class="mappings-switch-row">
         <div class="mappings-switch">
           <button type="button" id="mappingsSwitchGames" class="active">Games</button>
@@ -1423,6 +1445,20 @@ $('mappingsAutoSubmitLive').addEventListener('change', saveAutoSubmit);
 $('mappingsAutoSubmitSession').addEventListener('change', saveAutoSubmit);
 $('shareNowPlaying').addEventListener('change', saveShareNowPlaying);
 $('detectUnmappedGames').addEventListener('change', saveUnmappedDetection);
+$('checkForUpdates').addEventListener('change', (e) => {
+  const enabled = !!e.target.checked;
+  invoke('set_update_checks', { enabled }).then(() => {
+    // Off also drops an update already found (the tray item goes too); on re-checks, and the
+    // `update-available` event brings the link back if there is one.
+    if (!enabled) {
+      availableUpdate = null;
+      loadVersion();
+    }
+  }).catch((err) => {
+    console.error('[LilyPad] set_update_checks error:', err);
+    e.target.checked = !enabled;
+  });
+});
 $('watchedDirsAdd').addEventListener('click', async () => {
   const path = await invoke('pick_directory').catch(() => null);
   if (!path) return;

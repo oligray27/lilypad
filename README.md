@@ -37,6 +37,16 @@ Needs [Decky Loader](https://decky.xyz). Download `LilyPad-<version>.zip`, enabl
 
 If you also install the Linux desktop app, both share one login and history, and only one tracks at a time: the desktop app in Desktop Mode, the plugin in Gaming Mode.
 
+### Updates
+
+LilyPad checks for a new release shortly after it starts, then once a day. It never downloads or installs anything without you. Turn this on or off with **Check for LilyPad updates automatically** in Configure (Windows and Linux; on Linux it also covers Gaming Mode). The Windows installer asks the first time you install; after that, upgrades keep your answer. Checks are on unless you turn them off. When a new version is out:
+
+- **Windows**: a notification, and **Update to (x.y.z)...** in the tray menu, which downloads the installer. Run it over the top of the installed version.
+- **Linux**: a notification with a **Download** button, **Update to (x.y.z)…** in the tray menu, and the version link in the window header. They open the release page, where you pick your package.
+- **Steam Gaming Mode**: a one-time toast, and an **Update available** section at the top of the plugin's panel. **Update now** hands the new version to Decky, which asks you to confirm and then installs it; your login and history are kept, and a game in progress keeps being tracked. If your Decky can't do that, **Open release page** has the zip to install the same way as the first.
+
+You're notified once per release. The tray item and panel notice stay until you update.
+
 #### Upgrading from 0.5.x on Linux
 
 Your pending sessions and New Games are imported automatically the first time the new version starts. Older versions didn't record which account a session belonged to. Those sessions appear in **Pending Submissions** under *From an earlier LilyPad version*, where you choose **Assign to me** or **Discard**. The old files are left in place as a backup.
@@ -102,6 +112,7 @@ The GTK build needs GTK 4.12+ and libadwaita 1.5+ development files. Its code ca
 - **Windows**: `scripts/release.ps1` bumps the patch version, builds, commits, tags, pushes and creates the GitHub release. Use `-NoBump` to release the version already in the manifests.
 - **Linux**: `scripts/release-linux-gtk.sh` builds the `.deb`, `.rpm` and AppImage into `target/release/bundle/linux-<version>/`, with `SHA256SUMS` and `BUILD-INFO.txt`. Build on the oldest distribution you support: the packages need at least the build machine's glibc.
 - **Steam Gaming Mode**: build the engine (`cargo build --release --locked -p lilypad-engine`, in the same build container) and the frontend (`cd decky && npm ci && npm run build`), then `decky/build-plugin.sh` assembles `target/decky/LilyPad-<version>.zip`.
+- **Update checks** (`crates/lilypad-core/src/updates.rs`) read GitHub's *latest release*, so a release only reaches existing installs once it is published: not a draft, not a pre-release. The tag must be `vX.Y.Z`, and the Windows tray item links to the asset whose name ends in `-setup.exe`, falling back to the release page if there isn't one. The Decky panel's **Update now** installs the `LilyPad-<version>.zip` asset, verified against its line in the release's `SHA256SUMS`. `release-linux-gtk.sh` only lists the Linux packages there, so add the zip's line (from `target/decky/LilyPad-<version>.zip.sha256`) before uploading; without it Decky installs the update unverified.
 
 ### App icon
 

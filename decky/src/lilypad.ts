@@ -16,6 +16,50 @@ export interface Status {
   new_games: number | null;
   decisions: number;
   storage_error: string | null;
+  /** A newer LilyPad release, once the engine's daily check has found one. */
+  update: Update | null;
+}
+
+export interface Update {
+  version: string;
+  /** The release page. */
+  url: string;
+  /** The plugin zip, for Decky's installer; null if the release has none. */
+  zip_url: string | null;
+  /** Its SHA-256 from the release's SHA256SUMS; null if not listed (installs unverified). */
+  zip_sha256: string | null;
+}
+
+declare global {
+  interface Window {
+    /** Decky Loader's own backend connection (set up by the loader for its UI). */
+    DeckyBackend?: { call: (route: string, ...args: unknown[]) => Promise<unknown> };
+  }
+}
+
+/** Decky's `InstallType.UPDATE`: labels its confirmation prompt as an update. */
+const DECKY_INSTALL_TYPE_UPDATE = 2;
+
+/** Whether this Decky exposes the installer `installUpdate` uses. */
+export const canInstallUpdates = () => typeof window.DeckyBackend?.call === "function";
+
+/**
+ * Hands the release's plugin zip to Decky's own installer -- the one behind its store and
+ * "Install Plugin from URL". Decky shows its standard confirmation, downloads the zip, checks it
+ * against `zip_sha256`, then replaces and reloads this plugin. Resolves once the prompt is up.
+ * Not part of Decky's public plugin API (`utilities/install_plugin`, stable since Decky 3), so
+ * callers keep the release page as a fallback.
+ */
+export async function installUpdate(update: Update): Promise<void> {
+  if (!update.zip_url || !canInstallUpdates()) throw new Error("This Decky version can't install updates from LilyPad.");
+  await window.DeckyBackend!.call(
+    "utilities/install_plugin",
+    update.zip_url,
+    "LilyPad",
+    update.version,
+    update.zip_sha256 ?? "",
+    DECKY_INSTALL_TYPE_UPDATE,
+  );
 }
 
 export interface Decision {

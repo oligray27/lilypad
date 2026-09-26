@@ -133,6 +133,19 @@ Windows shares the session code, and several fixes changed it (stale waiter afte
 - [ ] Resolve a New Games entry (Create new) and check a single game is created.
 - [ ] Retry a queued session from Pending Submissions.
 
+### K. Update notice
+
+Start LilyPad with `LILYPAD_PRETEND_VERSION=0.0.1` set so the published release counts as newer (Windows: `$env:LILYPAD_PRETEND_VERSION='0.0.1'` in PowerShell, then run the exe from there; Gaming Mode: add it to the engine's environment in `main.py`). The first check runs about 20 s after start. Delete `update-check.json` from the data folder to see the one-time notice again.
+
+- [ ] **Windows.** *Expect:* "New version available" notification ("Open LilyPad to update."); tray menu has **Update to (x.y.z)...** above About, which starts the installer download; the About view's version line ends "· Update to v…". Restarting LilyPad: no second notification, but the tray item and link come back.
+- [ ] **Linux desktop.** *Expect:* notification with a **Download** button that opens the release page; the same tray item; within a minute the header's "(?)" becomes "Update to v…".
+- [ ] **Gaming Mode.** *Expect:* "New version available" toast (none if the desktop app already announced this release: they share the record); an **Update available** section at the top of the panel, including while the desktop app is tracking; **Open release page** opens it in Steam's browser.
+- [ ] **Gaming Mode: Update now, with a game running.** *Expect:* Decky's own "Install LilyPad …?" confirmation; after confirming, the plugin reloads (the engine log shows it restarting) and the panel shows the release version with no update notice; still logged in; the running game is still tracked and its session submitted once when it ends. Cancelling the confirmation changes nothing. With `LILYPAD_PRETEND_VERSION`, "updating" to the same release is a reinstall, which is fine for this test.
+- [ ] **Windows installer question.** Delete `%LOCALAPPDATA%\froglog-lilypad\update-settings.json`, then run the installer. *Expect:* after installing, "Automatically check for LilyPad updates?" (Yes/No); the file then holds `{"check_for_updates":true}` or `false`, and Configure's **Check for LilyPad updates automatically** matches. Running the installer again doesn't ask. A silent install (`/S`) doesn't ask either, and leaves no file (checks on).
+- [ ] **Configure checkbox, both desktops.** With an update showing (`LILYPAD_PRETEND_VERSION`), untick it. *Expect:* the tray's **Update to (x.y.z)** item and the version link go straight away; Gaming Mode's panel notice goes the next time it refreshes (on Linux the setting is shared). Tick it again. *Expect:* it checks straight away and they come back within a few seconds (Linux header link: within 5 s), with no second notification. Reopening Configure doesn't trigger another check (the log shows no new "update available" line).
+- [ ] **Offline start.** *Expect:* nothing shown, and the log says "update check failed"; LilyPad otherwise unaffected.
+- [ ] **Without the variable.** *Expect:* the log says "up to date"; no notice anywhere.
+
 ### Known limitations (not failures)
 
 - Flatpak Steam: only games you have already mapped are tracked.

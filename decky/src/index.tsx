@@ -9,7 +9,9 @@ import {
 import { useCallback, useEffect, useState } from "react";
 import lilypadIcon from "../assets/lilypad.png";
 import { DecisionModal, NewGamesModal, PendingModal } from "./modals";
-import { Decision, EngineEvent, Settings, Status, call, errorText, publish, subscribe } from "./lilypad";
+import {
+  Decision, EngineEvent, Settings, Status, Update, call, canInstallUpdates, errorText, installUpdate, publish, subscribe,
+} from "./lilypad";
 
 const openPanel = () => Navigation.OpenQuickAccessMenu(QuickAccessTab.Decky);
 
@@ -28,6 +30,13 @@ function toastFor(event: EngineEvent) {
     // Steam's own UI is back in front.
     case "needs_decision":
       showModal(<DecisionModal decision={event.decision as Decision} />);
+      break;
+    // Only the first time this release is seen (shared with the desktop app); after that the
+    // panel's update notice (from `status`) is the reminder.
+    case "update_available":
+      if (event.notify) {
+        toaster.toast({ title: "New version available", body: "Open LilyPad to update.", onClick: openPanel });
+      }
       break;
     case "new_game_recorded":
       toaster.toast({
@@ -151,6 +160,53 @@ function SettingsSection() {
   );
 }
 
+/** Shown at the top of the panel, in every state, once a newer release is out. "Update now"
+ * hands the release's zip to Decky's installer (see `installUpdate`), which asks to confirm and
+ * then replaces and reloads the plugin; the engine restarts with it, and a session in progress
+ * is picked up again by its recovery. The release page stays as the fallback for a Decky
+ * without that installer, or a release without a plugin zip. */
+function UpdateNotice({ update }: { update: Update | null }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  if (!update) return null;
+
+  const inPanel = Boolean(update.zip_url) && canInstallUpdates();
+  const install = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await installUpdate(update);
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const openPage = () => {
+    Navigation.CloseSideMenus();
+    Navigation.NavigateToExternalWeb(update.url);
+  };
+
+  return (
+    <PanelSection title="Update available">
+      <PanelSectionRow>
+        <Field
+          label={`LilyPad ${update.version}`}
+          description={error ?? (inPanel
+            ? undefined
+            : "Download the plugin zip from the release page, then install it with Decky's Install from ZIP.")}
+        />
+      </PanelSectionRow>
+      {inPanel && (
+        <PanelSectionRow>
+          <ButtonItem layout="below" disabled={busy} onClick={install}>{busy ? "Starting update…" : "Update now"}</ButtonItem>
+        </PanelSectionRow>
+      )}
+      <PanelSectionRow><ButtonItem layout="below" onClick={openPage}>Open release page</ButtonItem></PanelSectionRow>
+    </PanelSection>
+  );
+}
+
 /** HH:MM:SS, e.g. 01:02:03. */
 function clock(totalSecs: number): string {
   const s = Math.max(0, Math.floor(totalSecs));
@@ -199,20 +255,25 @@ function Content() {
     );
   }
 
+  const updateNotice = <UpdateNotice update={status.update} />;
+
   if (!status.tracking) {
     return (
-      <PanelSection>
-        <PanelSectionRow>
-          <Field
-            label="Tracking from the desktop app"
-            description="LilyPad is running in Desktop Mode, so it is tracking there. Gaming Mode takes over when you switch back."
-          />
-        </PanelSectionRow>
-      </PanelSection>
+      <>
+        {updateNotice}
+        <PanelSection>
+          <PanelSectionRow>
+            <Field
+              label="Tracking from the desktop app"
+              description="LilyPad is running in Desktop Mode, so it is tracking there. Gaming Mode takes over when you switch back."
+            />
+          </PanelSectionRow>
+        </PanelSection>
+      </>
     );
   }
 
-  if (!status.logged_in) return <LoginSection onDone={refresh} />;
+  if (!status.logged_in) return <>{updateNotice}<LoginSection onDone={refresh} /></>;
 
   const stopTracking = () =>
     showModal(
@@ -235,6 +296,7 @@ function Content() {
 
   return (
     <>
+      {updateNotice}
       {status.storage_error && (
         <PanelSection><PanelSectionRow><Field label="Storage problem" description={status.storage_error} /></PanelSectionRow></PanelSection>
       )}

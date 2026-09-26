@@ -37,7 +37,23 @@ pub enum TrayAction {
     ShowNewGames,
     Logout,
     ForceStopTracking,
+    /// Opens the newer release found by `lilypad_core::updates` (its release page).
+    OpenUpdate,
     Quit,
+}
+
+/// "Update to (x.y.z)…" when the background checker has found a newer release; listed just above
+/// About in both the logged-in and logged-out menus.
+fn update_item() -> Option<MenuItem<LilypadTray>> {
+    let update = lilypad_core::updates::available()?;
+    Some(
+        StandardItem {
+            label: format!("Update to ({})…", update.version),
+            activate: Box::new(|t: &mut LilypadTray| t.send(TrayAction::OpenUpdate)),
+            ..Default::default()
+        }
+        .into(),
+    )
 }
 
 pub struct LilypadTray {
@@ -167,6 +183,7 @@ impl ksni::Tray for LilypadTray {
                     .into(),
                 );
             }
+            items.extend(update_item());
             items.push(
                 StandardItem {
                     label: "About".into(),
@@ -192,6 +209,7 @@ impl ksni::Tray for LilypadTray {
                 }
                 .into(),
             );
+            items.extend(update_item());
             items.push(
                 StandardItem {
                     label: "About".into(),

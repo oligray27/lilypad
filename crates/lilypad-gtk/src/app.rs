@@ -123,6 +123,30 @@ fn build_window(app: &adw::Application, state: AppState) {
     };
     let refresh_tray = tray::make_refresh_tray(tray_handle);
 
+    // Newer-release checks after start-up and daily (lilypad_core::updates). The tray gains an
+    // "Update to (x.y.z)…" item and the header's version link changes (see below); the first time
+    // a release is seen -- by this app or the Gaming Mode engine, which share the record -- a
+    // notification with a Download button says so. Runs on the checker's thread, so it only
+    // uses thread-safe handles and routes the download through the tray action channel.
+    {
+        let refresh_tray = refresh_tray.clone();
+        let action_tx = action_tx.clone();
+        lilypad_core::updates::spawn_checker(env!("CARGO_PKG_VERSION").to_string(), move |_update, notify_now| {
+            refresh_tray();
+            if notify_now {
+                let action_tx = action_tx.clone();
+                notify::show_with_action(
+                    "New version available",
+                    "Open LilyPad to update.",
+                    "Download",
+                    move || {
+                        let _ = action_tx.send_blocking(TrayAction::OpenUpdate);
+                    },
+                );
+            }
+        });
+    }
+
     // Keeps the session length in the tray tooltip and menu current while a game runs.
     {
         let state = state.clone();
@@ -210,6 +234,32 @@ fn build_window(app: &adw::Application, state: AppState) {
     version_box.append(&releases_link);
     header_bar.pack_end(&version_box);
 
+    // Once the update checker finds a newer release, the "(?)" link becomes "Update to vX",
+    // pointing at it -- and goes back if checks are turned off in Configure (which drops the
+    // found update). Polled rather than pushed: the checker runs on its own thread and changes
+    // this at most once a day, so a cheap read every few seconds is simpler than a channel.
+    {
+        let releases_link = releases_link.clone();
+        glib::timeout_add_seconds_local(5, move || {
+            // The update link has no tooltip; "(?)" keeps its original "View releases".
+            let (label, uri, tooltip) = match lilypad_core::updates::available() {
+                Some(update) => (format!("Update to v{}", update.version), update.download_url().to_string(), None),
+                None => ("(?)".to_string(), lilypad_core::updates::RELEASES_PAGE.to_string(), Some("View releases")),
+            };
+            if releases_link.label().as_deref() != Some(label.as_str()) {
+                releases_link.set_label(&label);
+                releases_link.set_uri(&uri);
+                releases_link.set_tooltip_text(tooltip);
+                if label == "(?)" {
+                    releases_link.add_css_class("dim-label");
+                } else {
+                    releases_link.remove_css_class("dim-label");
+                }
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
     let stack = gtk4::Stack::new();
     stack.set_transition_type(gtk4::StackTransitionType::Crossfade);
     // Without this, Stack sizes itself to its largest child (the mappings page)
@@ -254,6 +304,7 @@ fn build_window(app: &adw::Application, state: AppState) {
     let (mappings_widget, reload_mappings) = views::mappings::build(
         state.clone(),
         window.clone().upcast(),
+        refresh_tray.clone(),
         {
             let stack = stack.clone();
             let window = window.clone();
@@ -401,6 +452,17 @@ fn build_window(app: &adw::Application, state: AppState) {
                     TrayAction::ForceStopTracking => {
                         lilypad_core::engine::actions::force_stop(&state, &frontend);
                         refresh_tray();
+                    }
+                    TrayAction::OpenUpdate => {
+                        if let Some(update) = lilypad_core::updates::available() {
+                            if let Err(e) = gtk4::gio::AppInfo::launch_default_for_uri(
+                                update.download_url(),
+                                None::<&gtk4::gio::AppLaunchContext>,
+                            ) {
+                                log::warn!("[LilyPad] could not open the release page: {e}");
+                                notify::show("Could not open the download page", update.download_url());
+                            }
+                        }
                     }
                     TrayAction::Quit => {
                         app.quit();

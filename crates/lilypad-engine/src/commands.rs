@@ -9,7 +9,12 @@ use lilypad_core::resolution::Choice;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+/// The newer release the update checker found, as the panel needs it: `{version, url (release
+/// page), zip_url, zip_sha256}`, the last two for handing the plugin zip to Decky's installer.
+/// Set by the checker in main.rs; served in `status`.
+pub static UPDATE: Mutex<Option<Value>> = Mutex::new(None);
 
 pub struct Engine {
     pub state: EngineState,
@@ -161,6 +166,11 @@ impl Engine {
             "new_games": counts.new_games,
             "decisions": self.frontend.decisions.lock().unwrap().len(),
             "storage_error": if tracking { store.error() } else { None },
+            // A newer LilyPad release, once the background checker has found one (see UPDATE).
+            // Hidden while update checks are off: the desktop app's Configure checkbox writes the
+            // shared setting from another process, so it's read here rather than waiting for this
+            // engine's own next check to notice.
+            "update": if lilypad_core::updates::checks_enabled() { UPDATE.lock().unwrap().clone() } else { None },
         })
     }
 

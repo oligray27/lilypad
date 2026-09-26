@@ -65,6 +65,27 @@ fn main() {
     }
 
     out.event("started", json!({ "version": env!("CARGO_PKG_VERSION") }));
+
+    // Newer-release checks (lilypad_core::updates), started before the lock so the panel can
+    // show an update even while the desktop app is the one tracking. The release's plugin zip
+    // and its checksum are looked up here, once per check, so the panel can hand them straight
+    // to Decky's installer (`status.update`). `notify` is true only the first time a release is
+    // seen -- shared with the desktop app's record -- for the plugin's one-off toast.
+    {
+        let out = out.clone();
+        lilypad_core::updates::spawn_checker(env!("CARGO_PKG_VERSION").to_string(), move |update, notify| {
+            let package = lilypad_core::updates::fetch_decky_package(&update, env!("CARGO_PKG_VERSION"));
+            let info = json!({
+                "version": update.version,
+                "url": update.page_url,
+                "zip_url": package.as_ref().map(|p| p.url.clone()),
+                "zip_sha256": package.and_then(|p| p.sha256),
+            });
+            *commands::UPDATE.lock().unwrap() = Some(info.clone());
+            out.event("update_available", json!({ "update": info, "notify": notify }));
+        });
+    }
+
     let lock = wait_for_lock(&out);
 
     if let Some(error) = engine::open_store(&state) {

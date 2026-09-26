@@ -38,7 +38,8 @@ const TRAY_ICON: tauri::image::Image<'_> = tauri::include_image!("icons/icon.ico
 /// Tray icon shown while a game session is active.
 const TRAY_ICON_NOWPLAYING: tauri::image::Image<'_> = tauri::include_image!("icons/icon_nowplaying.ico");
 
-const DEFAULT_HEIGHT: f64 = 780.0;
+// Configure's height; keep in step with main.js's VIEW_SIZE.mappingsView.
+const DEFAULT_HEIGHT: f64 = 810.0;
 const MAIN_ABOUT_HEIGHT: f64 = 335.0;
 const WINDOW_WIDTH: f64 = 642.0;
 const SESSION_WIDTH: f64 = 440.0;
@@ -1691,6 +1692,13 @@ fn build_tray_menu(app: &tauri::AppHandle, logged_in: bool, game_label: Option<S
         None
     };
     *TRACKING_STATUS_ITEM.lock().unwrap() = tracking_items.as_ref().map(|(status, _)| status.clone());
+    // Shown whether or not anyone is logged in, just above About (lilypad_core::updates).
+    let update_item = match lilypad_core::updates::available() {
+        Some(update) => Some(
+            MenuItemBuilder::with_id("update_available", format!("Update to ({})...", update.version)).build(app)?,
+        ),
+        None => None,
+    };
     if logged_in {
         let assign_exes_item = MenuItemBuilder::with_id("assign_exes", "Configure...").build(app)?;
         let about_item = MenuItemBuilder::with_id("about", "About").build(app)?;
@@ -1719,6 +1727,9 @@ fn build_tray_menu(app: &tauri::AppHandle, logged_in: bool, game_label: Option<S
         if let Some(ref item) = pending_item {
             items.push(item);
         }
+        if let Some(ref item) = update_item {
+            items.push(item);
+        }
         items.push(&about_item);
         items.push(&logout_item);
         items.push(&quit_item);
@@ -1731,7 +1742,13 @@ fn build_tray_menu(app: &tauri::AppHandle, logged_in: bool, game_label: Option<S
     } else {
         let login_item = MenuItemBuilder::with_id("login", "Login").build(app)?;
         let about_item = MenuItemBuilder::with_id("about", "About").build(app)?;
-        let menu = Menu::with_items(app, &[&login_item, &about_item, &quit_item])?;
+        let mut items: Vec<&dyn IsMenuItem<Wry>> = vec![&login_item];
+        if let Some(ref item) = update_item {
+            items.push(item);
+        }
+        items.push(&about_item);
+        items.push(&quit_item);
+        let menu = Menu::with_items(app, &items)?;
         Ok(menu)
     }
 }
@@ -1752,6 +1769,56 @@ fn update_tray_state(app: &tauri::AppHandle) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Checks for a newer LilyPad release after start-up and daily (`lilypad_core::updates`). When one
+/// is out: the tray gains an "Update to (x.y.z)..." item, the About view's version line links to
+/// it (`update-available` event), and -- once per release -- a notification says so. Plain toasts
+/// can't carry a link here, so the notification just points back at LilyPad.
+fn watch_for_updates(app: tauri::AppHandle) {
+    let current = app.package_info().version.to_string();
+    lilypad_core::updates::spawn_checker(current, move |update, notify| {
+        let handle = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            let _ = update_tray_state(&handle);
+        });
+        let _ = app.emit("update-available", update_json(&update));
+        if notify {
+            let _ = app.notification().builder()
+                .title("New version available")
+                .body("Open LilyPad to update.")
+                .show();
+        }
+    });
+}
+
+fn update_json(update: &lilypad_core::updates::UpdateInfo) -> serde_json::Value {
+    serde_json::json!({ "version": update.version, "url": update.download_url() })
+}
+
+/// The newer release the background checker found, if any, for the About view.
+#[tauri::command]
+fn get_update_info() -> Option<serde_json::Value> {
+    lilypad_core::updates::available().as_ref().map(update_json)
+}
+
+/// Configure's "Check for LilyPad updates automatically" checkbox. The same app-wide setting the
+/// installer's post-install question writes (windows/installer-hooks.nsh).
+#[tauri::command]
+fn get_update_checks() -> bool {
+    lilypad_core::updates::checks_enabled()
+}
+
+/// Turning checks off drops any update already found, so the tray item goes with it; turning
+/// them on checks straight away (`watch_for_updates` then adds it back if there is one).
+#[tauri::command]
+fn set_update_checks(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    lilypad_core::updates::set_checks_enabled(enabled)?;
+    let handle = app.clone();
+    app.run_on_main_thread(move || {
+        let _ = update_tray_state(&handle);
+    })
+    .map_err(|e| e.to_string())
 }
 
 /// Keeps the session length in the tray tooltip and "Now Tracking" item current while a game
@@ -2683,6 +2750,9 @@ pub fn run() {
             login,
             logout,
             refresh_tray_menu,
+            get_update_info,
+            get_update_checks,
+            set_update_checks,
             get_games,
             get_live_service_games,
             submit_session,
@@ -2771,6 +2841,12 @@ pub fn run() {
                             show_window_at_height(&w, WINDOW_WIDTH, MAIN_ABOUT_HEIGHT);
                             let _ = w.emit("show-main", ());
                         }
+                    } else if id == "update_available" {
+                        // Straight to the installer download (the release page if a release
+                        // ever ships without one).
+                        if let Some(update) = lilypad_core::updates::available() {
+                            let _ = app.opener().open_url(update.download_url(), None::<&str>);
+                        }
                     } else if id == "logout" {
                         let state = app.state::<AppState>();
                         let mut auth = state.auth.write().unwrap();
@@ -2857,6 +2933,7 @@ pub fn run() {
                 })
                 .build(app)?;
             tick_session_length(handle.clone());
+            watch_for_updates(handle.clone());
 
             // Show login window on first launch (no saved credentials)
             if !logged_in {

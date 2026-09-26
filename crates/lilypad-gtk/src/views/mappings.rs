@@ -38,6 +38,7 @@ impl Default for ViewState {
 pub fn build(
     state: AppState,
     window: gtk4::Window,
+    refresh_tray: crate::tray::RefreshTray,
     on_show_watched_dirs: impl Fn() + 'static,
     on_show_excluded_games: impl Fn() + 'static,
     on_show_new_games: impl Fn() + 'static,
@@ -113,12 +114,36 @@ pub fn build(
     let auto_live = gtk4::CheckButton::with_label("Auto-submit live service sessions");
     let share_now_playing = gtk4::CheckButton::with_label("Enable online presence on FrogLog");
     let detect_unmapped = gtk4::CheckButton::with_label("Detect games not in your FrogLog library");
+    let check_updates = gtk4::CheckButton::with_label("Check for LilyPad updates automatically");
     toggles_grid.attach(&auto_regular, 0, 0, 1, 1);
     toggles_grid.attach(&auto_session, 1, 0, 1, 1);
     toggles_grid.attach(&auto_live, 0, 1, 1, 1);
     toggles_grid.attach(&share_now_playing, 1, 1, 1, 1);
     toggles_grid.attach(&detect_unmapped, 0, 2, 1, 1);
+    toggles_grid.attach(&check_updates, 1, 2, 1, 1);
     container.append(&toggles_grid);
+    check_updates.set_active(lilypad_core::updates::checks_enabled());
+
+    // App-wide, not per account like the toggles below: lilypad_core::updates' own setting file,
+    // shared with the Tauri build's checkbox and (on Linux) the Gaming Mode engine. Only acts on a
+    // real change, since `reload` below re-syncs the box every time Configure opens and turning
+    // checks on runs a check straight away. Off drops a found update, so the tray is refreshed
+    // to lose its "Update to (x.y.z)…" item.
+    {
+        let refresh_tray = refresh_tray.clone();
+        check_updates.connect_toggled(move |check| {
+            let active = check.is_active();
+            if active == lilypad_core::updates::checks_enabled() {
+                return;
+            }
+            if let Err(e) = lilypad_core::updates::set_checks_enabled(active) {
+                log::warn!("[LilyPad] could not save the update-check setting: {e}");
+                check.set_active(!active);
+                return;
+            }
+            refresh_tray();
+        });
+    }
 
     {
         let cfg = state.process_map.read().unwrap();
@@ -475,6 +500,7 @@ pub fn build(
         let auto_live = auto_live.clone();
         let share_now_playing = share_now_playing.clone();
         let detect_unmapped = detect_unmapped.clone();
+        let check_updates = check_updates.clone();
         let new_games_notice_label = new_games_notice_label.clone();
         let new_games_notice_link = new_games_notice_link.clone();
         let pending_notice_label = pending_notice_label.clone();
@@ -488,6 +514,7 @@ pub fn build(
                 share_now_playing.set_active(cfg.share_now_playing);
                 detect_unmapped.set_active(!cfg.disable_unmapped_game_detection);
             }
+            check_updates.set_active(lilypad_core::updates::checks_enabled());
 
             let account = state.account();
             let counts = state.store().counts(account.as_ref());

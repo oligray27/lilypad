@@ -44,7 +44,8 @@
       "timestampUrl": "",
       "nsis": {
         "installerIcon": "icons/icon.ico",
-        "startMenuFolder": "LilyPad"
+        "startMenuFolder": "LilyPad",
+        "installerHooks": "windows/installer-hooks.nsh"
       }
     },
     "longDescription": "FrogLog game time tracker - runs in system tray, detects game processes and logs play time.",
