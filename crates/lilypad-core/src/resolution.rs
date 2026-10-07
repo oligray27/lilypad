@@ -245,13 +245,18 @@ fn create_new(
     if let Some(start) = local_date(entry.game.first_seen_secs) {
         obj.insert("start_date".into(), json!(start));
     }
-    // Our own detected appid is known-accurate. A non-Steam detection (`local:<path>`) must
-    // *clear* the Steam SKU `/search/fetch` found for the title, or a copy never launched
-    // through Steam gains a Steam link and a permanently empty Trophies tab.
+    // Our own detected appid is known-accurate. A non-Steam detection (`local:<path>`) must not
+    // send the Steam SKU `/search/fetch` found for the title as `steam_app_id`, or a copy never
+    // launched through Steam is shown and counted as a Steam game. It goes as
+    // `steam_reference_app_id` instead, which the server stores as a reference-only link: the
+    // store button, artwork and later Steam matching use it, the platform stays PC (Non-Steam).
+    // A server that predates that field ignores it, which is the old behaviour.
     if let Ok(appid) = entry.game.appid.parse::<i64>() {
         obj.insert("steam_app_id".into(), json!(appid));
     } else {
-        obj.remove("steam_app_id");
+        if let Some(sku) = obj.remove("steam_app_id").filter(|v| !v.is_null()) {
+            obj.insert("steam_reference_app_id".into(), sku);
+        }
         obj.insert("platform_chips".into(), json!(["PC (Non-Steam)"]));
         obj.insert("no_achievements".into(), json!(true));
     }
@@ -425,6 +430,10 @@ mod tests {
         already_owned: Option<i32>,
         /// Every uploaded session's note, in order.
         notes: RefCell<Vec<Option<String>>>,
+        /// The Steam SKU `/search/fetch` reports for the title, if any.
+        steam_sku: Option<i64>,
+        /// Every create payload, in order.
+        payloads: RefCell<Vec<Value>>,
     }
 
     impl SessionApi for FakeServer {
@@ -442,9 +451,15 @@ mod tests {
     }
 
     impl ResolveApi for FakeServer {
-        fn fetch_game_details(&self, title: &str) -> Result<Value, String> { Ok(json!({ "title": title })) }
+        fn fetch_game_details(&self, title: &str) -> Result<Value, String> {
+            Ok(match self.steam_sku {
+                Some(sku) => json!({ "title": title, "steam_app_id": sku }),
+                None => json!({ "title": title }),
+            })
+        }
         fn get_game_raw(&self, id: i32) -> Result<Value, String> { Ok(json!({ "id": id, "title": "Old run" })) }
-        fn create_game_keyed(&self, _payload: Value, client_ref: &str, _confirm_new: bool) -> Result<GameCreation, String> {
+        fn create_game_keyed(&self, payload: Value, client_ref: &str, _confirm_new: bool) -> Result<GameCreation, String> {
+            self.payloads.borrow_mut().push(payload);
             if let Some(game_id) = self.already_owned {
                 return Ok(GameCreation::AlreadyOwned { game_id, title: Some("Owned".into()) });
             }
@@ -543,6 +558,32 @@ mod tests {
             *api.notes.borrow(),
             vec![Some(CREATED_NOTE_STEAMOS.to_string()), Some(ATTACHED_NOTE.to_string())]
         );
+    }
+
+    #[test]
+    fn a_non_steam_game_sends_its_steam_sku_as_a_reference_only() {
+        let (store, account) = setup(0);
+        let appid = "local:C:/Games/Onimusha/Onimusha.exe";
+        store.record_new_game(&account, appid, "Onimusha", "Onimusha", 1.0, None).unwrap();
+        let api = FakeServer { steam_sku: Some(2638890), ..Default::default() };
+        let choice = Choice::New { igdb_title: "Onimusha: Way of the Sword".into() };
+        resolve(&api, &store, &account, &LibraryIndex::default(), appid, choice, CREATED_NOTE).unwrap();
+        let payload = &api.payloads.borrow()[0];
+        assert!(payload.get("steam_app_id").is_none(), "a non-Steam copy must not claim a Steam link");
+        assert_eq!(payload["steam_reference_app_id"], json!(2638890));
+        assert_eq!(payload["platform_chips"], json!(["PC (Non-Steam)"]));
+        assert_eq!(payload["no_achievements"], json!(true));
+    }
+
+    #[test]
+    fn a_steam_game_sends_its_own_detected_appid_and_no_reference() {
+        let (store, account) = setup(1);
+        let api = FakeServer { steam_sku: Some(999), ..Default::default() };
+        resolve(&api, &store, &account, &LibraryIndex::default(), "620", new_game(), CREATED_NOTE).unwrap();
+        let payload = &api.payloads.borrow()[0];
+        assert_eq!(payload["steam_app_id"], json!(620));
+        assert!(payload.get("steam_reference_app_id").is_none());
+        assert!(payload.get("platform_chips").is_none());
     }
 
     #[test]

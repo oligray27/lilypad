@@ -311,6 +311,15 @@ fn maybe_start_unmapped_tracking(
         return None;
     }
 
+    // A *different* executable of this same install is mapped -- e.g. Unreal's root launcher
+    // stub, which stays running for the whole session next to the mapped
+    // `*-Win64-Shipping.exe`. The mapping already tracks this play; filing the stub as a New
+    // Game recorded every session twice. Matters most for watched-directory games, whose
+    // synthetic `local:` appid can never resolve against the library below to catch it there.
+    if config.read().unwrap().has_mapping_under(&found.install_dir) {
+        return None;
+    }
+
     // A companion process not on the `is_known_helper_process` blocklist can still start or
     // exit around the same time as the real game (e.g. right after it closes) and get
     // misattributed as a new instance of the same appid. Skip it if we very recently finished

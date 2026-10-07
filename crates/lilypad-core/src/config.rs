@@ -214,6 +214,20 @@ impl ProcessMapConfig {
             .collect()
     }
 
+    /// Whether some mapping's recorded executable lives inside `dir` -- an installed game's own
+    /// folder. A game can run more than one process from its folder at once, and only one of
+    /// them is mapped: Unreal games launch a stub `<Game>.exe` in the root that stays open beside
+    /// the real `Binaries\Win64\<Game>-Win64-Shipping.exe`. The others are the same game, so
+    /// unmapped detection must not file them as a New Game -- before this check, every launch of
+    /// such a game was recorded twice, once against its mapping and once as a New Game.
+    pub fn has_mapping_under(&self, dir: &std::path::Path) -> bool {
+        self.mappings.iter().any(|m| {
+            m.exe_path
+                .as_deref()
+                .is_some_and(|p| crate::steam::path_starts_with(std::path::Path::new(p), dir))
+        })
+    }
+
     /// Records the executable a mapping was seen running as, so it can be told apart from a
     /// same-named binary elsewhere. Returns whether anything changed, so the caller knows to save.
     ///
@@ -668,6 +682,31 @@ mod tests {
         assert!(cfg.find_all_by_process("MyGame.exe").is_empty());
         assert!(cfg.find_all_by_process("NotFishlike.exe").is_empty());
         assert!(cfg.find_all_by_process("othergame.exe").is_empty());
+    }
+
+    /// Silent Hill: Townfall, as installed: the mapping is on the real Unreal binary, and the
+    /// root `Townfall.exe` launcher stub running beside it was being filed as a New Game.
+    #[test]
+    fn a_mapped_executable_covers_the_rest_of_its_install_folder() {
+        let install = std::path::PathBuf::from("games").join("SILENT HILL - Townfall");
+        let shipping = install.join("Townfall").join("Binaries").join("Win64").join("Townfall-Win64-Shipping.exe");
+        let mut m = mapping("Townfall-Win64-Shipping.exe", "session", 14368, None);
+        m.exe_path = Some(shipping.to_string_lossy().into_owned());
+        let cfg = ProcessMapConfig { mappings: vec![m], ..Default::default() };
+
+        assert!(cfg.has_mapping_under(&install));
+        // Path components, not a string prefix: a sibling whose name starts the same is another game.
+        assert!(!cfg.has_mapping_under(&std::path::PathBuf::from("games").join("SILENT HILL - Townfall 2")));
+        assert!(!cfg.has_mapping_under(&std::path::PathBuf::from("games").join("Celeste")));
+        #[cfg(windows)]
+        assert!(cfg.has_mapping_under(&std::path::PathBuf::from("GAMES").join("silent hill - townfall")));
+
+        // A mapping that has never recorded where it runs from says nothing about any folder.
+        let unrecorded = ProcessMapConfig {
+            mappings: vec![mapping("Townfall-Win64-Shipping.exe", "session", 14368, None)],
+            ..Default::default()
+        };
+        assert!(!unrecorded.has_mapping_under(&install));
     }
 
     /// The point of recording a path: two installs shipping `game.exe` are different games, and a

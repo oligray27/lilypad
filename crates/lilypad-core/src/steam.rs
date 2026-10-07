@@ -335,14 +335,14 @@ fn dir_contains_file(dir: &Path, name: &str, depth: usize) -> bool {
 }
 
 #[cfg(windows)]
-fn path_starts_with(path: &Path, prefix: &Path) -> bool {
+pub(crate) fn path_starts_with(path: &Path, prefix: &Path) -> bool {
     let path_lower = path.to_string_lossy().to_lowercase();
     let prefix_lower = prefix.to_string_lossy().to_lowercase();
     Path::new(&path_lower).starts_with(Path::new(&prefix_lower))
 }
 
 #[cfg(not(windows))]
-fn path_starts_with(path: &Path, prefix: &Path) -> bool {
+pub(crate) fn path_starts_with(path: &Path, prefix: &Path) -> bool {
     path.starts_with(prefix)
 }
 
