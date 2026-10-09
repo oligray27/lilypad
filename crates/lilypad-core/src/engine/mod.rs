@@ -20,7 +20,7 @@ use std::time::Duration;
 /// How often to check whether anything has been installed or removed. Cheap because the scan
 /// itself is gated on install-location fingerprints; the library fetch stays on the slow cycle.
 const INSTALL_SCAN_INTERVAL: Duration = Duration::from_secs(10);
-const LIBRARY_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
+use crate::library_match::LIBRARY_REFRESH_INTERVAL;
 
 /// What the engine needs from whatever is showing it to the user. Called from background
 /// threads, so implementations must hand any UI work to their own UI thread.

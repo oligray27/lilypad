@@ -137,6 +137,32 @@ fn check_mapped_game_needs_replay_prompt(mapping: &ProcessMapping, library_index
     Some(resolved.clone())
 }
 
+/// Refreshes the cached library before a mapped game's launch is checked for a possible replay
+/// (`check_mapped_game_needs_replay_prompt`), at most once per `LIBRARY_RECHECK_COOLDOWN` per
+/// game. The periodic refresh only runs every `LIBRARY_REFRESH_INTERVAL` (30 minutes), so
+/// without this a game marked Completed on the website shortly before launch would be silently
+/// continued instead of offered as a replay. A failed refresh leaves the cached library to
+/// decide, as before.
+fn refresh_before_replay_check(
+    mapping: &ProcessMapping,
+    last_library_refresh: &Arc<RwLock<HashMap<String, Instant>>>,
+    refresh_library_index: &Arc<dyn Fn() -> bool + Send + Sync>,
+) {
+    if mapping.r#type.eq_ignore_ascii_case("live") {
+        return; // live-service games have no finished state to check
+    }
+    let key = format!("mapped:{}", mapping.froglog_id);
+    let due = last_library_refresh
+        .read()
+        .unwrap()
+        .get(&key)
+        .is_none_or(|at| at.elapsed() >= LIBRARY_RECHECK_COOLDOWN);
+    if due {
+        last_library_refresh.write().unwrap().insert(key, Instant::now());
+        refresh_library_index();
+    }
+}
+
 /// Detects and repairs a `ProcessMapping` whose `games` row has vanished out from under it --
 /// far and away the most common cause is the website's "move to Live Service" action
 /// (`games.js`'s `move-to-live-service`/`bulk-move-to-live-service`), which deletes the old
@@ -334,7 +360,7 @@ fn maybe_start_unmapped_tracking(
     }
 
     // Before concluding this game is not in the library, make sure the library we are consulting
-    // is current. The cache refreshes on a five-minute timer, so a game added on the website
+    // is current. The cache refreshes on a 30-minute timer, so a game added on the website
     // minutes ago is still absent from it -- and the consequence is not a delay but a wrong
     // answer: the game is filed as a New Game the user already owns, which they then have to
     // resolve by hand. Refreshing only at this decision point keeps the cost off the common path,
@@ -613,14 +639,15 @@ fn pick_mapping(candidates: &[ProcessMapping], window_titles: &[String]) -> Opti
 /// starting a phantom second session, e.g. javaw.exe relaunching during Minecraft mod pack close).
 const POST_SESSION_COOLDOWN: Duration = Duration::from_secs(15);
 
-/// Minimum gap between on-demand library refreshes for the *same* game.
+/// Minimum gap between on-demand library refreshes for the *same* game (keyed by appid, or
+/// `mapped:<id>` for a linked game's replay check).
 ///
-/// Keyed per appid rather than globally: a global gap meant a genuinely unlisted game refreshed
+/// Keyed per game rather than globally: a global gap meant a genuinely unlisted game refreshed
 /// the whole library once a minute for as long as it ran -- roughly 120 redundant fetches over a
 /// two-hour session, none of which could find anything, since the game only appears once the user
-/// resolves it. Per-game with a long gap keeps the valuable case (a game added on the website
-/// shortly before launch is found immediately) while the five-minute periodic refresh covers
-/// anything added later.
+/// resolves it. Per-game with a long gap keeps the valuable case (a game added or finished on the
+/// website shortly before launch is seen immediately) while the 30-minute periodic refresh covers
+/// anything changed later.
 const LIBRARY_RECHECK_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 
 /// Games whose exe carries a UAC elevation manifest actually run twice: the unelevated process
@@ -1402,6 +1429,7 @@ pub fn run_poll_loop(
                                     on_dead_mapping_poll(mapping);
                                     continue 'proc_scan;
                                 }
+                                refresh_before_replay_check(&mapping, &last_library_refresh_poll, &refresh_library_poll);
                                 let replay = check_mapped_game_needs_replay_prompt(&mapping, &library_index_poll.read().unwrap());
                                 if let Some(resolved) = replay {
                                     start_replay_prompt_tracking(

@@ -3,6 +3,15 @@
 
 use crate::api::{Game, LiveServiceGame, PlatformLink, WishlistItem};
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
+
+/// How often every LilyPad (desktop, Gaming Mode, GTK) refetches the whole library in the
+/// background. It was 5 minutes, which made it 30% of all FrogLog API traffic. The decisions
+/// that need a current library refresh it on the spot instead: an unrecognised game
+/// (`monitor::maybe_start_unmapped_tracking`), a linked game that seems deleted
+/// (`mapping_is_dead`), and a linked game's launch before the replay check
+/// (`refresh_before_replay_check`).
+pub const LIBRARY_REFRESH_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
 /// Lowercases, strips punctuation, and strips common edition suffixes so titles that
 /// differ only cosmetically (store title vs. FrogLog title) still match.

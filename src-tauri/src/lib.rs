@@ -2959,7 +2959,7 @@ pub fn run() {
             //
             // Installed games are local files, and the scan is gated on directory mtimes, so
             // checking often costs a few `stat` calls and a newly installed game is picked up
-            // within seconds. It used to share the five-minute cycle below, which meant
+            // within seconds. It used to share the slow library cycle below, which meant
             // installing a game and launching it straight away matched nothing at all -- it was
             // simply absent from the list the monitor consults.
             //
@@ -2969,12 +2969,12 @@ pub fn run() {
             {
                 let app_handle_refresh = app_handle.clone();
                 std::thread::spawn(move || {
-                    let mut since_library_refresh = Duration::from_secs(300);
+                    let mut since_library_refresh = library_match::LIBRARY_REFRESH_INTERVAL;
                     loop {
                         {
                             let state = app_handle_refresh.state::<AppState>();
                             refresh_installed_games_if_changed(&state);
-                            if since_library_refresh >= Duration::from_secs(300) {
+                            if since_library_refresh >= library_match::LIBRARY_REFRESH_INTERVAL {
                                 refresh_library_index_state(&state);
                                 since_library_refresh = Duration::ZERO;
                             }
