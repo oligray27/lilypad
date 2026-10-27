@@ -11,6 +11,7 @@
 
 use crate::api::FroglogClient;
 use crate::config::{AuthConfig, ProcessMapConfig, ProcessMapping};
+use crate::monitor::ActiveSession;
 use crate::session_ledger::{AccountIdentity, SessionLedger, SessionRecord};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
@@ -73,21 +74,23 @@ fn normalised_server(auth: &AuthConfig, default_server: &str) -> String {
 ///
 /// Bounded by the last confirmed-alive checkpoint, never "now": a session that outlived a PC
 /// shutdown would otherwise bill the entire downtime as play time. This is the same rule
-/// `session_persistence::recover_on_startup` applies, restated against a ledger record.
+/// `session_persistence::recover_on_startup` applies, restated against a ledger record. Time
+/// spent paused is left out, a pause still running at the checkpoint included.
 pub fn interrupted_duration_secs(record: &SessionRecord) -> f64 {
     let started = record.started_at_secs.unwrap_or_default();
     let last_alive = record
         .last_alive_secs
         .unwrap_or(started)
         .max(started);
-    (last_alive - started) as f64
+    (last_alive - started).saturating_sub(record.paused_secs_at(last_alive)) as f64
 }
 
 /// How long a session that is *still running* has lasted, measured from its recorded start.
 /// Wall-clock is accurate here: the process never stopped, so there is no downtime to exclude.
+/// Paused time is.
 pub fn ongoing_duration_secs(record: &SessionRecord, now: u64) -> f64 {
     let started = record.started_at_secs.unwrap_or_default();
-    now.saturating_sub(started) as f64
+    now.saturating_sub(started).saturating_sub(record.paused_secs_at(now)) as f64
 }
 
 /// Per-session ticker: advances the ledger's confirmed-alive checkpoint and refreshes remote
@@ -114,19 +117,24 @@ pub fn ongoing_duration_secs(record: &SessionRecord, now: u64) -> f64 {
 /// `mapping` is `None` for a session with nothing to report presence for — an unmapped game is
 /// not in the library, so it has no id to be "now playing" as. Such a session still gets the
 /// local checkpoint half, which is what bounds its crash recovery.
+/// `presence_times` gives the times to report on this tick, or `None` for a session with no
+/// presence to report (see `presence_start`).
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_ledger_heartbeat(
     ledger: Option<Arc<Mutex<SessionLedger>>>,
     session_id: Option<String>,
     client_factory: impl Fn() -> FroglogClient + Send + 'static,
     process_map: Arc<RwLock<ProcessMapConfig>>,
     mapping: Option<ProcessMapping>,
-    started_at_iso: String,
+    presence_times: impl Fn() -> Option<PresenceTimes> + Send + 'static,
     still_active: impl Fn() -> bool + Send + 'static,
     on_error: impl Fn(String) + Send + 'static,
 ) {
     std::thread::spawn(move || loop {
         std::thread::sleep(HEARTBEAT_INTERVAL);
+        let times = presence_times();
         let share_presence = mapping.is_some()
+            && times.is_some()
             && process_map
                 .read()
                 .map(|c| c.share_now_playing)
@@ -137,12 +145,13 @@ pub fn spawn_ledger_heartbeat(
             &still_active,
             share_presence,
             &|| {
-                if let Some(mapping) = &mapping {
-                    let _ = client_factory().set_now_playing(
+                if let (Some(mapping), Some(times)) = (&mapping, &times) {
+                    let _ = client_factory().set_now_playing_at(
                         mapping.froglog_id,
                         mapping.r#type.clone(),
                         mapping.title.clone(),
-                        Some(started_at_iso.clone()),
+                        Some(times.started_at.clone()),
+                        times.paused_at.clone(),
                     );
                 }
             },
@@ -152,6 +161,48 @@ pub fn spawn_ledger_heartbeat(
             return;
         }
     });
+}
+
+/// The times a heartbeat reports for a session's presence ("now playing").
+#[derive(Debug, Clone, PartialEq)]
+pub struct PresenceTimes {
+    /// The real start, moved forward by time spent in pauses that have ended.
+    pub started_at: String,
+    /// When the pause still running began, if the session is paused. Online Now keeps showing
+    /// it, but its "playing for" time stops here.
+    pub paused_at: Option<String>,
+}
+
+/// The heartbeat's `presence_times` for the mapped session tracked as `process_name`. The start is
+/// moved forward by time spent paused, so Online Now's "playing for" leaves pauses out (as it does
+/// for a Quick Session); it only changes when a pause ends, so successive heartbeats report the
+/// same start. While paused, `paused_at` is set, so the time stands still there.
+pub fn presence_start(
+    current_session: Arc<RwLock<Option<ActiveSession>>>,
+    process_name: String,
+    started_at_iso: String,
+) -> impl Fn() -> Option<PresenceTimes> + Send + 'static {
+    move || {
+        let (paused_total, current_pause) = match current_session.read().ok()?.as_ref() {
+            Some(s) if s.process_name == process_name => (s.paused_total, s.paused_at.map(|p| p.elapsed())),
+            _ => (Duration::ZERO, None),
+        };
+        Some(PresenceTimes {
+            started_at: shift_iso(&started_at_iso, paused_total),
+            paused_at: current_pause.map(|d| (chrono::Utc::now() - chrono::Duration::seconds(d.as_secs() as i64)).to_rfc3339()),
+        })
+    }
+}
+
+/// `iso` (RFC 3339) moved forward by `by`, to the whole second; unchanged if it can't be parsed.
+pub fn shift_iso(iso: &str, by: Duration) -> String {
+    if by.as_secs() == 0 {
+        return iso.to_string();
+    }
+    match chrono::DateTime::parse_from_rfc3339(iso) {
+        Ok(t) => (t + chrono::Duration::seconds(by.as_secs() as i64)).to_rfc3339(),
+        Err(_) => iso.to_string(),
+    }
 }
 
 /// One heartbeat tick, separated from the timer so the independence of its two halves is
@@ -423,5 +474,73 @@ mod tests {
         let stored = ledger.get(&r.id).unwrap().unwrap();
         assert_eq!(stored.record.ended_at_secs, Some(1_300));
         assert_eq!(interrupted_duration_secs(&stored.record), 300.0);
+    }
+
+    /// Paused time is never logged as play: two pauses, the second still running when the
+    /// session ends, both come off its length.
+    #[test]
+    fn paused_time_is_left_out_of_a_finished_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ledger = SessionLedger::open(&dir.path().join("l.sqlite")).unwrap();
+        let r = record(1_000, Some(1_000));
+        ledger.insert(&r, SubmissionState::Active).unwrap();
+        assert!(ledger.pause(&r.id, 1_100).unwrap());
+        assert!(!ledger.pause(&r.id, 1_150).unwrap(), "already paused");
+        assert!(ledger.resume(&r.id, 1_200).unwrap());
+        assert!(!ledger.resume(&r.id, 1_250).unwrap(), "not paused");
+        assert!(ledger.pause(&r.id, 1_500).unwrap());
+        assert!(ledger.finish(&r.id, 1_600).unwrap());
+
+        let stored = ledger.get(&r.id).unwrap().unwrap();
+        assert_eq!(stored.record.paused_secs, 200);
+        assert_eq!(stored.record.paused_at_secs, None, "finishing closes the open pause");
+        assert_eq!(interrupted_duration_secs(&stored.record), 400.0);
+        assert!(!ledger.pause(&r.id, 1_700).unwrap(), "a finished session can't be paused");
+    }
+
+    /// A crash while paused is credited up to the checkpoint, minus the pause up to there.
+    #[test]
+    fn an_interrupted_paused_session_leaves_out_its_pause_up_to_the_checkpoint() {
+        let mut r = record(1_000, Some(1_600));
+        r.paused_secs = 60;
+        r.paused_at_secs = Some(1_500);
+        // 600s between start and checkpoint, 60s of earlier pauses, 100s of the running one.
+        assert_eq!(interrupted_duration_secs(&r), 440.0);
+        assert_eq!(ongoing_duration_secs(&r, 1_700), 440.0);
+    }
+
+    #[test]
+    fn a_paused_session_keeps_reporting_presence_with_its_pause_time() {
+        use crate::config::ProcessMapping;
+        use std::time::Instant;
+        let mut session = ActiveSession::new(
+            "game.exe".into(),
+            ProcessMapping {
+                process: "game.exe".into(), r#type: "session".into(), froglog_id: 1,
+                title: None, title_filter: None, exe_path: None,
+            },
+            sysinfo::Pid::from(1usize),
+            None,
+            Instant::now(),
+        );
+        session.paused_total = Duration::from_secs(60);
+        let current = Arc::new(RwLock::new(Some(session)));
+        let times = presence_start(Arc::clone(&current), "game.exe".into(), "2026-10-27T18:00:00+00:00".into());
+
+        let running = times().unwrap();
+        assert_eq!(running.started_at, "2026-10-27T18:01:00+00:00");
+        assert_eq!(running.paused_at, None);
+
+        current.write().unwrap().as_mut().unwrap().paused_at = Some(Instant::now());
+        let paused = times().unwrap();
+        assert_eq!(paused.started_at, "2026-10-27T18:01:00+00:00", "the start doesn't move while paused");
+        assert!(paused.paused_at.is_some());
+    }
+
+    #[test]
+    fn presence_start_moves_forward_by_paused_time() {
+        assert_eq!(shift_iso("2026-10-27T18:00:00+00:00", Duration::from_secs(90)), "2026-10-27T18:01:30+00:00");
+        assert_eq!(shift_iso("2026-10-27T18:00:00+00:00", Duration::ZERO), "2026-10-27T18:00:00+00:00");
+        assert_eq!(shift_iso("not a date", Duration::from_secs(90)), "not a date");
     }
 }

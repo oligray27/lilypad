@@ -185,7 +185,7 @@ pub fn handle_session_started(
         move || client_for(&auth),
         state.process_map.clone(),
         Some(mapping.clone()),
-        started_at_iso,
+        ledger_session::presence_start(state.current_session.clone(), process_name.clone(), started_at_iso),
         move || {
             current_session
                 .read()
@@ -194,6 +194,8 @@ pub fn handle_session_started(
         },
         move |e| error_store.report_error(e),
     );
+    // The FrogLog site's Quick Session bar can now show (and pause) it, with remote control on.
+    crate::remote::state_changed();
 }
 
 /// Entry point once a tracked session has ended (normal exit, force-stop, or recovery) and
@@ -219,6 +221,7 @@ pub fn handle_session_ended(
             let _ = client.clear_now_playing();
         });
     }
+    crate::remote::state_changed();
     frontend.changed();
 
     // The account changed while this game was running. The record stays pending under the
@@ -415,14 +418,16 @@ fn resume(state: EngineState, frontend: FrontendRef, record: SessionRecord, mapp
     let started_at = Instant::now().checked_sub(elapsed).unwrap_or_else(Instant::now);
     let process_name = record.process.executable.clone();
 
-    *state.current_session.write().unwrap() = Some(ActiveSession {
-        process_name: process_name.clone(),
-        mapping: mapping.clone(),
-        pid,
-        // Carried from the record: `find_original_process` has just confirmed it matches.
-        started_at_secs: record.process.started_at_secs,
-        started_at,
+    // Carried from the record: `find_original_process` has just confirmed it matches.
+    let mut session = ActiveSession::new(process_name.clone(), mapping.clone(), pid, record.process.started_at_secs, started_at);
+    // A session paused when LilyPad stopped is still paused: its record still holds the open
+    // pause, so the in-memory copy picks up from it rather than silently resuming.
+    session.paused_total = Duration::from_secs(record.paused_secs);
+    session.paused_at = record.paused_at_secs.map(|p| {
+        let paused_for = Duration::from_secs(now_secs().saturating_sub(p));
+        Instant::now().checked_sub(paused_for).unwrap_or_else(Instant::now)
     });
+    *state.current_session.write().unwrap() = Some(session);
     state.active_ledger_id.set(&process_name, Some(record.id.clone()));
     frontend.changed();
 
@@ -438,10 +443,15 @@ fn resume(state: EngineState, frontend: FrontendRef, record: SessionRecord, mapp
         let was_force_stopped = state.take_force_stop(&process_name);
         // Only clear the active id if it is still ours; a force-stop has already taken it.
         state.active_ledger_id.clear_if(&record.id);
-        match state.store().complete(&record.id, now_secs()) {
-            Completion::Owned(ledger_id) => handle_session_ended(
-                state, frontend, process_name, mapping, duration_secs, false, ledger_id,
-            ),
+        let ended_at = now_secs();
+        match state.store().complete(&record.id, ended_at) {
+            Completion::Owned(ledger_id) => {
+                // Completing closed any pause, so this is the final paused total.
+                let paused = state.store().paused_secs(&record.id, ended_at) as f64;
+                handle_session_ended(
+                    state, frontend, process_name, mapping, (duration_secs - paused).max(0.0), false, ledger_id,
+                )
+            }
             // Completed elsewhere -- a force-stop, which has already asked the user.
             Completion::Stale => {
                 log::info!(

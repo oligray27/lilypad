@@ -17,7 +17,9 @@ if (!isDevServer) {
 const VIEW_SIZE = {
   loginView: { width: 560, height: 328 },
   mainView: { width: 550, height: 444 },
-  mappingsView: { width: 642, height: 810 }, // keep in step with lib.rs's DEFAULT_HEIGHT
+  // Wide enough for the settings checkboxes in two columns. Keep in step with lib.rs's
+  // CONFIGURE_WIDTH and DEFAULT_HEIGHT.
+  mappingsView: { width: 880, height: 740 },
   sessionView: { width: 440, height: 165 },
   pendingView: { width: 550, height: 480 },
   watchedDirsView: { width: 550, height: 480 },
@@ -723,8 +725,17 @@ async function loadMappingsView() {
     if (asSessionEl) asSessionEl.checked = !!mc.auto_submit_session;
     const shareNowEl = $('shareNowPlaying');
     if (shareNowEl) shareNowEl.checked = !!mc.share_now_playing;
+    const remoteControlEl = $('remoteControl');
+    if (remoteControlEl) remoteControlEl.checked = !!mc.remote_control;
     const detectUnmappedEl = $('detectUnmappedGames');
     if (detectUnmappedEl) detectUnmappedEl.checked = !mc.disable_unmapped_game_detection;
+  }).catch(() => {});
+  // App-wide (device.json), not per account like the settings above.
+  invoke('get_device_name').then((d) => {
+    const el = $('deviceName');
+    if (!el) return;
+    el.value = d.name || '';
+    el.placeholder = d.computerName || '';
   }).catch(() => {});
   // App-wide, not per account (unlike the settings above): its own file, also written by the
   // installer's "Automatically check for updates?" question.
@@ -809,6 +820,8 @@ async function loadMappingsView() {
       shareNowEl.checked = !!mapConfigAfter.share_now_playing;
       console.log('[LilyPad] share_now_playing loaded as:', shareNowEl.checked);
     }
+    const remoteControlEl = $('remoteControl');
+    if (remoteControlEl) remoteControlEl.checked = !!mapConfigAfter.remote_control;
     const detectUnmappedEl = $('detectUnmappedGames');
     if (detectUnmappedEl) detectUnmappedEl.checked = !mapConfigAfter.disable_unmapped_game_detection;
     tableWrap.hidden = false;
@@ -1308,12 +1321,19 @@ app.innerHTML = `
            internal "regular"/"session"/"live" type names. The first one deliberately says play
            time rather than sessions: a game without session tracking has no sessions to log,
            so that submission only adds hours to the game's total (see update_game_hours). -->
-      <label class="mappings-auto-submit-label"><input type="checkbox" id="mappingsAutoSubmitRegular" /> Auto-submit play time to games without session tracking</label>
-      <label class="mappings-auto-submit-label"><input type="checkbox" id="mappingsAutoSubmitSession" /> Auto-submit sessions to games with session tracking</label>
-      <label class="mappings-auto-submit-label"><input type="checkbox" id="mappingsAutoSubmitLive" /> Auto-submit live service sessions</label>
-      <label class="mappings-auto-submit-label"><input type="checkbox" id="shareNowPlaying" /> Enable online presence on FrogLog</label>
-      <label class="mappings-auto-submit-label"><input type="checkbox" id="detectUnmappedGames" /> Detect games not in your FrogLog library</label>
-      <label class="mappings-auto-submit-label"><input type="checkbox" id="checkForUpdates" /> Check for LilyPad updates automatically</label>
+      <!-- Two columns, filled row by row, in the same order as the GTK build's grid. -->
+      <div class="mappings-settings-grid">
+        <label class="mappings-auto-submit-label"><input type="checkbox" id="mappingsAutoSubmitRegular" /> Auto-submit play time to games without session tracking</label>
+        <label class="mappings-auto-submit-label"><input type="checkbox" id="mappingsAutoSubmitSession" /> Auto-submit sessions to games with session tracking</label>
+        <label class="mappings-auto-submit-label"><input type="checkbox" id="mappingsAutoSubmitLive" /> Auto-submit live service sessions</label>
+        <label class="mappings-auto-submit-label"><input type="checkbox" id="shareNowPlaying" /> Enable online presence on FrogLog</label>
+        <label class="mappings-auto-submit-label"><input type="checkbox" id="detectUnmappedGames" /> Detect games not in your FrogLog library</label>
+        <label class="mappings-auto-submit-label"><input type="checkbox" id="checkForUpdates" /> Check for LilyPad updates automatically</label>
+        <label class="mappings-auto-submit-label"><input type="checkbox" id="remoteControl" /> Enable remote control from FrogLog</label>
+        <!-- Shown in FrogLog's Quick Session bar ("Tracked by LilyPad on ..."). Per install, not
+             per account. Blank: the bar just says "Tracked by LilyPad". -->
+        <label class="mappings-auto-submit-label mappings-device-name">Device name <input type="text" id="deviceName" maxlength="40" /></label>
+      </div>
       <div class="mappings-switch-row">
         <div class="mappings-switch">
           <button type="button" id="mappingsSwitchGames" class="active">Games</button>
@@ -1434,6 +1454,15 @@ function saveShareNowPlaying() {
     console.error('[LilyPad] save_now_playing_share error:', err);
   });
 }
+// "Enable remote control from FrogLog": pause/resume this session from FrogLog's Quick Session
+// bar (lilypad_core::remote). Reverted if it couldn't be saved.
+function saveRemoteControl(e) {
+  const enabled = !!e.target.checked;
+  invoke('save_remote_control', { enabled }).catch((err) => {
+    console.error('[LilyPad] save_remote_control error:', err);
+    e.target.checked = !enabled;
+  });
+}
 function saveUnmappedDetection() {
   const enabled = !!$('detectUnmappedGames').checked;
   invoke('save_unmapped_detection', { disabled: !enabled }).catch((err) => {
@@ -1444,6 +1473,13 @@ $('mappingsAutoSubmitRegular').addEventListener('change', saveAutoSubmit);
 $('mappingsAutoSubmitLive').addEventListener('change', saveAutoSubmit);
 $('mappingsAutoSubmitSession').addEventListener('change', saveAutoSubmit);
 $('shareNowPlaying').addEventListener('change', saveShareNowPlaying);
+$('remoteControl').addEventListener('change', saveRemoteControl);
+// Saved when the field is left or Enter is pressed ('change'), not on every keystroke.
+$('deviceName').addEventListener('change', (e) => {
+  invoke('save_device_name', { name: e.target.value }).catch((err) => {
+    console.error('[LilyPad] save_device_name error:', err);
+  });
+});
 $('detectUnmappedGames').addEventListener('change', saveUnmappedDetection);
 $('checkForUpdates').addEventListener('change', (e) => {
   const enabled = !!e.target.checked;

@@ -449,6 +449,12 @@ fn build_window(app: &adw::Application, state: AppState) {
                         window.present();
                         refresh_tray();
                     }
+                    TrayAction::TogglePauseTracking => {
+                        if let Err(e) = lilypad_core::engine::actions::toggle_pause(&state, &frontend) {
+                            notify::show("Could not pause", &e);
+                        }
+                        refresh_tray();
+                    }
                     TrayAction::ForceStopTracking => {
                         lilypad_core::engine::actions::force_stop(&state, &frontend);
                         refresh_tray();
@@ -498,5 +504,8 @@ fn build_window(app: &adw::Application, state: AppState) {
 
     // Detection, recording, recovery and submission: the shared engine, reporting back through
     // this window, its notifications and the tray.
-    lilypad_core::engine::start(&state, frontend);
+    lilypad_core::engine::start(&state, frontend.clone());
+    // Pause/Resume from FrogLog, when "Enable remote control from FrogLog" is on. This process
+    // holds the tracker lock (above), so Gaming Mode isn't also answering for this install.
+    lilypad_core::engine::start_remote_control(&state, frontend, "linux");
 }

@@ -127,6 +127,58 @@ pub fn start(state: &EngineState, frontend: FrontendRef) {
     });
 }
 
+/// Starts "Enable remote control from FrogLog" for this engine (see `remote`): Pause/Resume of
+/// the tracked session from the FrogLog site. Idles while the setting is off. Call after `start`,
+/// once. `platform` is shown on the site: "linux" or "steam-deck".
+pub fn start_remote_control(state: &EngineState, frontend: FrontendRef, platform: &'static str) {
+    crate::remote::start(Arc::new(EngineRemote { state: state.clone(), frontend, platform }));
+}
+
+struct EngineRemote {
+    state: EngineState,
+    frontend: FrontendRef,
+    platform: &'static str,
+}
+
+impl EngineRemote {
+    fn set_paused(&self, ledger_id: &str, paused: bool) -> Result<(), String> {
+        let auth = self.state.auth.read().unwrap().clone();
+        let share = self.state.process_map.read().unwrap().share_now_playing;
+        crate::pause::set_paused(
+            &self.state.current_session, &self.state.active_ledger_id, &self.state.store(),
+            &auth, share, ledger_id, paused,
+        )?;
+        self.frontend.changed();
+        Ok(())
+    }
+}
+
+impl crate::remote::RemoteHost for EngineRemote {
+    fn auth(&self) -> crate::config::AuthConfig {
+        self.state.auth.read().unwrap().clone()
+    }
+
+    fn enabled(&self) -> bool {
+        self.state.logged_in() && self.state.process_map.read().unwrap().remote_control
+    }
+
+    fn platform(&self) -> &'static str {
+        self.platform
+    }
+
+    fn state(&self) -> crate::remote::RemoteState {
+        crate::remote::RemoteState::of(self.state.current_session.read().unwrap().as_ref(), self.state.active_ledger_id.current())
+    }
+
+    fn pause(&self, ledger_id: &str) -> Result<(), String> {
+        self.set_paused(ledger_id, true)
+    }
+
+    fn resume(&self, ledger_id: &str) -> Result<(), String> {
+        self.set_paused(ledger_id, false)
+    }
+}
+
 fn handle_event(state: &EngineState, frontend: &FrontendRef, event: MonitorEvent) {
     match event {
         MonitorEvent::SessionStarted { process_name, mapping, ledger_id } => {

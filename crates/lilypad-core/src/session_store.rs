@@ -129,6 +129,11 @@ impl ActiveRecord {
         self.0.lock().unwrap().take().map(|(_, id)| id)
     }
 
+    /// The id of the session being tracked, without taking it.
+    pub fn current(&self) -> Option<String> {
+        self.0.lock().unwrap().as_ref().map(|(_, id)| id.clone())
+    }
+
     /// Clears the slot only if it still holds `id`.
     pub fn clear_if(&self, id: &str) {
         let mut slot = self.0.lock().unwrap();
@@ -348,6 +353,25 @@ impl SessionStore {
         }
     }
 
+    /// Starts a pause on an active record. `false` if it isn't active, is already paused, or
+    /// storage is unavailable.
+    pub fn pause(&self, id: &str, at: u64) -> bool {
+        self.with_ledger("pausing a session", |l| l.pause(id, at)) == Some(true)
+    }
+
+    /// Ends a running pause on an active record.
+    pub fn resume(&self, id: &str, at: u64) -> bool {
+        self.with_ledger("resuming a session", |l| l.resume(id, at)) == Some(true)
+    }
+
+    /// The record's total paused time as of `at` (its final total once completed), or 0 if it
+    /// can't be read. A session's wall-clock length minus this is its play time.
+    pub fn paused_secs(&self, id: &str, at: u64) -> u64 {
+        self.with_ledger("reading paused time", |l| l.get(id))
+            .flatten()
+            .map_or(0, |stored| stored.record.paused_secs_at(at))
+    }
+
     /// Credits a normally-ended unmapped session into New Games and settles its record in one
     /// transaction. Returns the entry's new total hours.
     pub fn complete_unmapped(&self, id: &str) -> Option<f64> {
@@ -456,6 +480,8 @@ impl SessionStore {
             ended_at_secs: Some(now_secs()),
             recovered: false,
             submission: Some(submission),
+            paused_secs: 0,
+            paused_at_secs: None,
         };
         log::warn!(
             "[LilyPad] a submission failed with no session record behind it; queueing it as {}",

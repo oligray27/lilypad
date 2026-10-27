@@ -262,9 +262,14 @@ impl EngineState {
             .map(|s| s.mapping.title.clone().unwrap_or_else(|| s.process_name.clone()))
     }
 
-    /// How long the current session has run, in seconds.
+    /// How long the current session has been played, in seconds (pauses left out).
     pub fn now_tracking_secs(&self) -> Option<u64> {
         self.current_session.read().unwrap().as_ref().map(|s| s.elapsed_secs())
+    }
+
+    /// Whether the current session is paused (from the tray or panel, or the FrogLog site).
+    pub fn now_tracking_paused(&self) -> bool {
+        self.current_session.read().unwrap().as_ref().is_some_and(|s| s.is_paused())
     }
 
     /// The current game with its length so far, e.g. "Hades (1h 23m)".

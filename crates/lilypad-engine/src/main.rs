@@ -93,7 +93,10 @@ fn main() {
     }
     tracking.store(true, Ordering::SeqCst);
     let frontend_ref: FrontendRef = frontend;
-    engine::start(&state, frontend_ref);
+    engine::start(&state, frontend_ref.clone());
+    // Only once this process holds the tracker lock, so the desktop app and Gaming Mode never
+    // both answer FrogLog's remote-control commands for the same install.
+    engine::start_remote_control(&state, frontend_ref, "steam-deck");
     log::info!("[LilyPad] tracking in Gaming Mode as {:?}", state.auth.read().unwrap().username);
     out.event("tracking", json!({ "logged_in": state.logged_in() }));
 

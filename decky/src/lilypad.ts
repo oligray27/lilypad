@@ -10,8 +10,10 @@ export interface Status {
   logged_in: boolean;
   username: string | null;
   now_tracking: string | null;
-  /** How long the current session has run, in seconds, when the status was read. */
+  /** How long the current session has been played (pauses left out), in seconds, when the status was read. */
   now_tracking_secs: number | null;
+  /** Paused (from this panel or the FrogLog site). Missing from engines older than this field. */
+  now_tracking_paused?: boolean;
   pending: number | null;
   new_games: number | null;
   decisions: number;
@@ -115,6 +117,12 @@ export interface Settings {
   session_note: string;
   /** Off: the session dialog opens as each game closes instead. */
   auto_submit: boolean;
+  /** "Enable remote control from FrogLog": pause/resume the session from the FrogLog site. */
+  remote_control: boolean;
+  /** Shown in FrogLog's Quick Session bar; empty for none. Per install, shared with the desktop app. */
+  device_name?: string;
+  /** The computer's own name, suggested while device_name is empty. */
+  device_name_default?: string;
 }
 
 export type Attempt =

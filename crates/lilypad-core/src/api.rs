@@ -130,6 +130,10 @@ pub struct NowPlayingBody {
   pub game_type: String,
   pub title: Option<String>,
   pub started_at: Option<String>,
+  /// When the session was paused (from FrogLog, with remote control on), if it is: Online Now
+  /// keeps showing it but its "playing for" time stops at this point. Left out when not paused.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub paused_at: Option<String>,
 }
 
 /// Synchronous Froglog API client (blocking reqwest for use from any thread).
@@ -787,7 +791,20 @@ impl FroglogClient {
         title: Option<String>,
         started_at: Option<String>,
     ) -> Result<serde_json::Value, String> {
-        let body = NowPlayingBody { game_id, game_type, title, started_at };
+        self.set_now_playing_at(game_id, game_type, title, started_at, None)
+    }
+
+    /// `set_now_playing` for a session that may be paused: `paused_at` freezes its "playing for"
+    /// time in Online Now (see `pause`).
+    pub fn set_now_playing_at(
+        &self,
+        game_id: i32,
+        game_type: String,
+        title: Option<String>,
+        started_at: Option<String>,
+        paused_at: Option<String>,
+    ) -> Result<serde_json::Value, String> {
+        let body = NowPlayingBody { game_id, game_type, title, started_at, paused_at };
         log::info!("[LilyPad] set_now_playing request: {:?}", body);
         let res = self
             .client

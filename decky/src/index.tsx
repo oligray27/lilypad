@@ -116,6 +116,35 @@ function NoteField({ saved, onSaved }: { saved: string; onSaved: (settings: Sett
   );
 }
 
+/** The name FrogLog's Quick Session bar shows for this device ("Tracked by LilyPad on ...").
+ * Saved when the field loses focus, like the session message. */
+function DeviceNameField({ settings, onSaved }: { settings: Settings; onSaved: (settings: Settings) => void }) {
+  const saved = settings.device_name ?? "";
+  const [name, setName] = useState(saved);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => setName(saved), [saved]);
+
+  const save = async () => {
+    if (name.trim() === saved) return;
+    try {
+      onSaved(await call<Settings>("settings_set", { device_name: name }));
+      setError(null);
+    } catch (e) {
+      setError(errorText(e));
+    }
+  };
+
+  return (
+    <TextField
+      label="Device name"
+      description={error ?? `Shown in FrogLog's Quick Session bar. Leave blank for none${settings.device_name_default ? ` (e.g. ${settings.device_name_default})` : ""}.`}
+      value={name}
+      onChange={(e) => setName(e.target.value)}
+      onBlur={save}
+    />
+  );
+}
+
 function SettingsSection() {
   const [settings, setSettings] = useState<Settings | null>(null);
   useEffect(() => { call<Settings>("settings_get").then(setSettings).catch(() => undefined); }, []);
@@ -148,6 +177,19 @@ function SettingsSection() {
       <PanelSectionRow>
         <ToggleField label="Mirror online presence to FrogLog" checked={settings.share_now_playing} onChange={set("share_now_playing")} />
       </PanelSectionRow>
+      <PanelSectionRow>
+        <ToggleField
+          label="Enable remote control from FrogLog"
+          description="Pause and resume this session from FrogLog's Quick Session bar."
+          checked={!!settings.remote_control}
+          onChange={set("remote_control")}
+        />
+      </PanelSectionRow>
+      {settings.remote_control && (
+        <PanelSectionRow>
+          <DeviceNameField settings={settings} onSaved={setSettings} />
+        </PanelSectionRow>
+      )}
       <PanelSectionRow>
         <ToggleField
           label="Record games not in FrogLog"
@@ -214,16 +256,24 @@ function clock(totalSecs: number): string {
   return `${pad(Math.floor(s / 3600))}:${pad(Math.floor((s % 3600) / 60))}:${pad(s % 60)}`;
 }
 
-/** The current game and a session clock that ticks locally from the engine's last reading. */
-function NowTracking({ title, secs }: { title: string; secs: number }) {
+/** The current game and a session clock that ticks locally from the engine's last reading, or
+ *  stands still while the session is paused (here, from the tray, or from the FrogLog site). */
+function NowTracking({ title, secs, paused }: { title: string; secs: number; paused: boolean }) {
   const [startedAt, setStartedAt] = useState(() => Date.now() - secs * 1000);
   const [now, setNow] = useState(Date.now());
   useEffect(() => setStartedAt(Date.now() - secs * 1000), [title, secs]);
   useEffect(() => {
+    if (paused) return;
     const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);
-  }, []);
-  return <Field label={`Now Tracking: ${title}`} description={`${clock((now - startedAt) / 1000)} - this session`} />;
+  }, [paused]);
+  const elapsed = paused ? secs : (now - startedAt) / 1000;
+  return (
+    <Field
+      label={`Now Tracking: ${title}`}
+      description={`${clock(elapsed)} - ${paused ? "paused" : "this session"}`}
+    />
+  );
 }
 
 function Content() {
@@ -303,11 +353,19 @@ function Content() {
       <PanelSection>
         <PanelSectionRow>
           {status.now_tracking
-            ? <NowTracking title={status.now_tracking} secs={status.now_tracking_secs ?? 0} />
+            ? <NowTracking title={status.now_tracking} secs={status.now_tracking_secs ?? 0} paused={!!status.now_tracking_paused} />
             : <Field label="Not tracking a game" />}
         </PanelSectionRow>
         {status.now_tracking && (
-          <PanelSectionRow><ButtonItem layout="below" onClick={stopTracking}>Stop tracking this session</ButtonItem></PanelSectionRow>
+          <>
+            {/* Paused time isn't logged. The same pause FrogLog's Quick Session bar can set. */}
+            <PanelSectionRow>
+              <ButtonItem layout="below" onClick={() => { call("toggle_pause").then(refresh).catch(() => undefined); }}>
+                {status.now_tracking_paused ? "Resume tracking" : "Pause tracking"}
+              </ButtonItem>
+            </PanelSectionRow>
+            <PanelSectionRow><ButtonItem layout="below" onClick={stopTracking}>Stop tracking this session</ButtonItem></PanelSectionRow>
+          </>
         )}
       </PanelSection>
 

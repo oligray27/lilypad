@@ -44,6 +44,11 @@ struct Settings {
     session_note: Option<String>,
     /// Off: ask on game close instead.
     auto_submit: Option<bool>,
+    /// "Enable remote control from FrogLog": pause/resume from the site (lilypad_core::remote).
+    remote_control: Option<bool>,
+    /// Shown on the site's Quick Session bar; blank for none. Per install, shared with the
+    /// desktop app (lilypad_core::remote::set_device_name).
+    device_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -136,6 +141,11 @@ impl Engine {
                 let frontend: FrontendRef = self.frontend.clone();
                 Ok(json!(actions::force_stop(&self.state, &frontend)))
             }
+            // Pause the tracked session, or resume it if paused. Returns whether it's now paused.
+            "toggle_pause" => {
+                let frontend: FrontendRef = self.frontend.clone();
+                Ok(json!(actions::toggle_pause(&self.state, &frontend)?))
+            }
             other => Err(format!("unknown command {other:?}")),
         }
     }
@@ -162,6 +172,8 @@ impl Engine {
             "username": auth.username,
             "now_tracking": self.state.now_tracking_title(),
             "now_tracking_secs": self.state.now_tracking_secs(),
+            // Paused (from the panel or the FrogLog site): the panel's clock stops.
+            "now_tracking_paused": self.state.now_tracking_paused(),
             "pending": counts.pending.map(|p| p.saturating_sub(hidden) +counts.unowned.unwrap_or(0)),
             "new_games": counts.new_games,
             "decisions": self.frontend.decisions.lock().unwrap().len(),
@@ -204,6 +216,10 @@ impl Engine {
             "detect_unmapped": !map.disable_unmapped_game_detection,
             "session_note": map.gaming_mode_note.clone().unwrap_or_else(|| DEFAULT_AUTO_SUBMIT_NOTE.to_string()),
             "auto_submit": !map.gaming_mode_ask,
+            "remote_control": map.remote_control,
+            "device_name": lilypad_core::remote::device_name().unwrap_or_default(),
+            // The suggestion shown while the name is blank.
+            "device_name_default": lilypad_core::remote::computer_name(),
         })
     }
 
@@ -217,8 +233,12 @@ impl Engine {
         if let Some(v) = s.detect_unmapped { map.disable_unmapped_game_detection = !v; }
         if let Some(v) = s.session_note { map.gaming_mode_note = Some(v.trim().to_string()); }
         if let Some(v) = s.auto_submit { map.gaming_mode_ask = !v; }
+        if let Some(v) = s.remote_control { map.remote_control = v; }
+        if let Some(v) = s.device_name { lilypad_core::remote::set_device_name(&v)?; }
         map.save_to(&process_map_path_for_auth(&auth)).map_err(|e| format!("Could not save settings: {e}"))?;
         *self.state.process_map.write().unwrap() = map;
+        // Registers with FrogLog (or unregisters) straight away rather than on the next re-check.
+        lilypad_core::remote::state_changed();
         Ok(self.settings())
     }
 

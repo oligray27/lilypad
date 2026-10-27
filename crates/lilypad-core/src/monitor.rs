@@ -1061,18 +1061,48 @@ pub struct ActiveSession {
     /// it could be read, which only makes recovery fall back to matching by name.
     pub started_at_secs: Option<u64>,
     pub started_at: Instant,
+    /// When the pause still running began, if the session is paused (tray Pause, or the FrogLog
+    /// site with remote control on). Mirrors the ledger record, which is what durations at the
+    /// end of a session come from; this copy is for showing the time while it runs.
+    pub paused_at: Option<Instant>,
+    /// Time spent in earlier pauses.
+    pub paused_total: Duration,
 }
 
 impl ActiveSession {
-    /// The session's length so far: the same clock its submitted duration is taken from.
-    pub fn elapsed_secs(&self) -> u64 {
-        self.started_at.elapsed().as_secs()
+    /// A session that has just started, unpaused.
+    pub fn new(process_name: String, mapping: ProcessMapping, pid: Pid, started_at_secs: Option<u64>, started_at: Instant) -> Self {
+        Self { process_name, mapping, pid, started_at_secs, started_at, paused_at: None, paused_total: Duration::ZERO }
     }
 
-    /// "Hades (1h 23m)", for tray menus and tooltips.
+    pub fn is_paused(&self) -> bool {
+        self.paused_at.is_some()
+    }
+
+    /// Time spent paused so far, the pause still running included.
+    pub fn paused_duration(&self) -> Duration {
+        self.paused_total + self.paused_at.map_or(Duration::ZERO, |p| p.elapsed())
+    }
+
+    /// Play time so far: wall-clock time since the start, minus pauses.
+    pub fn active_elapsed(&self) -> Duration {
+        self.started_at.elapsed().saturating_sub(self.paused_duration())
+    }
+
+    /// The session's play time so far, in whole seconds (pauses left out).
+    pub fn elapsed_secs(&self) -> u64 {
+        self.active_elapsed().as_secs()
+    }
+
+    /// "Hades (1h 23m)", or "Hades (1h 23m, paused)", for tray menus and tooltips.
     pub fn label(&self) -> String {
         let title = self.mapping.title.clone().unwrap_or_else(|| self.process_name.clone());
-        format!("{title} ({})", crate::duration::format_session_duration(self.elapsed_secs() as f64))
+        let time = crate::duration::format_session_duration(self.elapsed_secs() as f64);
+        if self.is_paused() {
+            format!("{title} ({time}, paused)")
+        } else {
+            format!("{title} ({time})")
+        }
     }
 }
 
@@ -1362,13 +1392,9 @@ pub fn run_poll_loop(
                                         } else {
                                             name
                                         };
-                                        *cur = Some(ActiveSession {
-                                            process_name: name.clone(),
-                                            mapping: mapping.clone(),
-                                            pid: *pid,
-                                            started_at_secs: Some(p.start_time()),
-                                            started_at: Instant::now(),
-                                        });
+                                        *cur = Some(ActiveSession::new(
+                                            name.clone(), mapping.clone(), *pid, Some(p.start_time()), Instant::now(),
+                                        ));
                                         found = Some((*pid, name, mapping));
                                         break 'proc_scan;
                                     }
@@ -1443,13 +1469,9 @@ pub fn run_poll_loop(
                                     );
                                     continue 'proc_scan;
                                 }
-                                *cur = Some(ActiveSession {
-                                    process_name: name.clone(),
-                                    mapping: mapping.clone(),
-                                    pid: *pid,
-                                    started_at_secs: Some(p.start_time()),
-                                    started_at: Instant::now(),
-                                });
+                                *cur = Some(ActiveSession::new(
+                                    name.clone(), mapping.clone(), *pid, Some(p.start_time()), Instant::now(),
+                                ));
                                 found = Some((*pid, name, mapping));
                                 break 'proc_scan;
                             }
@@ -1739,16 +1761,16 @@ mod tests {
     }
 
     fn active(process_name: &str) -> ActiveSession {
-        ActiveSession {
-            process_name: process_name.into(),
-            mapping: ProcessMapping {
+        ActiveSession::new(
+            process_name.into(),
+            ProcessMapping {
                 process: process_name.into(), r#type: "session".into(), froglog_id: 1,
                 title: None, title_filter: None, exe_path: None,
             },
-            pid: Pid::from(1usize),
-            started_at_secs: None,
-            started_at: Instant::now(),
-        }
+            Pid::from(1usize),
+            None,
+            Instant::now(),
+        )
     }
 
     /// Force-stop X, start Y, then X exits: Y must still be the tracked session, or the next

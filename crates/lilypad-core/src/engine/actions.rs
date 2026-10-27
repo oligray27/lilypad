@@ -159,13 +159,29 @@ pub fn resolve_new_game(state: &EngineState, appid: &str, choice: Choice, create
     Ok(resolved)
 }
 
+/// "Pause Tracking" / "Resume Tracking": pauses the tracked session, or resumes it if paused.
+/// Paused time isn't logged as play. The same pause FrogLog's Quick Session bar sets with remote
+/// control on (see `pause`). Returns whether the session is paused afterwards.
+pub fn toggle_pause(state: &EngineState, frontend: &FrontendRef) -> Result<bool, String> {
+    let paused = state.now_tracking_paused();
+    let ledger_id = state
+        .active_ledger_id
+        .current()
+        .ok_or("This session couldn't be stored, so it can't be paused")?;
+    let auth = state.auth.read().unwrap().clone();
+    let share = state.process_map.read().unwrap().share_now_playing;
+    crate::pause::set_paused(&state.current_session, &state.active_ledger_id, &state.store(), &auth, share, &ledger_id, !paused)?;
+    frontend.changed();
+    Ok(!paused)
+}
+
 /// "Stop Tracking Current Session": ends the tracked session now (the user is usually
 /// correcting a wrong game) and asks what to do with the time. The process keeps running, so
 /// re-tracking it is blocked until it really exits. Returns whether anything was stopped.
 pub fn force_stop(state: &EngineState, frontend: &FrontendRef) -> bool {
     let session_info = {
         let sess = state.current_session.read().unwrap();
-        sess.as_ref().map(|s| (s.process_name.clone(), s.mapping.clone(), s.started_at.elapsed().as_secs_f64()))
+        sess.as_ref().map(|s| (s.process_name.clone(), s.mapping.clone(), s.active_elapsed().as_secs_f64()))
     };
     let Some((process_name, mapping, duration_secs)) = session_info else { return false };
     *state.force_stopped_process.write().unwrap() = Some(process_name.clone());

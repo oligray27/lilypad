@@ -169,13 +169,13 @@ pub fn recover_on_startup(
         // time since the original start is still accurate here.
         let duration_so_far = SystemTime::now().duration_since(saved_wall).unwrap_or_default();
         let started_at = Instant::now().checked_sub(duration_so_far).unwrap_or_else(Instant::now);
-        *current_session.write().unwrap() = Some(ActiveSession {
-            process_name: persisted.process.clone(),
-            mapping: mapping.clone(),
+        *current_session.write().unwrap() = Some(ActiveSession::new(
+            persisted.process.clone(),
+            mapping.clone(),
             pid,
-            started_at_secs: crate::monitor::process_start_time(pid),
+            crate::monitor::process_start_time(pid),
             started_at,
-        });
+        ));
 
         let started_at_iso = chrono::DateTime::<chrono::Utc>::from(saved_wall).to_rfc3339();
         on_restored(mapping.clone(), started_at_iso);

@@ -38,8 +38,10 @@ const TRAY_ICON: tauri::image::Image<'_> = tauri::include_image!("icons/icon.ico
 /// Tray icon shown while a game session is active.
 const TRAY_ICON_NOWPLAYING: tauri::image::Image<'_> = tauri::include_image!("icons/icon_nowplaying.ico");
 
-// Configure's height; keep in step with main.js's VIEW_SIZE.mappingsView.
-const DEFAULT_HEIGHT: f64 = 810.0;
+// Configure's size; keep in step with main.js's VIEW_SIZE.mappingsView. Wider than the other
+// views so its settings checkboxes fit in two columns.
+const DEFAULT_HEIGHT: f64 = 740.0;
+const CONFIGURE_WIDTH: f64 = 880.0;
 const MAIN_ABOUT_HEIGHT: f64 = 335.0;
 const WINDOW_WIDTH: f64 = 642.0;
 const SESSION_WIDTH: f64 = 440.0;
@@ -646,6 +648,8 @@ fn queue_failed_submission(
         ended_at_secs: Some(ledger_session::now_secs()),
         recovered: false,
         submission: Some(submission),
+        paused_secs: 0,
+        paused_at_secs: None,
     };
     log::warn!(
         "[LilyPad] a submission failed with no session record behind it; queueing it as {}",
@@ -824,15 +828,19 @@ fn resume_recovered_session(
     );
 
     let state = app.state::<AppState>();
-    *state.current_session_arc.write().unwrap() = Some(ActiveSession {
-        process_name: record.process.executable.clone(),
-        mapping: mapping.clone(),
-        pid,
-        // Carried from the original record rather than re-read: this is the same process
-        // instance, and `find_original_process` has just confirmed its start time matches.
-        started_at_secs: record.process.started_at_secs,
-        started_at,
+    // The OS start time is carried from the original record rather than re-read: this is the
+    // same process instance, and `find_original_process` has just confirmed it matches.
+    let mut session = ActiveSession::new(
+        record.process.executable.clone(), mapping.clone(), pid, record.process.started_at_secs, started_at,
+    );
+    // Paused (from FrogLog) when LilyPad stopped: still paused, since the record still holds the
+    // open pause. Mirrors lilypad_core::engine::flow's resume.
+    session.paused_total = Duration::from_secs(record.paused_secs);
+    session.paused_at = record.paused_at_secs.map(|p| {
+        let paused_for = Duration::from_secs(ledger_session::now_secs().saturating_sub(p));
+        Instant::now().checked_sub(paused_for).unwrap_or_else(Instant::now)
     });
+    *state.current_session_arc.write().unwrap() = Some(session);
     state.active_ledger_id.set(&record.process.executable, Some(record.id.clone()));
     let _ = update_tray_state(app);
 
@@ -865,9 +873,12 @@ fn resume_recovered_session(
         // callback -- which is what normally clears this -- therefore never fires.
         let was_force_stopped = take_force_stop(&state, &process_name);
 
-        match complete_session(&state, &session_id, ledger_session::now_secs()) {
+        let ended_at = ledger_session::now_secs();
+        match complete_session(&state, &session_id, ended_at) {
             Completion::Owned(ledger_id) => {
-                handle_session_ended(app.clone(), process_name, mapping, duration_secs, ledger_id)
+                // Completing closed any pause, so this is the final paused total.
+                let paused = state.store().paused_secs(&session_id, ended_at) as f64;
+                handle_session_ended(app.clone(), process_name, mapping, (duration_secs - paused).max(0.0), ledger_id)
             }
             // Already completed elsewhere -- a force-stop, which has shown its own post-play
             // popup and may already have submitted. A second end event here would prompt again
@@ -934,6 +945,9 @@ fn start_session_heartbeat(
     let auth = state.auth.read().unwrap().clone();
     let process_map = Arc::clone(&state.process_map_arc);
     let current_session = Arc::clone(&state.current_session_arc);
+    // Moves the reported start past any pauses, and sends `paused_at` while paused so Online
+    // Now's "playing for" stands still.
+    let presence_start = ledger_session::presence_start(Arc::clone(&current_session), process_name.clone(), started_at_iso);
     let app = app.clone();
     ledger_session::spawn_ledger_heartbeat(
         ledger,
@@ -941,7 +955,7 @@ fn start_session_heartbeat(
         move || api_client(&auth).unwrap_or_else(|| FroglogClient::new(String::new())),
         process_map,
         Some(mapping),
-        started_at_iso,
+        presence_start,
         move || {
             current_session
                 .read()
@@ -966,7 +980,7 @@ fn start_unmapped_heartbeat(app: &tauri::AppHandle, session_id: String, exe_name
         move || api_client(&auth).unwrap_or_else(|| FroglogClient::new(String::new())),
         process_map,
         None,
-        String::new(),
+        || None,
         // Unused while a record exists: the ledger's own state is the stop condition. Kept
         // truthful rather than a bare `true` so it cannot mislead if that ever changes.
         move || !exe_name.is_empty(),
@@ -1415,6 +1429,8 @@ fn handle_session_ended(
     duration_secs: f64,
     ledger_id: Option<String>,
 ) {
+    // Nothing is being tracked any more (normal end, recovery): FrogLog's bar drops it.
+    lilypad_core::remote::state_changed();
     tauri::async_runtime::spawn(async move {
         let state = app.state::<AppState>();
         let auto_submit = {
@@ -1681,17 +1697,27 @@ fn build_tray_menu(app: &tauri::AppHandle, logged_in: bool, game_label: Option<S
     // the active session's wait-thread holds its own clone of the ProcessMapping, and the
     // monitor skips all start-detection while current_session is occupied, so mapping edits,
     // library refreshes, and rescans can only affect *future* sessions, never the live one.
+    let paused = app
+        .state::<AppState>()
+        .current_session_arc
+        .read()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|s| s.is_paused());
     let tracking_items = if let Some(ref label) = game_label {
         Some((
             MenuItemBuilder::with_id("tracking_status", format!("Now Tracking: {}", label))
                 .enabled(false)
                 .build(app)?,
+            // Paused time isn't logged as play (lilypad_core::pause); the same pause FrogLog's
+            // Quick Session bar can set with remote control on.
+            MenuItemBuilder::with_id("toggle_pause_tracking", if paused { "Resume Tracking" } else { "Pause Tracking" }).build(app)?,
             MenuItemBuilder::with_id("force_stop_tracking", "Stop Tracking Current Session").build(app)?,
         ))
     } else {
         None
     };
-    *TRACKING_STATUS_ITEM.lock().unwrap() = tracking_items.as_ref().map(|(status, _)| status.clone());
+    *TRACKING_STATUS_ITEM.lock().unwrap() = tracking_items.as_ref().map(|(status, _, _)| status.clone());
     // Shown whether or not anyone is logged in, just above About (lilypad_core::updates).
     let update_item = match lilypad_core::updates::available() {
         Some(update) => Some(
@@ -1716,8 +1742,9 @@ fn build_tray_menu(app: &tauri::AppHandle, logged_in: bool, game_label: Option<S
             None
         };
         let mut items: Vec<&dyn IsMenuItem<Wry>> = Vec::new();
-        if let Some((ref status_item, ref force_stop_item)) = tracking_items {
+        if let Some((ref status_item, ref pause_item, ref force_stop_item)) = tracking_items {
             items.push(status_item);
+            items.push(pause_item);
             items.push(force_stop_item);
         }
         items.push(&assign_exes_item);
@@ -1735,9 +1762,9 @@ fn build_tray_menu(app: &tauri::AppHandle, logged_in: bool, game_label: Option<S
         items.push(&quit_item);
         let menu = Menu::with_items(app, &items)?;
         Ok(menu)
-    } else if let Some((ref status_item, ref force_stop_item)) = tracking_items {
+    } else if let Some((ref status_item, ref pause_item, ref force_stop_item)) = tracking_items {
         // Tracking without a login shouldn't happen, but keep the session controls reachable.
-        let menu = Menu::with_items(app, &[status_item, force_stop_item, &quit_item])?;
+        let menu = Menu::with_items(app, &[status_item, pause_item, force_stop_item, &quit_item])?;
         Ok(menu)
     } else {
         let login_item = MenuItemBuilder::with_id("login", "Login").build(app)?;
@@ -2518,6 +2545,87 @@ fn save_unmapped_detection(state: tauri::State<AppState>, disabled: bool) -> Res
     Ok(())
 }
 
+/// "Enable remote control from FrogLog" (see lilypad_core::remote): pause/resume from the site.
+#[tauri::command]
+fn save_remote_control(state: tauri::State<AppState>, enabled: bool) -> Result<(), String> {
+    let mut map = state.process_map_arc.read().unwrap().clone();
+    map.remote_control = enabled;
+    map.save_to(&process_map_path_for_auth(&state.auth.read().unwrap()))
+        .map_err(|e| e.to_string())?;
+    *state.process_map_arc.write().unwrap() = map;
+    // Registers with FrogLog (or unregisters) straight away rather than on the next re-check.
+    lilypad_core::remote::state_changed();
+    Ok(())
+}
+
+/// The name shown for this install in FrogLog's Quick Session bar ("Tracked by LilyPad on ..."),
+/// and the computer's own name to suggest when it's blank. Per install, not per account.
+#[tauri::command]
+fn get_device_name() -> serde_json::Value {
+    serde_json::json!({
+        "name": lilypad_core::remote::device_name(),
+        "computerName": lilypad_core::remote::computer_name(),
+    })
+}
+
+#[tauri::command]
+fn save_device_name(name: String) -> Result<(), String> {
+    lilypad_core::remote::set_device_name(&name)
+}
+
+/// What lilypad_core::remote needs from this app: the tracked session, and pausing it.
+struct TauriRemote {
+    app: tauri::AppHandle,
+}
+
+impl TauriRemote {
+    fn set_paused(&self, ledger_id: &str, paused: bool) -> Result<(), String> {
+        let state = self.app.state::<AppState>();
+        let auth = state.auth.read().unwrap().clone();
+        let share = state.process_map_arc.read().unwrap().share_now_playing;
+        lilypad_core::pause::set_paused(
+            &state.current_session_arc, &state.active_ledger_id, &state.store(),
+            &auth, share, ledger_id, paused,
+        )?;
+        // The tray's "Now Tracking" label says when it's paused.
+        let app = self.app.clone();
+        let _ = self.app.run_on_main_thread(move || {
+            let _ = update_tray_state(&app);
+        });
+        Ok(())
+    }
+}
+
+impl lilypad_core::remote::RemoteHost for TauriRemote {
+    fn auth(&self) -> AuthConfig {
+        self.app.state::<AppState>().auth.read().unwrap().clone()
+    }
+
+    fn enabled(&self) -> bool {
+        let state = self.app.state::<AppState>();
+        let logged_in = state.auth.read().unwrap().token.is_some();
+        logged_in && state.process_map_arc.read().unwrap().remote_control
+    }
+
+    fn platform(&self) -> &'static str {
+        "windows"
+    }
+
+    fn state(&self) -> lilypad_core::remote::RemoteState {
+        let state = self.app.state::<AppState>();
+        let session = state.current_session_arc.read().unwrap();
+        lilypad_core::remote::RemoteState::of(session.as_ref(), state.active_ledger_id.current())
+    }
+
+    fn pause(&self, ledger_id: &str) -> Result<(), String> {
+        self.set_paused(ledger_id, true)
+    }
+
+    fn resume(&self, ledger_id: &str) -> Result<(), String> {
+        self.set_paused(ledger_id, false)
+    }
+}
+
 #[tauri::command]
 fn save_now_playing_share(state: tauri::State<AppState>, share: bool) -> Result<(), String> {
     let mut map = state.process_map_arc.read().unwrap().clone();
@@ -2777,6 +2885,9 @@ pub fn run() {
             delete_process_mapping,
             save_auto_submit,
             save_now_playing_share,
+            save_remote_control,
+            get_device_name,
+            save_device_name,
             save_unmapped_detection,
             hide_window,
             set_window_size,
@@ -2833,7 +2944,7 @@ pub fn run() {
                         }
                     } else if id == "assign_exes" {
                         if let Some(w) = app.get_webview_window("main") {
-                            show_window_at_height(&w, WINDOW_WIDTH, DEFAULT_HEIGHT);
+                            show_window_at_height(&w, CONFIGURE_WIDTH, DEFAULT_HEIGHT);
                             let _ = w.emit("open-mappings", ());
                         }
                     } else if id == "about" {
@@ -2880,12 +2991,26 @@ pub fn run() {
                             show_window_at_height(&w, WINDOW_WIDTH, 500.0);
                             let _ = w.emit("show-new-games", ());
                         }
+                    } else if id == "toggle_pause_tracking" {
+                        let state = app.state::<AppState>();
+                        let paused = state.current_session_arc.read().unwrap().as_ref().is_some_and(|s| s.is_paused());
+                        match state.active_ledger_id.current() {
+                            // Same path as a pause from FrogLog: saved on the record, presence
+                            // updated, FrogLog's bar told, tray refreshed.
+                            Some(ledger_id) => {
+                                if let Err(e) = (TauriRemote { app: app.clone() }).set_paused(&ledger_id, !paused) {
+                                    log::warn!("[LilyPad] could not {} tracking: {e}", if paused { "resume" } else { "pause" });
+                                }
+                            }
+                            None => log::warn!("[LilyPad] this session has no stored record, so it can't be paused"),
+                        }
                     } else if id == "force_stop_tracking" {
                         let state = app.state::<AppState>();
                         // Grab session info before clearing so we can submit it
                         let session_info = {
                             let sess = state.current_session_arc.read().unwrap();
-                            sess.as_ref().map(|s| (s.process_name.clone(), s.mapping.clone(), s.started_at.elapsed().as_secs_f64()))
+                            // Play time: a pause from FrogLog isn't counted.
+                            sess.as_ref().map(|s| (s.process_name.clone(), s.mapping.clone(), s.active_elapsed().as_secs_f64()))
                         };
                         if let Some((process_name, mapping, duration_secs)) = session_info {
                             // Block re-tracking until the process actually exits
@@ -2897,6 +3022,7 @@ pub fn run() {
                             // same process (which arrives later, when the process really does
                             // exit) cannot complete it a second time.
                             let ledger_id = finish_ledger_session(&state, ledger_session::now_secs());
+                            lilypad_core::remote::state_changed();
                             // Always show the popup (never auto-submit on force stop —
                             // user is likely correcting a bad mapping)
                             let auth = state.auth.read().unwrap().clone();
@@ -2934,6 +3060,9 @@ pub fn run() {
                 .build(app)?;
             tick_session_length(handle.clone());
             watch_for_updates(handle.clone());
+            // Pause/Resume from FrogLog, when "Enable remote control from FrogLog" is on (idles
+            // otherwise). Windows runs one LilyPad per session (the single-instance mutex above).
+            lilypad_core::remote::start(Arc::new(TauriRemote { app: handle.clone() }));
 
             // Show login window on first launch (no saved credentials)
             if !logged_in {
@@ -3053,6 +3182,8 @@ pub fn run() {
                             mapping_hb,
                             started_at_iso_hb,
                         );
+                        // FrogLog's Quick Session bar can show (and pause) it, with remote control on.
+                        lilypad_core::remote::state_changed();
                         // Update tray to now-tracking state
                         let handle_tray = handle.clone();
                         let _ = handle.run_on_main_thread(move || {
@@ -3082,15 +3213,22 @@ pub fn run() {
                             // active was ended by someone else (the force-stop above, or a
                             // second waiter for the same process), and emitting again would
                             // show a duplicate popup and log a duplicate session.
+                            let ended_at = ledger_session::now_secs();
                             let completion = match active_id {
-                                Some(id) => complete_session(&state, &id, ledger_session::now_secs()),
+                                Some(id) => complete_session(&state, &id, ended_at),
                                 None => Completion::Owned(None),
                             };
+                            lilypad_core::remote::state_changed();
                             match completion {
                                 _ if was_force_stopped => {}
-                                Completion::Owned(ledger_id) => handle_session_ended(
-                                    app_handle.clone(), process_name, mapping, duration_secs, ledger_id,
-                                ),
+                                Completion::Owned(ledger_id) => {
+                                    // The monitor's duration is wall-clock; paused time comes off
+                                    // it here, from the record (completing it closed any pause).
+                                    let paused = ledger_id.as_deref().map_or(0, |id| state.store().paused_secs(id, ended_at));
+                                    handle_session_ended(
+                                        app_handle.clone(), process_name, mapping, (duration_secs - paused as f64).max(0.0), ledger_id,
+                                    )
+                                }
                                 Completion::Stale => log::info!(
                                     "[LilyPad] session for {process_name} was already completed; \
                                      not emitting a second end event"

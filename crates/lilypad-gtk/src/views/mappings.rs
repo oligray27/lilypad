@@ -115,13 +115,44 @@ pub fn build(
     let share_now_playing = gtk4::CheckButton::with_label("Enable online presence on FrogLog");
     let detect_unmapped = gtk4::CheckButton::with_label("Detect games not in your FrogLog library");
     let check_updates = gtk4::CheckButton::with_label("Check for LilyPad updates automatically");
+    let remote_control = gtk4::CheckButton::with_label("Enable remote control from FrogLog");
     toggles_grid.attach(&auto_regular, 0, 0, 1, 1);
     toggles_grid.attach(&auto_session, 1, 0, 1, 1);
     toggles_grid.attach(&auto_live, 0, 1, 1, 1);
     toggles_grid.attach(&share_now_playing, 1, 1, 1, 1);
     toggles_grid.attach(&detect_unmapped, 0, 2, 1, 1);
     toggles_grid.attach(&check_updates, 1, 2, 1, 1);
+    toggles_grid.attach(&remote_control, 0, 3, 1, 1);
     container.append(&toggles_grid);
+
+    // The name FrogLog's Quick Session bar shows for this install ("Tracked by LilyPad on ...").
+    // Per install (lilypad_core::remote's device.json, shared with Gaming Mode), not per account.
+    // Saved on Enter or leaving the field, not on every keystroke.
+    let device_name_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    device_name_row.append(&gtk4::Label::new(Some("Device name")));
+    let device_name = gtk4::Entry::new();
+    device_name.set_max_length(40);
+    device_name.set_width_chars(24);
+    device_name.set_placeholder_text(Some(&lilypad_core::remote::computer_name()));
+    device_name.set_text(&lilypad_core::remote::device_name().unwrap_or_default());
+    device_name_row.append(&device_name);
+    container.append(&device_name_row);
+    {
+        let save = |entry: &gtk4::Entry| {
+            let text = entry.text();
+            if text.trim() == lilypad_core::remote::device_name().unwrap_or_default() {
+                return;
+            }
+            if let Err(e) = lilypad_core::remote::set_device_name(&text) {
+                log::warn!("[LilyPad] {e}");
+            }
+        };
+        device_name.connect_activate(save);
+        let focus = gtk4::EventControllerFocus::new();
+        let entry = device_name.clone();
+        focus.connect_leave(move |_| save(&entry));
+        device_name.add_controller(focus);
+    }
     check_updates.set_active(lilypad_core::updates::checks_enabled());
 
     // App-wide, not per account like the toggles below: lilypad_core::updates' own setting file,
@@ -152,16 +183,18 @@ pub fn build(
         auto_live.set_active(cfg.auto_submit_live);
         share_now_playing.set_active(cfg.share_now_playing);
         detect_unmapped.set_active(!cfg.disable_unmapped_game_detection);
+        remote_control.set_active(cfg.remote_control);
     }
 
     // Auto-submit / presence toggles persist immediately (not staged), same as the Tauri build.
     type Setter = fn(&mut lilypad_core::config::ProcessMapConfig, bool);
-    let toggle_setters: [(&gtk4::CheckButton, Setter); 5] = [
+    let toggle_setters: [(&gtk4::CheckButton, Setter); 6] = [
         (&auto_regular, |c, v| c.auto_submit_regular = v),
         (&auto_session, |c, v| c.auto_submit_session = v),
         (&auto_live, |c, v| c.auto_submit_live = v),
         (&share_now_playing, |c, v| c.share_now_playing = v),
         (&detect_unmapped, |c, v| c.disable_unmapped_game_detection = !v),
+        (&remote_control, |c, v| c.remote_control = v),
     ];
     for (check, setter) in toggle_setters {
         let state = state.clone();
@@ -172,6 +205,10 @@ pub fn build(
             let _ = cfg.save_to(&process_map_path_for_auth(&state.auth.read().unwrap()));
         });
     }
+
+    // Registers this install with FrogLog's remote control (or unregisters it) straight away,
+    // rather than on lilypad_core::remote's next re-check. Runs after the setter above has saved.
+    remote_control.connect_toggled(|_| lilypad_core::remote::state_changed());
 
     // share_now_playing additionally needs to notify the FrogLog API (fire-and-forget).
     {
@@ -501,6 +538,8 @@ pub fn build(
         let share_now_playing = share_now_playing.clone();
         let detect_unmapped = detect_unmapped.clone();
         let check_updates = check_updates.clone();
+        let remote_control = remote_control.clone();
+        let device_name = device_name.clone();
         let new_games_notice_label = new_games_notice_label.clone();
         let new_games_notice_link = new_games_notice_link.clone();
         let pending_notice_label = pending_notice_label.clone();
@@ -514,6 +553,12 @@ pub fn build(
                 share_now_playing.set_active(cfg.share_now_playing);
                 detect_unmapped.set_active(!cfg.disable_unmapped_game_detection);
             }
+            // Read, then set once the lock is released: a changed value fires the toggle handler,
+            // which takes the write lock.
+            let remote = state.process_map.read().unwrap().remote_control;
+            remote_control.set_active(remote);
+            // May have been changed from Gaming Mode, which shares it.
+            device_name.set_text(&lilypad_core::remote::device_name().unwrap_or_default());
             check_updates.set_active(lilypad_core::updates::checks_enabled());
 
             let account = state.account();

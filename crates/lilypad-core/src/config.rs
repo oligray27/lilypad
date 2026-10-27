@@ -68,6 +68,11 @@ pub struct ProcessMapConfig {
     // fields, so existing config files carrying these keys still load; the keys are ignored.
     #[serde(default)]
     pub share_now_playing: bool,
+    /// "Enable remote control from FrogLog": LilyPad reports what it's tracking to FrogLog
+    /// privately and takes Pause/Resume/Stop/Submit/Discard from the site's Quick Session bar
+    /// (see `remote`). Off by default; per account, like the other settings here.
+    #[serde(default)]
+    pub remote_control: bool,
     /// When true, LilyPad never scans unmapped processes against installed Steam games /
     /// the FrogLog library (see `monitor::maybe_start_unmapped_tracking`). Defaults to false
     /// (feature enabled) so existing configs opt in without a migration.

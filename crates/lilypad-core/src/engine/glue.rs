@@ -107,7 +107,7 @@ fn begin_unmapped(state: &EngineState, start: &UnmappedSessionStart) {
         move || client_for(&auth),
         state.process_map.clone(),
         None,
-        String::new(),
+        || None,
         || true,
         move |e| error_store.report_error(e),
     );
@@ -167,6 +167,10 @@ pub fn start(state: &EngineState, tx: mpsc::Sender<MonitorEvent>) {
         },
         move |process_name, mapping, duration_secs| {
             let Some(ledger_id) = finish_session(&state_for_end, &process_name) else { return };
+            // The monitor's duration is wall-clock; paused time comes off it here, from the
+            // record (completing it closed any pause still running).
+            let paused = ledger_id.as_deref().map_or(0, |id| state_for_end.store().paused_secs(id, now_secs()));
+            let duration_secs = (duration_secs - paused as f64).max(0.0);
             let _ = tx_ended.send(MonitorEvent::SessionEnded { process_name, mapping, duration_secs, ledger_id });
         },
         state.installed_games.clone(),

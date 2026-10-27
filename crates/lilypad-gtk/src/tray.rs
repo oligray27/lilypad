@@ -36,6 +36,8 @@ pub enum TrayAction {
     ShowPending,
     ShowNewGames,
     Logout,
+    /// Pause the tracked session, or resume it if paused.
+    TogglePauseTracking,
     ForceStopTracking,
     /// Opens the newer release found by `lilypad_core::updates` (its release page).
     OpenUpdate,
@@ -125,6 +127,14 @@ impl ksni::Tray for LilypadTray {
                     label: format!("Now Tracking: {title}"),
                     enabled: false,
                     activate: Box::new(|_: &mut Self| {}),
+                    ..Default::default()
+                }
+                .into(),
+            );
+            items.push(
+                StandardItem {
+                    label: if self.state.now_tracking_paused() { "Resume Tracking" } else { "Pause Tracking" }.into(),
+                    activate: Box::new(|t: &mut Self| t.send(TrayAction::TogglePauseTracking)),
                     ..Default::default()
                 }
                 .into(),

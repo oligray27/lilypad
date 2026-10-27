@@ -108,6 +108,14 @@ pub struct SessionRecord {
     /// session is still active. Defaults to absent for records written before this field.
     #[serde(default)]
     pub submission: Option<Submission>,
+    /// Time spent in pauses that have ended (Pause in the tray, or from the FrogLog site with
+    /// remote control on). Paused time is never logged as play. Zero for older records.
+    #[serde(default)]
+    pub paused_secs: u64,
+    /// When the pause still running began, if the session is paused right now. `finish` closes
+    /// it, so a completed record never has one.
+    #[serde(default)]
+    pub paused_at_secs: Option<u64>,
 }
 
 impl SessionRecord {
@@ -127,7 +135,15 @@ impl SessionRecord {
             ended_at_secs: None,
             recovered: false,
             submission: None,
+            paused_secs: 0,
+            paused_at_secs: None,
         }
+    }
+
+    /// Total time paused as of `at`: earlier pauses plus the one still running, if any. Every
+    /// duration worked out from this record's timestamps subtracts this.
+    pub fn paused_secs_at(&self, at: u64) -> u64 {
+        self.paused_secs + self.paused_at_secs.map_or(0, |p| at.saturating_sub(p))
     }
 }
 
@@ -635,6 +651,46 @@ impl SessionLedger {
         self.update_active(id, ended_at, true)
     }
 
+    /// Starts a pause on an active session. `false` when it isn't active or is already paused.
+    pub fn pause(&mut self, id: &str, at: u64) -> LedgerResult<bool> {
+        self.edit_active(id, |record| {
+            if record.paused_at_secs.is_some() {
+                return false;
+            }
+            record.paused_at_secs = Some(at.max(record.started_at_secs.unwrap_or(0)));
+            true
+        })
+    }
+
+    /// Ends a running pause, adding its length to the record's paused total. `false` when the
+    /// session isn't active or isn't paused.
+    pub fn resume(&mut self, id: &str, at: u64) -> LedgerResult<bool> {
+        self.edit_active(id, |record| {
+            let Some(paused_at) = record.paused_at_secs.take() else { return false };
+            record.paused_secs += at.saturating_sub(paused_at);
+            true
+        })
+    }
+
+    /// Applies `edit` to an active record in one transaction, writing it back only when `edit`
+    /// says it changed something.
+    fn edit_active(&mut self, id: &str, edit: impl FnOnce(&mut SessionRecord) -> bool) -> LedgerResult<bool> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let json: Option<String> = tx
+            .query_row("SELECT record FROM sessions WHERE id=?1 AND state='active'", [id], |r| r.get(0))
+            .optional()?;
+        let Some(json) = json else { return Ok(false) };
+        let mut record: SessionRecord = serde_json::from_str(&json)?;
+        if !edit(&mut record) {
+            return Ok(false);
+        }
+        tx.execute("UPDATE sessions SET record=?2 WHERE id=?1", params![id, serde_json::to_string(&record)?])?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     fn update_active(&mut self, id: &str, at: u64, finish: bool) -> LedgerResult<bool> {
         let tx = self
             .connection
@@ -656,6 +712,11 @@ impl SessionLedger {
         record.last_alive_secs = Some(at);
         if finish {
             record.ended_at_secs = Some(at);
+            // A session that ends while paused ends its pause too, so the record's paused total
+            // is final and nothing reading it later has to know about an open pause.
+            if let Some(paused_at) = record.paused_at_secs.take() {
+                record.paused_secs += at.saturating_sub(paused_at);
+            }
         }
         tx.execute(
             "UPDATE sessions SET record=?2,state=?3 WHERE id=?1",
@@ -772,7 +833,7 @@ fn pending_session_from_record(record: &SessionRecord) -> LedgerResult<PendingSe
     Ok(PendingSession {
         id: record.id.clone(), game_id: mapping.froglog_id, game_type: mapping.r#type.clone(),
         title: mapping.title.clone().unwrap_or_else(|| mapping.process.clone()),
-        hours: ((end.saturating_sub(start) as f64 / 3600.0 * 100.0).round() / 100.0).max(0.01),
+        hours: ((end.saturating_sub(start).saturating_sub(record.paused_secs_at(end)) as f64 / 3600.0 * 100.0).round() / 100.0).max(0.01),
         date, notes: None, spoiler: false, is_public: true, failed_at: String::new(),
         error: "Never submitted (LilyPad stopped before it could be sent)".into(),
     })
@@ -854,6 +915,8 @@ fn accumulate_new_game(
                 ended_at_secs: Some(now),
                 recovered: false,
                 submission: None,
+                paused_secs: 0,
+                paused_at_secs: None,
             };
             tx.execute(
                 "INSERT INTO sessions(id,record,state) VALUES (?1,?2,?3)",
@@ -911,6 +974,8 @@ fn legacy_records(
         ended_at_secs: None,
         recovered: true,
         submission: None,
+        paused_secs: 0,
+        paused_at_secs: None,
     };
     Ok(match filename {
         LEGACY_ACTIVE_SESSION => {

@@ -131,8 +131,11 @@ a:hover { text-decoration: underline; }
 .mappings-switch button.active { background: var(--switch-active-bg); color: var(--switch-active-text); border-color: var(--switch-active-bg); z-index: 1; }
 .mappings-switch-row-end { display: flex; gap: 0.5rem; }
 .mappings-watched-dirs-btn { margin: 0; padding: 0 0.8rem; font-size: 0.85rem; white-space: nowrap; height: 2.25rem; box-sizing: border-box; display: inline-flex; align-items: center; justify-content: center; }
+.mappings-settings-grid { display: grid; grid-template-columns: 1fr 1fr; column-gap: 1.5rem; }
 .mappings-auto-submit-label { display: flex; align-items: center; gap: 0.4rem; margin-top: 0.5rem; font-size: 0.9rem; cursor: pointer; width: fit-content; }
 .mappings-auto-submit-label input { width: auto; margin: 0; }
+.mappings-device-name { cursor: default; }
+.mappings-device-name input { width: 12rem; padding: 0.2rem 0.4rem; }
 /* Non-Steam Games view */
 #watchedDirsView { width: 100%; max-width: none; display: flex; flex-direction: column; height: calc(100vh - 2rem); }
 #watchedDirsView .mappings-footer { padding-top: 0.5rem; }
