@@ -727,15 +727,15 @@ async function loadMappingsView() {
     if (shareNowEl) shareNowEl.checked = !!mc.share_now_playing;
     const remoteControlEl = $('remoteControl');
     if (remoteControlEl) remoteControlEl.checked = !!mc.remote_control;
+    const deviceNameEl = $('deviceName');
+    if (deviceNameEl) deviceNameEl.value = mc.device_name || '';
     const detectUnmappedEl = $('detectUnmappedGames');
     if (detectUnmappedEl) detectUnmappedEl.checked = !mc.disable_unmapped_game_detection;
   }).catch(() => {});
-  // App-wide (device.json), not per account like the settings above.
-  invoke('get_device_name').then((d) => {
+  // The suggestion shown while "Device name" is blank.
+  invoke('get_computer_name').then((name) => {
     const el = $('deviceName');
-    if (!el) return;
-    el.value = d.name || '';
-    el.placeholder = d.computerName || '';
+    if (el) el.placeholder = name || '';
   }).catch(() => {});
   // App-wide, not per account (unlike the settings above): its own file, also written by the
   // installer's "Automatically check for updates?" question.
@@ -822,6 +822,8 @@ async function loadMappingsView() {
     }
     const remoteControlEl = $('remoteControl');
     if (remoteControlEl) remoteControlEl.checked = !!mapConfigAfter.remote_control;
+    const deviceNameEl = $('deviceName');
+    if (deviceNameEl) deviceNameEl.value = mapConfigAfter.device_name || '';
     const detectUnmappedEl = $('detectUnmappedGames');
     if (detectUnmappedEl) detectUnmappedEl.checked = !mapConfigAfter.disable_unmapped_game_detection;
     tableWrap.hidden = false;
