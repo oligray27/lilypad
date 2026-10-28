@@ -33,6 +33,7 @@ VERIFY='
   test -f /usr/share/applications/uk.co.froglog.lilypad.desktop
   test -f /usr/share/icons/hicolor/128x128/apps/uk.co.froglog.lilypad.png
   test -f /usr/share/icons/hicolor/128x128/apps/uk.co.froglog.lilypad-tracking.png
+  test -f /usr/share/icons/hicolor/128x128/apps/uk.co.froglog.lilypad-paused.png
 '
 
 DEB_INSTALL='export DEBIAN_FRONTEND=noninteractive; apt-get -qq update >/dev/null'

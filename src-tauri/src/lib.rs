@@ -37,6 +37,8 @@ use tauri_plugin_opener::OpenerExt;
 const TRAY_ICON: tauri::image::Image<'_> = tauri::include_image!("icons/icon.ico");
 /// Tray icon shown while a game session is active.
 const TRAY_ICON_NOWPLAYING: tauri::image::Image<'_> = tauri::include_image!("icons/icon_nowplaying.ico");
+/// Tray icon shown while the active session is paused.
+const TRAY_ICON_PAUSED: tauri::image::Image<'_> = tauri::include_image!("icons/icon_paused.ico");
 
 // Configure's size; keep in step with main.js's VIEW_SIZE.mappingsView. Wider than the other
 // views so its settings checkboxes fit in two columns.
@@ -1783,12 +1785,16 @@ fn build_tray_menu(app: &tauri::AppHandle, logged_in: bool, game_label: Option<S
 fn update_tray_state(app: &tauri::AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
     let logged_in = state.auth.read().unwrap().token.is_some();
-    let game_label = state.current_session_arc.read().unwrap().as_ref().map(ActiveSession::label);
+    let (game_label, paused) = match state.current_session_arc.read().unwrap().as_ref() {
+        Some(session) => (Some(session.label()), session.is_paused()),
+        None => (None, false),
+    };
     let menu = build_tray_menu(app, logged_in, game_label.clone()).map_err(|e| e.to_string())?;
     if let Some(tray) = app.tray_by_id("main") {
         tray.set_menu(Some(menu)).map_err(|e| e.to_string())?;
         if let Some(ref label) = game_label {
-            let _ = tray.set_icon(Some(TRAY_ICON_NOWPLAYING.clone()));
+            let icon = if paused { &TRAY_ICON_PAUSED } else { &TRAY_ICON_NOWPLAYING };
+            let _ = tray.set_icon(Some(icon.clone()));
             let _ = tray.set_tooltip(Some(format!("LilyPad - Now Tracking: {}", label)));
         } else {
             let _ = tray.set_icon(Some(TRAY_ICON.clone()));

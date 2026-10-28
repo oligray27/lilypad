@@ -43,6 +43,7 @@ assets = [
     ["data/uk.co.froglog.lilypad.desktop", "usr/share/applications/", "644"],
     ["../../src-tauri/icons/128x128.png", "usr/share/icons/hicolor/128x128/apps/uk.co.froglog.lilypad.png", "644"],
     ["../../src-tauri/icons/128x128_nowplaying.png", "usr/share/icons/hicolor/128x128/apps/uk.co.froglog.lilypad-tracking.png", "644"],
+    ["../../src-tauri/icons/128x128_paused.png", "usr/share/icons/hicolor/128x128/apps/uk.co.froglog.lilypad-paused.png", "644"],
 ]
 
 [package.metadata.generate-rpm]
@@ -51,6 +52,7 @@ assets = [
     { source = "data/uk.co.froglog.lilypad.desktop", dest = "/usr/share/applications/uk.co.froglog.lilypad.desktop", mode = "644" },
     { source = "../../src-tauri/icons/128x128.png", dest = "/usr/share/icons/hicolor/128x128/apps/uk.co.froglog.lilypad.png", mode = "644" },
     { source = "../../src-tauri/icons/128x128_nowplaying.png", dest = "/usr/share/icons/hicolor/128x128/apps/uk.co.froglog.lilypad-tracking.png", mode = "644" },
+    { source = "../../src-tauri/icons/128x128_paused.png", dest = "/usr/share/icons/hicolor/128x128/apps/uk.co.froglog.lilypad-paused.png", mode = "644" },
 ]
 # Refresh the icon/desktop-file caches so the taskbar/app-grid icon shows up
 # without requiring a logout — mirrors debian/postinst+postrm for the .deb.

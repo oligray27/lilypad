@@ -98,6 +98,7 @@ cp target/release/lilypad-gtk "$APPDIR/usr/bin/"
 cp "$CRATE/data/uk.co.froglog.lilypad.desktop" "$APPDIR/usr/share/applications/"
 cp src-tauri/icons/128x128.png "$APPDIR/usr/share/icons/hicolor/128x128/apps/uk.co.froglog.lilypad.png"
 cp src-tauri/icons/128x128_nowplaying.png "$APPDIR/usr/share/icons/hicolor/128x128/apps/uk.co.froglog.lilypad-tracking.png"
+cp src-tauri/icons/128x128_paused.png "$APPDIR/usr/share/icons/hicolor/128x128/apps/uk.co.froglog.lilypad-paused.png"
 
 (
   cd "$OUT"

@@ -79,7 +79,9 @@ impl ksni::Tray for LilypadTray {
     }
 
     fn icon_name(&self) -> String {
-        if self.state.now_tracking_title().is_some() {
+        if self.state.now_tracking_paused() {
+            "uk.co.froglog.lilypad-paused".into()
+        } else if self.state.now_tracking_title().is_some() {
             "uk.co.froglog.lilypad-tracking".into()
         } else {
             "uk.co.froglog.lilypad".into()
@@ -96,8 +98,16 @@ impl ksni::Tray for LilypadTray {
             LazyLock::new(|| load_icon(include_bytes!("../../../src-tauri/icons/128x128.png")));
         static TRACKING: LazyLock<ksni::Icon> =
             LazyLock::new(|| load_icon(include_bytes!("../../../src-tauri/icons/128x128_nowplaying.png")));
+        static PAUSED: LazyLock<ksni::Icon> =
+            LazyLock::new(|| load_icon(include_bytes!("../../../src-tauri/icons/128x128_paused.png")));
 
-        let icon = if self.state.now_tracking_title().is_some() { &*TRACKING } else { &*NORMAL };
+        let icon = if self.state.now_tracking_paused() {
+            &*PAUSED
+        } else if self.state.now_tracking_title().is_some() {
+            &*TRACKING
+        } else {
+            &*NORMAL
+        };
         vec![icon.clone()]
     }
 
