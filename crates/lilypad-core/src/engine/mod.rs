@@ -166,6 +166,10 @@ impl crate::remote::RemoteHost for EngineRemote {
         self.platform
     }
 
+    fn device_name(&self) -> Option<String> {
+        self.state.process_map.read().unwrap().device_name.clone()
+    }
+
     fn state(&self) -> crate::remote::RemoteState {
         crate::remote::RemoteState::of(self.state.current_session.read().unwrap().as_ref(), self.state.active_ledger_id.current())
     }

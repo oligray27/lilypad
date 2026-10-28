@@ -46,8 +46,8 @@ struct Settings {
     auto_submit: Option<bool>,
     /// "Enable remote control from FrogLog": pause/resume from the site (lilypad_core::remote).
     remote_control: Option<bool>,
-    /// Shown on the site's Quick Session bar; blank for none. Per install, shared with the
-    /// desktop app (lilypad_core::remote::set_device_name).
+    /// Shown on the site's Quick Session bar; blank for none. Per account, like the rest
+    /// (ProcessMapConfig::device_name), so shared with the desktop app for the same account.
     device_name: Option<String>,
 }
 
@@ -217,7 +217,7 @@ impl Engine {
             "session_note": map.gaming_mode_note.clone().unwrap_or_else(|| DEFAULT_AUTO_SUBMIT_NOTE.to_string()),
             "auto_submit": !map.gaming_mode_ask,
             "remote_control": map.remote_control,
-            "device_name": lilypad_core::remote::device_name().unwrap_or_default(),
+            "device_name": map.device_name.clone().unwrap_or_default(),
             // The suggestion shown while the name is blank.
             "device_name_default": lilypad_core::remote::computer_name(),
         })
@@ -234,7 +234,7 @@ impl Engine {
         if let Some(v) = s.session_note { map.gaming_mode_note = Some(v.trim().to_string()); }
         if let Some(v) = s.auto_submit { map.gaming_mode_ask = !v; }
         if let Some(v) = s.remote_control { map.remote_control = v; }
-        if let Some(v) = s.device_name { lilypad_core::remote::set_device_name(&v)?; }
+        if let Some(v) = s.device_name { map.device_name = lilypad_core::remote::clean_device_name(&v); }
         map.save_to(&process_map_path_for_auth(&auth)).map_err(|e| format!("Could not save settings: {e}"))?;
         *self.state.process_map.write().unwrap() = map;
         // Registers with FrogLog (or unregisters) straight away rather than on the next re-check.

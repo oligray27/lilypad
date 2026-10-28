@@ -125,29 +125,40 @@ pub fn build(
     toggles_grid.attach(&remote_control, 0, 3, 1, 1);
     container.append(&toggles_grid);
 
-    // The name FrogLog's Quick Session bar shows for this install ("Tracked by LilyPad on ...").
-    // Per install (lilypad_core::remote's device.json, shared with Gaming Mode), not per account.
-    // Saved on Enter or leaving the field, not on every keystroke.
+    // The name FrogLog's Quick Session bar shows for this computer ("via ..."). Per account, like
+    // the toggles below (ProcessMapConfig::device_name). Saved on Enter or leaving the field, not
+    // on every keystroke.
     let device_name_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     device_name_row.append(&gtk4::Label::new(Some("Device name")));
     let device_name = gtk4::Entry::new();
     device_name.set_max_length(40);
     device_name.set_width_chars(24);
     device_name.set_placeholder_text(Some(&lilypad_core::remote::computer_name()));
-    device_name.set_text(&lilypad_core::remote::device_name().unwrap_or_default());
+    device_name.set_text(state.process_map.read().unwrap().device_name.as_deref().unwrap_or_default());
     device_name_row.append(&device_name);
     container.append(&device_name_row);
     {
-        let save = |entry: &gtk4::Entry| {
-            let text = entry.text();
-            if text.trim() == lilypad_core::remote::device_name().unwrap_or_default() {
-                return;
-            }
-            if let Err(e) = lilypad_core::remote::set_device_name(&text) {
-                log::warn!("[LilyPad] {e}");
+        let save = {
+            let state = state.clone();
+            move |entry: &gtk4::Entry| {
+                let name = lilypad_core::remote::clean_device_name(&entry.text());
+                let mut cfg = state.process_map.write().unwrap();
+                if cfg.device_name == name {
+                    return;
+                }
+                cfg.device_name = name;
+                if let Err(e) = cfg.save_to(&process_map_path_for_auth(&state.auth.read().unwrap())) {
+                    log::warn!("[LilyPad] could not save the device name: {e}");
+                }
+                drop(cfg);
+                lilypad_core::remote::state_changed();
             }
         };
-        device_name.connect_activate(save);
+        let save = Rc::new(save);
+        {
+            let save = save.clone();
+            device_name.connect_activate(move |entry| save(entry));
+        }
         let focus = gtk4::EventControllerFocus::new();
         let entry = device_name.clone();
         focus.connect_leave(move |_| save(&entry));
@@ -555,10 +566,13 @@ pub fn build(
             }
             // Read, then set once the lock is released: a changed value fires the toggle handler,
             // which takes the write lock.
-            let remote = state.process_map.read().unwrap().remote_control;
+            let (remote, name) = {
+                let cfg = state.process_map.read().unwrap();
+                (cfg.remote_control, cfg.device_name.clone())
+            };
             remote_control.set_active(remote);
-            // May have been changed from Gaming Mode, which shares it.
-            device_name.set_text(&lilypad_core::remote::device_name().unwrap_or_default());
+            // Another account's after a switch, or changed from Gaming Mode.
+            device_name.set_text(name.as_deref().unwrap_or_default());
             check_updates.set_active(lilypad_core::updates::checks_enabled());
 
             let account = state.account();

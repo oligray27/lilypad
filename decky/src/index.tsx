@@ -116,7 +116,7 @@ function NoteField({ saved, onSaved }: { saved: string; onSaved: (settings: Sett
   );
 }
 
-/** The name FrogLog's Quick Session bar shows for this device ("Tracked by LilyPad on ...").
+/** The name FrogLog's Quick Session bar shows for this device ("via ...").
  * Saved when the field loses focus, like the session message. */
 function DeviceNameField({ settings, onSaved }: { settings: Settings; onSaved: (settings: Settings) => void }) {
   const saved = settings.device_name ?? "";

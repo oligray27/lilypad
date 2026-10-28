@@ -91,6 +91,8 @@ pub trait RemoteHost: Send + Sync + 'static {
     fn enabled(&self) -> bool;
     /// "windows", "linux" or "steam-deck", shown to the user on the site.
     fn platform(&self) -> &'static str;
+    /// The logged-in account's "Device name" (`ProcessMapConfig::device_name`), if set.
+    fn device_name(&self) -> Option<String>;
     fn state(&self) -> RemoteState;
     /// Pauses the session `ledger_id`, if it's the one being tracked. Pausing a paused session
     /// is not an error.
@@ -108,15 +110,14 @@ pub fn state_changed() {
     }
 }
 
-/// `device.json` in the app data directory: this install's id and the name the user gave it. On
-/// Linux the desktop app and the Gaming Mode engine share it, which is right: it's the same
-/// install, and only one of them tracks at a time.
+/// `device.json` in the app data directory: this install's id. On Linux the desktop app and the
+/// Gaming Mode engine share it, which is right: it's the same install, and only one of them
+/// tracks at a time. (0.6.6's first build kept the device name here too; it's per account now,
+/// in `ProcessMapConfig`, and an old `name` key is ignored.)
 #[derive(Default, Serialize, Deserialize)]
 struct DeviceFile {
     #[serde(default)]
     id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    name: Option<String>,
 }
 
 /// Longest device name kept; the site shows it in the Quick Session bar.
@@ -155,24 +156,11 @@ pub fn device_id() -> String {
     .clone()
 }
 
-/// The name the user gave this install ("Device name" in LilyPad's settings), shown on the
-/// FrogLog site's Quick Session bar, e.g. "Tracked by LilyPad on Gaming PC". `None` when unset,
-/// and then the site just says "Tracked by LilyPad".
-pub fn device_name() -> Option<String> {
-    read_device_file().name.filter(|n| !n.trim().is_empty())
-}
-
-/// Saves the device name (blank clears it) and reports it to FrogLog.
-pub fn set_device_name(name: &str) -> Result<(), String> {
+/// A "Device name" as typed, ready to store in `ProcessMapConfig::device_name`: trimmed and cut
+/// to length, `None` when blank. The site shows it in the Quick Session bar, e.g. "via Gaming PC".
+pub fn clean_device_name(name: &str) -> Option<String> {
     let name: String = name.trim().chars().take(MAX_DEVICE_NAME).collect();
-    let mut file = read_device_file();
-    if file.id.is_empty() {
-        file.id = device_id();
-    }
-    file.name = (!name.is_empty()).then_some(name);
-    write_device_file(&file).map_err(|e| format!("Could not save the device name: {e}"))?;
-    state_changed();
-    Ok(())
+    (!name.is_empty()).then_some(name)
 }
 
 /// The computer's own name: the suggestion shown in the empty "Device name" field.
@@ -326,7 +314,7 @@ fn run_reporter(host: Arc<dyn RemoteHost>, rx: mpsc::Receiver<()>) {
         let enabled = host.enabled() && auth.token.is_some();
         let state = if enabled { host.state() } else { RemoteState::Idle };
         let (kind, ledger) = state.shape();
-        let name = device_name();
+        let name = host.device_name();
         let now = Reported { enabled, token: auth.token.clone(), name: name.clone(), shape: (kind, ledger.map(str::to_string)) };
         if last.as_ref() == Some(&now) {
             continue;
@@ -449,6 +437,13 @@ mod tests {
         assert_eq!(json["game_id"], 7);
         assert_eq!(json["game_type"], "live");
         assert_eq!(serde_json::to_value(RemoteState::Idle).unwrap(), serde_json::json!({ "status": "idle" }));
+    }
+
+    #[test]
+    fn device_names_are_trimmed_cut_to_length_and_blank_is_none() {
+        assert_eq!(clean_device_name("  Gaming PC "), Some("Gaming PC".into()));
+        assert_eq!(clean_device_name("   "), None);
+        assert_eq!(clean_device_name(&"x".repeat(60)).map(|n| n.chars().count()), Some(MAX_DEVICE_NAME));
     }
 
     #[test]

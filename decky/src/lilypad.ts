@@ -119,7 +119,7 @@ export interface Settings {
   auto_submit: boolean;
   /** "Enable remote control from FrogLog": pause/resume the session from the FrogLog site. */
   remote_control: boolean;
-  /** Shown in FrogLog's Quick Session bar; empty for none. Per install, shared with the desktop app. */
+  /** Shown in FrogLog's Quick Session bar; empty for none. Per account, shared with the desktop app. */
   device_name?: string;
   /** The computer's own name, suggested while device_name is empty. */
   device_name_default?: string;

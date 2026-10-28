@@ -2564,19 +2564,23 @@ fn save_remote_control(state: tauri::State<AppState>, enabled: bool) -> Result<(
     Ok(())
 }
 
-/// The name shown for this install in FrogLog's Quick Session bar ("Tracked by LilyPad on ..."),
-/// and the computer's own name to suggest when it's blank. Per install, not per account.
+/// The computer's own name, suggested while "Device name" is blank.
 #[tauri::command]
-fn get_device_name() -> serde_json::Value {
-    serde_json::json!({
-        "name": lilypad_core::remote::device_name(),
-        "computerName": lilypad_core::remote::computer_name(),
-    })
+fn get_computer_name() -> String {
+    lilypad_core::remote::computer_name()
 }
 
+/// "Device name": what FrogLog's Quick Session bar calls this computer ("via ..."). Per account,
+/// like the other settings in the process map; blank for none.
 #[tauri::command]
-fn save_device_name(name: String) -> Result<(), String> {
-    lilypad_core::remote::set_device_name(&name)
+fn save_device_name(state: tauri::State<AppState>, name: String) -> Result<(), String> {
+    let mut map = state.process_map_arc.read().unwrap().clone();
+    map.device_name = lilypad_core::remote::clean_device_name(&name);
+    map.save_to(&process_map_path_for_auth(&state.auth.read().unwrap()))
+        .map_err(|e| e.to_string())?;
+    *state.process_map_arc.write().unwrap() = map;
+    lilypad_core::remote::state_changed();
+    Ok(())
 }
 
 /// What lilypad_core::remote needs from this app: the tracked session, and pausing it.
@@ -2615,6 +2619,10 @@ impl lilypad_core::remote::RemoteHost for TauriRemote {
 
     fn platform(&self) -> &'static str {
         "windows"
+    }
+
+    fn device_name(&self) -> Option<String> {
+        self.app.state::<AppState>().process_map_arc.read().unwrap().device_name.clone()
     }
 
     fn state(&self) -> lilypad_core::remote::RemoteState {
@@ -2892,7 +2900,7 @@ pub fn run() {
             save_auto_submit,
             save_now_playing_share,
             save_remote_control,
-            get_device_name,
+            get_computer_name,
             save_device_name,
             save_unmapped_detection,
             hide_window,

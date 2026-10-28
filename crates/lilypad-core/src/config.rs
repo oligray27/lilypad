@@ -69,10 +69,14 @@ pub struct ProcessMapConfig {
     #[serde(default)]
     pub share_now_playing: bool,
     /// "Enable remote control from FrogLog": LilyPad reports what it's tracking to FrogLog
-    /// privately and takes Pause/Resume/Stop/Submit/Discard from the site's Quick Session bar
-    /// (see `remote`). Off by default; per account, like the other settings here.
+    /// privately and takes Pause/Resume from the site's Quick Session bar (see `remote`). Off by
+    /// default; per account, like the other settings here.
     #[serde(default)]
     pub remote_control: bool,
+    /// "Device name": what the site's Quick Session bar calls this computer ("via ..."). `None`
+    /// for none. Per account, so people sharing a LilyPad install each name it their own way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
     /// When true, LilyPad never scans unmapped processes against installed Steam games /
     /// the FrogLog library (see `monitor::maybe_start_unmapped_tracking`). Defaults to false
     /// (feature enabled) so existing configs opt in without a migration.
