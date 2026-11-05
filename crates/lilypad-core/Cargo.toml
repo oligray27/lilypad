@@ -17,6 +17,13 @@ chrono = "0.4"
 rusqlite = { version = "0.32", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
+# Remote launch from a paired phone on the LAN (see lan/): its own TLS server and certificate, the pairing proof, and discovery.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+sha2 = "0.10"
+hmac = "0.12"
+mdns-sd = "0.13"
+if-addrs = "0.13"
 
 [dev-dependencies]
 tempfile = "3"
@@ -33,6 +40,9 @@ windows = { version = "0.58", features = [
     # OpenProcess/WaitForSingleObject, for waiting on a real SYNCHRONIZE handle rather than
     # inferring exit from process enumeration -- see monitor::wait_for_process_exit.
     "Win32_System_Threading",
+    # ShellExecuteW, which starts a program the way Explorer does (including the UAC prompt for one that needs administrator rights).
+    "Win32_UI_Shell",
+    "Win32_System_Com",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

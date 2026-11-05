@@ -554,7 +554,7 @@ pub fn app_data_dir() -> PathBuf {
 /// Stable key for the current user so each account has its own process-map file.
 /// Uses username when present (stable across logout/login); otherwise token hash for backwards compat.
 /// Username is normalized to lowercase so the key is stable regardless of login input casing.
-fn process_map_user_key(auth: &AuthConfig) -> String {
+pub fn process_map_user_key(auth: &AuthConfig) -> String {
     if let Some(ref u) = auth.username {
         let normalized = u.to_lowercase();
         let h = normalized.bytes().fold(0u32, |a, b| a.wrapping_mul(31).wrapping_add(b as u32));
@@ -619,11 +619,10 @@ pub fn link_process_mapping(
     title: Option<String>,
 ) -> Result<(), String> {
     let mut map = process_map_arc.read().unwrap().clone();
-    let existing_title_filter = map
-        .mappings
-        .iter()
-        .find(|m| m.froglog_id == froglog_id && m.r#type == game_type)
-        .and_then(|m| m.title_filter.clone());
+    let existing = map.mappings.iter().find(|m| m.froglog_id == froglog_id && m.r#type == game_type);
+    let existing_title_filter = existing.and_then(|m| m.title_filter.clone());
+    // Linking the same executable again keeps the path already recorded for it (a different executable is a different file).
+    let existing_exe_path = existing.filter(|m| m.process.eq_ignore_ascii_case(&process)).and_then(|m| m.exe_path.clone());
     map.mappings.retain(|m| survives_relink(m, &process, &game_type, froglog_id));
     map.mappings.push(ProcessMapping {
         process,
@@ -631,7 +630,7 @@ pub fn link_process_mapping(
         froglog_id,
         title,
         title_filter: existing_title_filter,
-        exe_path: None,
+        exe_path: existing_exe_path,
     });
     map.save_to(&process_map_path_for_auth(auth)).map_err(|e| e.to_string())?;
     *process_map_arc.write().unwrap() = map;

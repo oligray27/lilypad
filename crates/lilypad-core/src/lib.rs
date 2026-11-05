@@ -3,6 +3,7 @@ pub mod auto_submit;
 pub mod config;
 pub mod duration;
 pub mod engine;
+pub mod lan;
 pub mod ledger_session;
 pub mod library_match;
 pub mod local_games;

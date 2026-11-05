@@ -1020,6 +1020,8 @@ fn refresh_installed_games(state: &AppState) {
     // function; this is where per-user preference gets applied on top of it.
     games.retain(|g| !excluded_appids.contains(&g.appid));
     *state.installed_games_arc.write().unwrap() = games;
+    // What is installed has changed, so a mapped game that had no path may be findable now.
+    fill_missing_exe_paths(state);
     *state.install_fingerprint.write().unwrap() = Some(fingerprint);
 }
 
@@ -1691,6 +1693,446 @@ fn handle_session_ended(
 /// place (rebuilding the whole menu every 30 s could disturb it while it is open).
 static TRACKING_STATUS_ITEM: Mutex<Option<tauri::menu::MenuItem<Wry>>> = Mutex::new(None);
 
+// ---- Remote launch from a paired phone on the LAN (lilypad_core::lan) ----
+
+/// The LAN server and its mDNS announcement. Present only while "Allow connections from remote devices" is on.
+struct LanRuntime {
+    server: Arc<lilypad_core::lan::server::LanServer>,
+    advertiser: Option<lilypad_core::lan::discovery::Advertiser>,
+}
+static LAN: Mutex<Option<LanRuntime>> = Mutex::new(None);
+
+fn lan_settings() -> lilypad_core::lan::settings::LanSettings {
+    lilypad_core::lan::settings::load(&lilypad_core::lan::settings::default_path())
+}
+
+/// The signed-in FrogLog username (if known) and the file this account's linked devices are kept in. Devices belong to the account
+/// LilyPad was signed in as when they linked, since the games they ask for are that account's. A list from before accounts were
+/// separated is adopted by the first account that signs in.
+fn lan_account(auth: &AuthConfig) -> (Option<String>, std::path::PathBuf) {
+    let username = auth.username.clone().filter(|u| !u.trim().is_empty());
+    let signed_in = auth.token.is_some() || username.is_some();
+    if !signed_in {
+        return (None, lilypad_core::lan::store::path_for_account("signed-out"));
+    }
+    let path = lilypad_core::lan::store::path_for_account(&lilypad_core::config::process_map_user_key(auth));
+    if !path.exists() {
+        let legacy = lilypad_core::lan::store::legacy_path();
+        if legacy.exists() {
+            let _ = std::fs::rename(&legacy, &path);
+        }
+    }
+    (username, path)
+}
+
+/// Where a mapped executable is on this PC, if that can be worked out without it running: inside the one installed Steam game whose
+/// folder holds it, or inside a folder LilyPad was told to watch for non-Steam games. Nothing is guessed when two games hold it.
+fn locate_exe(process: &str, installed: &[steam::InstalledGame], watched: &[String]) -> Option<String> {
+    use lilypad_core::lan::launch::find_file;
+    if let Some(game) = steam::find_installed_game_by_executable(process, None, installed) {
+        if let Some(path) = find_file(&game.install_dir, process, 8) {
+            return Some(path.display().to_string());
+        }
+    }
+    watched.iter().find_map(|root| find_file(std::path::Path::new(root), process, 4)).map(|p| p.display().to_string())
+}
+
+/// Fills in the path of every mapping that has none. A path is otherwise only learned once its game has been seen running as a tracked
+/// session, which left a mapping typed in by hand (or linked from the first session of a new game) without one until its next session,
+/// and "Play on PC" couldn't start it. Run after linking, saving and each look at what Steam has installed.
+fn fill_missing_exe_paths(state: &AppState) {
+    let installed = state.installed_games_arc.read().unwrap().clone();
+    let mut map = state.process_map_arc.read().unwrap().clone();
+    let watched: Vec<String> = map.watched_directories.iter().map(|w| w.path.clone()).collect();
+    let mut changed = false;
+    for mapping in map.mappings.iter_mut().filter(|m| m.exe_path.is_none()) {
+        if let Some(path) = locate_exe(&mapping.process, &installed, &watched) {
+            log::info!("[LilyPad] found {} for {} at {path}", mapping.process, mapping.title.as_deref().unwrap_or("a mapped game"));
+            mapping.exe_path = Some(path);
+            changed = true;
+        }
+    }
+    if changed {
+        let path = process_map_path_for_auth(&state.auth.read().unwrap());
+        if map.save_to(&path).is_ok() {
+            *state.process_map_arc.write().unwrap() = map;
+        }
+    }
+}
+
+/// Games a remote device has just started, so the "Tracking Started" notification that follows is not shown on top of the one saying who
+/// started the game (that it is being tracked goes without saying).
+static REMOTE_LAUNCHES: Mutex<Vec<(i32, String, std::time::Instant)>> = Mutex::new(Vec::new());
+/// How long after a remote start a game still counts as started that way (games can take a while to open).
+const REMOTE_LAUNCH_WINDOW: std::time::Duration = std::time::Duration::from_secs(180);
+
+fn note_remote_launch(game_id: i32, game_type: &str) {
+    let mut launches = REMOTE_LAUNCHES.lock().unwrap();
+    launches.retain(|(_, _, at)| at.elapsed() < REMOTE_LAUNCH_WINDOW);
+    launches.push((game_id, game_type.to_string(), std::time::Instant::now()));
+}
+
+/// Whether this mapping's session is the result of a remote start just now. Counts once: the entry is used up.
+fn take_remote_launch(mapping: &ProcessMapping) -> bool {
+    let mut launches = REMOTE_LAUNCHES.lock().unwrap();
+    launches.retain(|(_, _, at)| at.elapsed() < REMOTE_LAUNCH_WINDOW);
+    let kind = if mapping.r#type == "live" { "live_service" } else { "game" };
+    match launches.iter().position(|(id, game_type, _)| *id == mapping.froglog_id && game_type == kind) {
+        Some(index) => {
+            launches.remove(index);
+            true
+        }
+        None => false,
+    }
+}
+
+/// What the LAN server asks of this app.
+struct TauriLan {
+    app: tauri::AppHandle,
+}
+
+impl lilypad_core::lan::server::LanHost for TauriLan {
+    fn enabled(&self) -> bool {
+        lan_settings().enabled
+    }
+    fn device_name(&self) -> String {
+        let state = self.app.state::<AppState>();
+        let name = state.process_map_arc.read().unwrap().device_name.clone();
+        name.unwrap_or_else(lilypad_core::remote::computer_name)
+    }
+    fn ask_before_launch(&self) -> bool {
+        lan_settings().ask_before_launch
+    }
+    fn mappings(&self) -> Vec<ProcessMapping> {
+        self.app.state::<AppState>().process_map_arc.read().unwrap().mappings.clone()
+    }
+    fn tracking(&self) -> bool {
+        self.app.state::<AppState>().current_session_arc.read().unwrap().is_some()
+    }
+    fn installed_steam_ids(&self) -> Vec<String> {
+        self.app.state::<AppState>().installed_games_arc.read().unwrap().iter().map(|g| g.appid.clone()).collect()
+    }
+    fn resolve_launch(&self, mapping: &ProcessMapping) -> Option<lilypad_core::lan::launch::Plan> {
+        let state = self.app.state::<AppState>();
+        // The Steam game whose install folder holds this executable: Steam starts it (and whatever it needs first).
+        let found = {
+            let games = state.installed_games_arc.read().unwrap();
+            steam::find_installed_game_by_executable(&mapping.process, None, &games).map(|g| g.appid.clone())
+        };
+        if let Some(appid) = found {
+            return Some(lilypad_core::lan::launch::Plan::Steam(appid));
+        }
+        // Otherwise the executable inside a folder LilyPad was told to watch for non-Steam games.
+        let roots: Vec<String> = state.process_map_arc.read().unwrap().watched_directories.iter().map(|w| w.path.clone()).collect();
+        roots
+            .iter()
+            .find_map(|root| lilypad_core::lan::launch::find_file(std::path::Path::new(root), &mapping.process, 4))
+            .map(lilypad_core::lan::launch::Plan::Exe)
+    }
+    fn account(&self) -> Option<String> {
+        lan_account(&self.app.state::<AppState>().auth.read().unwrap()).0
+    }
+    fn paired_path(&self) -> std::path::PathBuf {
+        lan_account(&self.app.state::<AppState>().auth.read().unwrap()).1
+    }
+    fn confirm_launch(&self, phone: &str, title: &str) -> bool {
+        use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
+        let what = if title.is_empty() { "a game".to_string() } else { title.to_string() };
+        self.app
+            .dialog()
+            .message(format!("{phone} wants to start {what} on this PC."))
+            .title("LilyPad")
+            .buttons(MessageDialogButtons::OkCancelCustom("Allow".into(), "Deny".into()))
+            .blocking_show()
+    }
+    fn event(&self, event: lilypad_core::lan::server::Event) {
+        use lilypad_core::lan::server::Event;
+        let window = self.app.get_webview_window("main");
+        match event {
+            Event::PairingRequested(name) => {
+                // LilyPad lives in the tray, so a request asks first, on a notification with Accept and Refuse. Accepting opens the
+                // window that takes the code. Without a notification that can show, the window opens straight away.
+                if matches!(notification_status(), NotificationStatus::Disabled(_)) {
+                    open_link_request_window(&self.app, name);
+                } else {
+                    show_link_request_toast(&name, self.app.clone());
+                }
+            }
+            Event::Paired(name) => {
+                if let Some(w) = &window {
+                    let _ = w.emit("lan-paired", name);
+                }
+            }
+            Event::PairingFailed => {
+                if let Some(w) = &window {
+                    let _ = w.emit("lan-pairing-failed", ());
+                }
+            }
+            Event::WrongPin { remaining } => {
+                if let Some(w) = &window {
+                    let _ = w.emit("lan-pin-wrong", remaining);
+                }
+            }
+            Event::Launched { phone, title, game_id, game_type, .. } => {
+                note_remote_launch(game_id, &game_type);
+                let what = if title.is_empty() { "a game".to_string() } else { title };
+                let _ = self.app.notification().builder().title("LilyPad").body(format!("{phone} started {what}")).show();
+            }
+        }
+    }
+}
+
+/// Brings LilyPad's window up on the screen that takes the code for a device that wants to link.
+fn open_link_request_window(app: &tauri::AppHandle, name: String) {
+    if let Some(w) = app.get_webview_window("main") {
+        show_window_at_height(&w, WINDOW_WIDTH, 540.0);
+        let _ = w.emit("lan-pairing-requested", name);
+    }
+}
+
+/// The user turned a link request down from the notification.
+fn refuse_link_request() {
+    if let Some(running) = LAN.lock().unwrap().as_ref() {
+        running.server.refuse_pairing();
+    }
+}
+
+/// A notification for a device that wants to link, with Accept and Refuse. Accept (or clicking the notification) opens the window
+/// for the code. Refuse turns the request down, and the device is told.
+#[cfg(windows)]
+fn show_link_request_toast(name: &str, app: tauri::AppHandle) {
+    use windows::core::{Interface, HSTRING};
+    use windows::Data::Xml::Dom::XmlDocument;
+    use windows::Foundation::TypedEventHandler;
+    use windows::UI::Notifications::{ToastActivatedEventArgs, ToastNotification, ToastNotificationManager};
+
+    let name_owned = name.to_string();
+    std::thread::spawn(move || {
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
+        }
+        // A reminder stays on screen until it is answered, which suits a request that waits for you.
+        let xml = concat!(
+                r#"<toast scenario="reminder"><visual><binding template="ToastGeneric">"#,
+                r#"<text>New pairing request</text>"#,
+                r#"<text>A new remote device wants to pair.</text>"#,
+                r#"</binding></visual>"#,
+                r#"<actions>"#,
+                r#"<action content="Accept" arguments="accept"/>"#,
+                r#"<action content="Refuse" arguments="refuse"/>"#,
+                r#"</actions></toast>"#,
+        );
+        let doc = match XmlDocument::new() {
+            Ok(d) => d,
+            Err(_) => return open_link_request_window(&app, name_owned),
+        };
+        if doc.LoadXml(&HSTRING::from(xml)).is_err() {
+            return open_link_request_window(&app, name_owned);
+        }
+        let toast = match ToastNotification::CreateToastNotification(&doc) {
+            Ok(t) => t,
+            Err(_) => return open_link_request_window(&app, name_owned),
+        };
+        let app_for_click = app.clone();
+        let name_for_click = name_owned.clone();
+        let _ = toast.Activated(&TypedEventHandler::<ToastNotification, windows::core::IInspectable>::new(
+            move |_, args| {
+                let choice = args
+                    .as_ref()
+                    .and_then(|a| a.cast::<ToastActivatedEventArgs>().ok())
+                    .and_then(|a| a.Arguments().ok())
+                    .map(|h| h.to_string())
+                    .unwrap_or_default();
+                if choice == "refuse" {
+                    refuse_link_request();
+                } else {
+                    let app2 = app_for_click.clone();
+                    let name2 = name_for_click.clone();
+                    let _ = app_for_click.run_on_main_thread(move || open_link_request_window(&app2, name2));
+                }
+                Ok(())
+            },
+        ));
+        let shown = ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(TOAST_AUMID)).and_then(|n| n.Show(&toast));
+        if shown.is_err() {
+            return open_link_request_window(&app, name_owned);
+        }
+        // Keep the toast alive so WinRT holds its handler. The request itself gives up after two minutes.
+        std::thread::sleep(std::time::Duration::from_secs(125));
+    });
+}
+
+#[cfg(not(windows))]
+fn show_link_request_toast(name: &str, app: tauri::AppHandle) {
+    let _ = app.notification().builder().title("New pairing request").body("A new remote device wants to pair.").show();
+    open_link_request_window(&app, name.to_string());
+}
+
+/// Starts or stops the LAN server to match the settings. Returns why it could not start, if it could not.
+fn apply_lan(app: &tauri::AppHandle) -> Result<(), String> {
+    let settings = lan_settings();
+    let enabled = settings.enabled;
+    let mut runtime = LAN.lock().unwrap();
+    let mut failure = None;
+    if enabled && runtime.is_none() {
+        let host = Arc::new(TauriLan { app: app.clone() });
+        let device_name = lilypad_core::lan::server::LanHost::device_name(&*host);
+        // The default port may move aside if something else has it; a port the user chose has to be free.
+        let exact = settings.port != lilypad_core::lan::settings::DEFAULT_PORT;
+        match lilypad_core::lan::server::LanServer::start_with(host, &lilypad_core::config::app_data_dir(), settings.port, exact) {
+            Ok(server) => {
+                let advertiser = match lilypad_core::lan::discovery::Advertiser::start(&device_name, server.port(), server.fingerprint()) {
+                    Ok(a) => Some(a),
+                    Err(e) => {
+                        log::warn!("[LilyPad] could not announce on the network: {e}");
+                        None
+                    }
+                };
+                log::info!("[LilyPad] remote devices can link on port {}", server.port());
+                *runtime = Some(LanRuntime { server: Arc::new(server), advertiser });
+            }
+            Err(e) => {
+                log::warn!("[LilyPad] could not start the remote device link: {e}");
+                failure = Some(e);
+            }
+        }
+    } else if !enabled {
+        if let Some(running) = runtime.take() {
+            running.server.stop();
+            if let Some(advertiser) = running.advertiser {
+                advertiser.stop();
+            }
+        }
+    }
+    failure.map_or(Ok(()), Err)
+}
+
+/// Stops the server (if running) so apply_lan starts it afresh, on a new port.
+fn stop_lan() {
+    if let Some(running) = LAN.lock().unwrap().take() {
+        running.server.stop();
+        if let Some(advertiser) = running.advertiser {
+            advertiser.stop();
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct LanState {
+    enabled: bool,
+    ask_before_launch: bool,
+    running: bool,
+    /// The port it is really listening on, if running.
+    port: Option<u16>,
+    /// The port chosen in settings.
+    port_setting: u16,
+    /// The FrogLog account LilyPad is signed in as; the devices listed are the ones linked under it.
+    account: Option<String>,
+    waiting_phone: Option<String>,
+    phones: Vec<lilypad_core::lan::store::PairedPhone>,
+}
+
+#[tauri::command]
+fn lan_get_state(state: tauri::State<AppState>) -> LanState {
+    let settings = lan_settings();
+    let (account, paired_path) = lan_account(&state.auth.read().unwrap());
+    let runtime = LAN.lock().unwrap();
+    let status = runtime.as_ref().map(|r| r.server.pairing_status()).unwrap_or_default();
+    LanState {
+        enabled: settings.enabled,
+        ask_before_launch: settings.ask_before_launch,
+        running: runtime.is_some(),
+        port: runtime.as_ref().map(|r| r.server.port()),
+        port_setting: settings.port,
+        account,
+        waiting_phone: status.waiting_phone,
+        phones: lilypad_core::lan::store::load(&paired_path),
+    }
+}
+
+#[tauri::command]
+fn lan_set_enabled(app: tauri::AppHandle, enabled: bool) -> Result<LanState, String> {
+    let mut settings = lan_settings();
+    settings.enabled = enabled;
+    lilypad_core::lan::settings::save(&lilypad_core::lan::settings::default_path(), &settings).map_err(|e| e.to_string())?;
+    apply_lan(&app)?;
+    Ok(lan_get_state(app.state::<AppState>()))
+}
+
+/// Changes the port to listen on. If it can't be used, the old port stays and the reason is returned.
+#[tauri::command]
+fn lan_set_port(app: tauri::AppHandle, port: u32) -> Result<LanState, String> {
+    if !lilypad_core::lan::settings::valid_port(port) {
+        return Err("Choose a port from 1024 to 65535.".to_string());
+    }
+    let path = lilypad_core::lan::settings::default_path();
+    let previous = lan_settings();
+    if previous.port == port as u16 {
+        return Ok(lan_get_state(app.state::<AppState>()));
+    }
+    // Checked before anything is stopped, so a busy port leaves the working one running.
+    let listening_on = LAN.lock().unwrap().as_ref().map(|r| r.server.port());
+    if listening_on != Some(port as u16) && !lilypad_core::lan::server::LanServer::port_is_free(port as u16) {
+        return Err(format!("Port {port} is already in use. Choose another."));
+    }
+    let mut settings = previous.clone();
+    settings.port = port as u16;
+    lilypad_core::lan::settings::save(&path, &settings).map_err(|e| e.to_string())?;
+    if settings.enabled {
+        stop_lan();
+        if let Err(e) = apply_lan(&app) {
+            // Back to the port that worked.
+            let _ = lilypad_core::lan::settings::save(&path, &previous);
+            let _ = apply_lan(&app);
+            return Err(e);
+        }
+    }
+    Ok(lan_get_state(app.state::<AppState>()))
+}
+
+#[tauri::command]
+fn lan_set_ask_before_launch(ask: bool) -> Result<(), String> {
+    let mut settings = lan_settings();
+    settings.ask_before_launch = ask;
+    lilypad_core::lan::settings::save(&lilypad_core::lan::settings::default_path(), &settings).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn lan_cancel_pairing() {
+    if let Some(running) = LAN.lock().unwrap().as_ref() {
+        running.server.cancel_pairing();
+    }
+}
+
+#[tauri::command]
+fn lan_submit_pin(pin: String, name: Option<String>) -> Result<(), String> {
+    match LAN.lock().unwrap().as_ref() {
+        Some(running) => running.server.submit_pin(pin.trim(), name.as_deref().unwrap_or("")).map_err(|code| match code {
+            "invalid_pin" => "The PIN is four digits.".to_string(),
+            _ => "No remote device is waiting for a PIN. Start linking from the FrogLog app first.".to_string(),
+        }),
+        None => Err("Remote device linking is off.".to_string()),
+    }
+}
+
+#[tauri::command]
+fn lan_rename_phone(state: tauri::State<AppState>, fingerprint: String, name: String) -> Result<(), String> {
+    let path = lan_account(&state.auth.read().unwrap()).1;
+    lilypad_core::lan::store::rename(&path, &fingerprint, &name).map(|_| ()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn lan_remove_phone(state: tauri::State<AppState>, fingerprint: String) -> Result<(), String> {
+    let path = lan_account(&state.auth.read().unwrap()).1;
+    lilypad_core::lan::store::remove(&path, &fingerprint).map(|_| ()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn lan_unpair_all(state: tauri::State<AppState>) -> Result<(), String> {
+    let path = lan_account(&state.auth.read().unwrap()).1;
+    lilypad_core::lan::store::clear(&path).map_err(|e| e.to_string())
+}
+
 /// `game_label` is the tracked game with its length so far (`ActiveSession::label`).
 fn build_tray_menu(app: &tauri::AppHandle, logged_in: bool, game_label: Option<String>) -> Result<Menu<Wry>, Box<dyn std::error::Error + Send + Sync>> {
     let quit_item = PredefinedMenuItem::quit(app, Some("Quit"))?;
@@ -1729,6 +2171,7 @@ fn build_tray_menu(app: &tauri::AppHandle, logged_in: bool, game_label: Option<S
     };
     if logged_in {
         let assign_exes_item = MenuItemBuilder::with_id("assign_exes", "Configure...").build(app)?;
+        let link_phone_item = MenuItemBuilder::with_id("link_phone", "Manage Remote Devices...").build(app)?;
         let about_item = MenuItemBuilder::with_id("about", "About").build(app)?;
         let logout_item = MenuItemBuilder::with_id("logout", "Logout").build(app)?;
         let pending_count = pending_sessions_for(&app.state::<AppState>()).len();
@@ -1750,6 +2193,7 @@ fn build_tray_menu(app: &tauri::AppHandle, logged_in: bool, game_label: Option<S
             items.push(force_stop_item);
         }
         items.push(&assign_exes_item);
+        items.push(&link_phone_item);
         if let Some(ref item) = new_games_item {
             items.push(item);
         }
@@ -2331,6 +2775,8 @@ fn resolve_pending(
     let library = state.library_index_arc.read().unwrap().clone();
     let resolved = resolution::resolve(&client, &state.store(), &account, &library, appid, choice, resolution::CREATED_NOTE)?;
     resolution::link_resolved(&state.process_map_arc, &auth, &resolved);
+    // Straight away, not at the next session: the new mapping only has the executable's name, and Play on PC needs where it is.
+    fill_missing_exe_paths(state);
     // Without this the library only refreshes every 5 minutes -- relaunching the same game
     // shortly after would still look new (or still finished) and be prompted about again.
     refresh_library_index_state(state);
@@ -2427,6 +2873,7 @@ fn save_process_mapping(
     froglog_id: i32,
     title: Option<String>,
     title_filter: Option<String>,
+    exe_path: Option<String>,
 ) -> Result<(), String> {
     let mut map = state.process_map_arc.read().unwrap().clone();
     
@@ -2479,6 +2926,17 @@ fn save_process_mapping(
         }
     }
 
+    // The path already recorded for this game (the same executable), so saving something else about it doesn't lose it.
+    let previous_exe_path = map
+        .mappings
+        .iter()
+        .find(|m| m.froglog_id == froglog_id && m.r#type == game_type && m.process.eq_ignore_ascii_case(&process))
+        .and_then(|m| m.exe_path.clone());
+    // A path from the file picker counts only if it is for the executable named, and the file is there.
+    let picked_exe_path = exe_path
+        .filter(|p| std::path::Path::new(p).file_name().and_then(|n| n.to_str()).is_some_and(|n| n.eq_ignore_ascii_case(&process)))
+        .filter(|p| std::path::Path::new(p).is_file());
+
     // Remove any existing mapping for this specific game (by id+type)
     map.mappings
         .retain(|m| !(m.froglog_id == froglog_id && m.r#type == game_type));
@@ -2489,14 +2947,15 @@ fn save_process_mapping(
         froglog_id,
         title,
         title_filter,
-        // Filled in the first time this mapping tracks a session: the user types an executable
-        // name here, and only a running process reveals which file on disk that is.
-        exe_path: None,
+        // The file the user picked, if they picked one; otherwise what was recorded before, or nothing until the first session this
+        // mapping tracks (a typed-in name is only a name, and a running process is what reveals which file it is).
+        exe_path: picked_exe_path.or(previous_exe_path),
     });
 
     map.save_to(&process_map_path_for_auth(&state.auth.read().unwrap()))
         .map_err(|e| e.to_string())?;
     *state.process_map_arc.write().unwrap() = map;
+    fill_missing_exe_paths(&state);
     Ok(())
 }
 
@@ -2900,6 +3359,15 @@ pub fn run() {
             save_auto_submit,
             save_now_playing_share,
             save_remote_control,
+            lan_get_state,
+            lan_set_enabled,
+            lan_set_ask_before_launch,
+            lan_set_port,
+            lan_cancel_pairing,
+            lan_submit_pin,
+            lan_remove_phone,
+            lan_rename_phone,
+            lan_unpair_all,
             get_computer_name,
             save_device_name,
             save_unmapped_detection,
@@ -2995,6 +3463,11 @@ pub fn run() {
                         if let Some(w) = app.get_webview_window("main") {
                             let _ = w.emit("show-login", ());
                         }
+                    } else if id == "link_phone" {
+                        if let Some(w) = app.get_webview_window("main") {
+                            show_window_at_height(&w, WINDOW_WIDTH, 520.0);
+                            let _ = w.emit("show-phones", ());
+                        }
                     } else if id == "pending_sessions" {
                         if let Some(w) = app.get_webview_window("main") {
                             show_window_at_height(&w, WINDOW_WIDTH, 500.0);
@@ -3077,6 +3550,8 @@ pub fn run() {
             // Pause/Resume from FrogLog, when "Enable remote control from FrogLog" is on (idles
             // otherwise). Windows runs one LilyPad per session (the single-instance mutex above).
             lilypad_core::remote::start(Arc::new(TauriRemote { app: handle.clone() }));
+            // Remote devices on the LAN, when "Allow connections from remote devices" is on.
+            let _ = apply_lan(&handle);
 
             // Show login window on first launch (no saved credentials)
             if !logged_in {
@@ -3158,10 +3633,12 @@ pub fn run() {
                         // another install stops matching it. No-op once recorded.
                         record_mapping_exe_path(&handle, &mapping);
                         let game_name = mapping.title.as_deref().unwrap_or_else(|| process_name.as_str());
-                        let _ = handle.notification().builder()
-                            .title("Tracking Started")
-                            .body(game_name)
-                            .show();
+                        if !take_remote_launch(&mapping) {
+                            let _ = handle.notification().builder()
+                                .title("Tracking Started")
+                                .body(game_name)
+                                .show();
+                        }
                         let started_at_iso = chrono::Utc::now().to_rfc3339();
                         let (auth, share_now_playing) = {
                             let state = handle.state::<AppState>();

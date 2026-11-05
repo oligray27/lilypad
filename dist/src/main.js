@@ -22,6 +22,7 @@ const VIEW_SIZE = {
   mappingsView: { width: 880, height: 740 },
   sessionView: { width: 440, height: 165 },
   pendingView: { width: 550, height: 480 },
+  phonesView: { width: 550, height: 540 },
   watchedDirsView: { width: 550, height: 480 },
   excludedGamesView: { width: 550, height: 480 },
 };
@@ -554,6 +555,7 @@ listen('update-available', (event) => {
 // --- Mappings view: table of games with exe column ---
 let mappingsAllRows = [];
 let pendingExeFor = {};        // working copy (not yet saved to disk)
+let pendingExePathFor = {};    // the whole path of an executable picked with Browse, kept so Play on PC can start it
 let pendingTitleFilterFor = {};
 let savedExeFor = {};          // reflects what's currently on disk
 let savedTitleFilterFor = {};
@@ -656,6 +658,146 @@ function renderMappingsTable() {
   if (nextBtn) nextBtn.disabled = mappingsPage >= totalPages - 1;
   if (pageInfo) pageInfo.textContent = `${mappingsPage + 1} / ${totalPages}`;
   refreshMappingsState();
+}
+
+// ---- Link Remote Device: devices on the home network that can start games on this PC ----
+let phonesPoll = null;
+
+// The port as saved, and whether linking is on, so Apply is only there when the field holds something new.
+// Link only works once all four digits of the PIN are in.
+function updateLinkButton() {
+  $('lanLink').disabled = !/^\d{4}$/.test($('lanPin').value);
+}
+
+// Empties the code and name boxes once a request is over, whichever way it ended, so the next one starts blank.
+function resetPairingFields() {
+  $('lanPin').value = '';
+  $('lanDeviceName').value = '';
+  lanNamePrefill = null;
+  updateLinkButton();
+}
+
+let lanNamePrefill = null;
+let lanPortSaved = null;
+let lanEnabledNow = false;
+function updatePortApply() {
+  const typed = Number($('lanPort').value);
+  $('lanPortApply').disabled = !lanEnabledNow || !$('lanPort').value || typed === lanPortSaved;
+}
+
+// "Applied" or "Failed to apply" beside the Apply button for a few seconds. The reason is in the tooltip.
+let lanPortStatusTimer = null;
+function flashPortStatus(text, isError, reason) {
+  const el = $('lanPortStatus');
+  el.textContent = text;
+  el.title = reason || '';
+  el.className = isError ? 'error' : 'muted';
+  clearTimeout(lanPortStatusTimer);
+  lanPortStatusTimer = setTimeout(() => { el.textContent = ''; el.title = ''; }, 3000);
+}
+
+// A final failure is shown for a few seconds and then goes, unless something else has been said in the meantime.
+let phonesFlashTimer = null;
+function flashPhonesMessage(text, isError) {
+  setPhonesMessage(text, isError);
+  clearTimeout(phonesFlashTimer);
+  phonesFlashTimer = setTimeout(() => {
+    if ($('lanPairMessage').textContent === text) setPhonesMessage('');
+  }, 4000);
+}
+
+function setPhonesMessage(text, isError) {
+  const el = $('lanPairMessage');
+  el.textContent = text || '';
+  el.className = isError ? 'error' : 'muted';
+}
+
+async function loadPhonesView() {
+  const state = await invoke('lan_get_state').catch(() => null);
+  if (!state) return;
+  $('lanEnabled').checked = state.enabled;
+  $('lanAsk').checked = state.ask_before_launch;
+  $('lanAsk').disabled = !state.enabled;
+  // Not while it is being typed in.
+  if (document.activeElement !== $('lanPort')) $('lanPort').value = state.port_setting;
+  $('lanPort').disabled = !state.enabled;
+  lanPortSaved = state.port_setting;
+  lanEnabledNow = state.enabled;
+  updatePortApply();
+  $('lanPortNote').textContent = state.running && state.port !== state.port_setting
+    ? 'Port ' + state.port_setting + ' was busy, so LilyPad is listening on ' + state.port + '.'
+    : '';
+  // Devices belong to the account LilyPad is signed in as, so the list says whose it is.
+  $('lanAccountNote').textContent = state.account
+    ? 'Linked while signed in as ' + state.account + '.'
+    : 'Sign in to LilyPad to link remote devices.';
+  // Only there once something is linked.
+  $('lanUnpairAll').hidden = !state.phones.length;
+  $('lanPairPanel').hidden = !state.waiting_phone;
+  // No request waiting (it ended, or was refused or cancelled from either side): the boxes go back to blank.
+  if (!state.waiting_phone && ($('lanPin').value || $('lanDeviceName').value)) resetPairingFields();
+  if (!state.waiting_phone) lanNamePrefill = null;
+  if (state.waiting_phone) {
+    setPhonesMessage('\u201c' + state.waiting_phone + '\u201d wants to link. Enter its code.');
+    // The name it claims is offered as a starting point for the name you give it.
+    if (lanNamePrefill !== state.waiting_phone) {
+      lanNamePrefill = state.waiting_phone;
+      $('lanDeviceName').value = state.waiting_phone;
+    }
+  } else if (!state.enabled) {
+    setPhonesMessage('Turn on "Allow connections from remote devices", then link from the FrogLog app.');
+  } else if ($('lanPairMessage').textContent.indexOf('wants to link') !== -1) {
+    setPhonesMessage('');
+  }
+  const list = $('lanPhones');
+  if (!state.phones.length) {
+    list.innerHTML = '<p class="muted watched-dirs-empty">No remote devices linked yet.</p>';
+  } else {
+    list.innerHTML = `
+      <table class="mappings-table lan-devices">
+        <thead><tr><th>Device name</th><th></th></tr></thead>
+        <tbody>${state.phones.map((p) => `
+          <tr data-fingerprint="${escapeAttr(p.fingerprint)}">
+            <td class="lan-device-name">${escapeHtml(p.name)}</td>
+            <td class="lan-device-actions"><button type="button" class="lan-device-rename">Rename</button> <button type="button" class="watched-dir-remove">Remove</button></td>
+          </tr>`).join('')}
+        </tbody>
+      </table>`;
+    list.querySelectorAll('.lan-device-rename').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const row = btn.closest('[data-fingerprint]');
+        const cell = row.querySelector('.lan-device-name');
+        const actions = row.querySelector('.lan-device-actions');
+        const current = cell.textContent;
+        clearInterval(phonesPoll); // the list redraws every 2s, which would drop the field mid-edit
+        cell.innerHTML = '<input type="text" class="lan-device-name-input" maxlength="60" />';
+        const input = cell.querySelector('input');
+        input.value = current;
+        actions.innerHTML = '<button type="button" class="lan-device-save">Save</button> <button type="button" class="lan-device-cancel">Cancel</button>';
+        input.focus();
+        input.select();
+        const save = async () => {
+          await invoke('lan_rename_phone', { fingerprint: row.dataset.fingerprint, name: input.value }).catch(() => {});
+          loadPhonesView();
+        };
+        actions.querySelector('.lan-device-save').addEventListener('click', save);
+        actions.querySelector('.lan-device-cancel').addEventListener('click', () => loadPhonesView());
+        input.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter') save();
+          else if (e.key === 'Escape') loadPhonesView();
+        });
+      });
+    });
+    list.querySelectorAll('.watched-dir-remove').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        await invoke('lan_remove_phone', { fingerprint: btn.closest('[data-fingerprint]').dataset.fingerprint }).catch(() => {});
+        loadPhonesView();
+      });
+    });
+  }
+  // A device can ask to link at any time, so while this screen is up it keeps in step with LilyPad.
+  clearInterval(phonesPoll);
+  phonesPoll = setInterval(() => { if (currentView === 'phonesView') loadPhonesView(); else clearInterval(phonesPoll); }, 2000);
 }
 
 async function loadWatchedDirectories() {
@@ -985,6 +1127,7 @@ async function onExeBrowse(e) {
     if (path && typeof path === 'string') {
       const name = path.replace(/^.*[/\\]/, '');
       if (name) {
+        pendingExePathFor[mappingKey(input.dataset.type, parseInt(input.dataset.id, 10))] = path;
         input.value = name;
         input.dispatchEvent(new Event('blur', { bubbles: true }));
       }
@@ -1047,7 +1190,9 @@ async function doApply() {
                     froglogId: gameId,
                     title: (row && row.title) || undefined,
                     titleFilter: newFilter || undefined,
+                    exePath: pendingExePathFor[key] || undefined,
                 });
+                delete pendingExePathFor[key];
             } else {
                 await invoke('delete_process_mapping', { froglogId: gameId, gameType });
             }
@@ -1261,6 +1406,52 @@ listen('show-new-games', () => {
   loadNewGamesView();
 });
 
+// Tray "Link Remote Device…" opens the remote devices view
+listen('show-phones', () => {
+  subViewOrigin = 'mappingsView';
+  showView('phonesView');
+  loadPhonesView();
+});
+// A remote device has started pairing and is waiting for its PIN to be typed here.
+listen('lan-pairing-requested', (event) => {
+  if (currentView !== 'phonesView') {
+    subViewOrigin = 'mappingsView';
+    showView('phonesView');
+  }
+  loadPhonesView().then(() => {
+    setPhonesMessage('\u201c' + event.payload + '\u201d wants to link. Enter its code.');
+    $('lanPairPanel').hidden = false;
+    $('lanPin').focus();
+  });
+});
+listen('lan-paired', (event) => {
+  resetPairingFields();
+  loadPhonesView().then(() => {
+    flashPhonesMessage('Linked ' + event.payload + '.');
+  });
+});
+// The PIN typed was not right: it can be typed again until the tries run out.
+listen('lan-pin-wrong', (event) => {
+  const remaining = event.payload;
+  loadPhonesView().then(() => {
+    $('lanPin').value = '';
+    updateLinkButton();
+    if (remaining > 0) {
+      setPhonesMessage('That PIN was not right. Enter the code again.', true);
+      $('lanPin').focus();
+    } else {
+      resetPairingFields();
+      flashPhonesMessage('Too many attempts.', true);
+    }
+  });
+});
+listen('lan-pairing-failed', () => {
+  resetPairingFields();
+  loadPhonesView().then(() => {
+    flashPhonesMessage('That code was not right. Start again from the other device.', true);
+  });
+});
+
 
 // Tray "Logout" (or after logout) show login view
 listen('show-login', () => {
@@ -1344,6 +1535,7 @@ app.innerHTML = `
         <div class="mappings-switch-row-end">
           <button type="button" id="mappingsOpenWatchedDirs" class="mappings-watched-dirs-btn">Non-Steam Games…</button>
           <button type="button" id="mappingsOpenExcludedGames" class="mappings-watched-dirs-btn">Excluded Games…</button>
+          <button type="button" id="mappingsOpenRemoteDevices" class="mappings-watched-dirs-btn">Manage Remote Devices…</button>
         </div>
       </div>
       <div class="mappings-search-wrap"><input type="search" id="mappingsSearch" class="mappings-search" placeholder="Search…" /></div>
@@ -1397,6 +1589,38 @@ app.innerHTML = `
     <div id="newGamesList" class="pending-list"></div>
     <div class="mappings-footer">
       <button type="button" id="newGamesBack">Back</button>
+    </div>
+  </div>
+  <div data-view id="phonesView" hidden>
+    <div class="mappings-scrollable">
+    <div class="page-header"><h2>Manage Remote Devices</h2><span class="app-version"></span></div>
+    <p class="muted">Start games on this PC from the FrogLog app on another device, over your home network. Nothing goes through the internet, and only devices you link here can do anything.</p>
+    <label class="mappings-auto-submit-label"><input type="checkbox" id="lanEnabled" /> Allow connections from remote devices</label>
+    <label class="mappings-auto-submit-label"><input type="checkbox" id="lanAsk" /> Ask me on this PC before launching a game</label>
+    <div class="lan-port-row">
+      <label class="lan-port-label">Listening port <input type="number" id="lanPort" min="1024" max="65535" step="1" /></label>
+      <button type="button" id="lanPortApply" disabled>Apply</button>
+      <span id="lanPortStatus"></span>
+    </div>
+    <p id="lanPortNote" class="muted"></p>
+    <p id="lanPairMessage" class="muted"></p>
+    <div id="lanPairPanel" hidden>
+      <form id="lanPinForm" class="lan-pair-row">
+        <label class="lan-field lan-field-pin">PIN<input type="text" id="lanPin" inputmode="numeric" maxlength="4" autocomplete="off" /></label>
+        <label class="lan-field lan-field-name">Friendly name<input type="text" id="lanDeviceName" maxlength="60" autocomplete="off" /></label>
+        <button type="submit" id="lanLink" disabled>Link</button>
+        <button type="button" id="lanCancelPairing">Cancel</button>
+      </form>
+    </div>
+    <div class="lan-linked-header">
+      <h3>Linked remote devices</h3>
+      <button type="button" id="lanUnpairAll" class="watched-dir-remove" hidden>Unlink all remote devices</button>
+    </div>
+    <p id="lanAccountNote" class="muted"></p>
+    <div id="lanPhones" class="watched-dirs-list"></div>
+    </div>
+    <div class="mappings-footer">
+      <button type="button" id="phonesBack">Back</button>
     </div>
   </div>
   <div data-view id="watchedDirsView" hidden>
@@ -1508,11 +1732,72 @@ $('watchedDirsAdd').addEventListener('click', async () => {
 $('mainOpenConfigure').addEventListener('click', () => { showView('mappingsView'); loadMappingsView(); });
 $('pendingBack').addEventListener('click', goBackFromSubView);
 $('newGamesBack').addEventListener('click', goBackFromSubView);
+$('phonesBack').addEventListener('click', () => { goBackFromSubView(); });
+$('lanEnabled').addEventListener('change', async (e) => {
+  const enabled = !!e.target.checked;
+  try {
+    await invoke('lan_set_enabled', { enabled });
+  } catch (err) {
+    console.error('[LilyPad] lan_set_enabled error:', err);
+    e.target.checked = !enabled;
+  }
+  loadPhonesView();
+});
+$('lanAsk').addEventListener('change', (e) => {
+  const ask = !!e.target.checked;
+  invoke('lan_set_ask_before_launch', { ask }).catch((err) => {
+    console.error('[LilyPad] lan_set_ask_before_launch error:', err);
+    e.target.checked = !ask;
+  });
+});
+// Apply checks that the port is free and switches to it. A port that can't be used leaves the old one running and says why.
+$('lanPort').addEventListener('input', updatePortApply);
+$('lanPort').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('lanPortApply').click(); });
+$('lanPortApply').addEventListener('click', async () => {
+  const port = Number($('lanPort').value);
+  $('lanPortApply').disabled = true;
+  try {
+    await invoke('lan_set_port', { port });
+    flashPortStatus('Applied', false);
+  } catch (err) {
+    flashPortStatus('Failed to apply', true, String(err));
+    $('lanPort').value = lanPortSaved;
+  }
+  loadPhonesView();
+});
+$('lanPin').addEventListener('input', (e) => {
+  // Digits only.
+  e.target.value = e.target.value.replace(/\D/g, '');
+  updateLinkButton();
+});
+$('lanPinForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  if ($('lanLink').disabled) return;
+  try {
+    await invoke('lan_submit_pin', { pin: $('lanPin').value, name: $('lanDeviceName').value });
+    setPhonesMessage('Checking…');
+  } catch (err) {
+    setPhonesMessage(String(err), true);
+  }
+});
+$('lanCancelPairing').addEventListener('click', async () => {
+  await invoke('lan_cancel_pairing').catch(() => {});
+  $('lanPin').value = '';
+  updateLinkButton();
+  setPhonesMessage('');
+  loadPhonesView();
+});
+$('lanUnpairAll').addEventListener('click', async () => {
+  await invoke('lan_unpair_all').catch(() => {});
+  loadPhonesView();
+});
 $('mappingsOpenWatchedDirs').addEventListener('click', () => {
   showView('watchedDirsView');
   loadWatchedDirectories();
 });
 $('watchedDirsBack').addEventListener('click', () => { showView('mappingsView'); loadMappingsView(); });
+// Back from Remote Devices returns here, since this is where it was opened from.
+$('mappingsOpenRemoteDevices').addEventListener('click', () => openSubView('phonesView', loadPhonesView));
 $('mappingsOpenExcludedGames').addEventListener('click', () => {
   showView('excludedGamesView');
   loadExcludedGames();

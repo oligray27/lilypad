@@ -134,6 +134,27 @@ a:hover { text-decoration: underline; }
 .mappings-settings-grid { display: grid; grid-template-columns: 1fr 1fr; column-gap: 1.5rem; }
 .mappings-auto-submit-label { display: flex; align-items: center; gap: 0.4rem; margin-top: 0.5rem; font-size: 0.9rem; cursor: pointer; width: fit-content; }
 .mappings-auto-submit-label input { width: auto; margin: 0; }
+/* The field and its Apply button are the same height, and the status sits to the right of the button. */
+/* The code and the name go on one row, each with its label above, and the buttons level with the fields */
+.lan-pair-row { display: flex; align-items: flex-end; gap: 0.5rem; margin-top: 0.5rem; }
+.lan-field { display: flex; flex-direction: column; gap: 0.2rem; margin: 0; font-size: 0.85rem; }
+.lan-field input { margin: 0; height: 2rem; box-sizing: border-box; }
+.lan-field-pin { width: 5rem; }
+.lan-field-name { flex: 1; min-width: 0; }
+.lan-pair-row button { margin: 0; height: 2rem; box-sizing: border-box; padding-top: 0; padding-bottom: 0; display: inline-flex; align-items: center; justify-content: center; line-height: 1; }
+.lan-linked-header { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }
+.lan-linked-header h3 { margin: 0.5rem 0; }
+.lan-port-row { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.5rem; }
+.lan-port-label { display: flex; align-items: center; gap: 0.5rem; font-size: 0.9rem; width: fit-content; margin: 0; }
+.lan-port-label input { width: 6rem; margin: 0; }
+.lan-port-row input, .lan-port-row button { height: 2rem; box-sizing: border-box; margin: 0; padding-top: 0; padding-bottom: 0; }
+/* Centred by flex, whatever line height the text inherits. */
+.lan-port-row button { display: inline-flex; align-items: center; justify-content: center; line-height: 1; }
+#lanPortStatus { font-size: 0.9rem; margin: 0; }
+/* The status line is always one line of one size, whatever it says (only the colour differs between states), so nothing below it moves. */
+/* Nothing to say, nothing taking room: the table sits straight under the port row. */
+#lanPairMessage:empty, #lanPortNote:empty { display: none; }
+#lanPairMessage { font-size: 0.9rem; margin: 0.5rem 0; line-height: 1.3; height: 1.3em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .mappings-device-name { cursor: default; }
 .mappings-device-name input { width: 12rem; padding: 0.2rem 0.4rem; }
 /* Non-Steam Games view */
@@ -180,6 +201,14 @@ input#mappingsSearch { width: 100%; padding-right: 0.35rem; box-sizing: border-b
 .mappings-switch button.mappings-switch-conflict + button { border-left-color: var(--error); }
 .mappings-footer { display: flex; justify-content: flex-end; border-top: 1px solid var(--border); padding: 0.5rem 0.35rem 0 0; }
 .mappings-footer button { margin: 0; padding: 0.25rem 0; font-size: 0.85rem; width: 65.75px; }
+/* Link Remote Device view: the content scrolls and the footer stays at the bottom, as on the Configure page */
+#phonesView { width: 100%; max-width: none; display: flex; flex-direction: column; height: calc(100vh - 2rem); }
+#phonesView .mappings-footer { padding-top: 0.5rem; }
+#phonesView .watched-dirs-list { flex: none; overflow: visible; }
+/* The linked devices table takes its look (header and rows) from .mappings-table, as on the Configure page; these two are its own */
+.lan-device-name { word-break: break-word; }
+.lan-device-actions { text-align: right; white-space: nowrap; width: 1%; }
+.lan-device-actions button { margin: 0; }
 /* Pending submissions view */
 #pendingView { width: 100%; max-width: none; display: flex; flex-direction: column; height: calc(100vh - 2rem); }
 #pendingView .mappings-footer { padding-top: 0.5rem; }
@@ -208,3 +237,5 @@ input#mappingsSearch { width: 100%; padding-right: 0.35rem; box-sizing: border-b
 .newgame-search-results { width: 100%; padding: 0.3rem; }
 .newgame-map-select { width: 100%; min-width: 0; padding: 0 0.3rem; height: 1.75rem; }
 .newgame-search-results option, .newgame-map-select option { padding: 0.2rem 0.3rem; }
+.lan-device-actions button.lan-device-rename, .lan-device-actions button.lan-device-save, .lan-device-actions button.lan-device-cancel { padding: 0.2rem 0.6rem; font-size: 0.8rem; }
+.lan-device-name-input { width: 100%; margin: 0; height: 2rem; box-sizing: border-box; }
