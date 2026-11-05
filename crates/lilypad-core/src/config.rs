@@ -28,6 +28,16 @@ pub struct ProcessMapping {
     pub exe_path: Option<String>,
 }
 
+/// What to run when a remote device asks to start one game, typed in by the user, in place of anything LilyPad works out for itself
+/// (see `lan::launch::plan_for`). Either a `steam://rungameid/<digits>` address or the full path of an executable, never arguments.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaunchOverride {
+    pub froglog_id: i32,
+    /// "game" or "live_service", as a remote device names them.
+    pub game_type: String,
+    pub command: String,
+}
+
 /// A root folder the user has pointed LilyPad at for non-Steam games — every immediate
 /// subfolder inside it is treated as a separate installed game (see `local_games.rs`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +63,9 @@ pub struct ExcludedApp {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ProcessMapConfig {
     pub mappings: Vec<ProcessMapping>,
+    /// Games whose remote launch command the user set by hand.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launch_overrides: Vec<LaunchOverride>,
     #[serde(default)]
     pub auto_submit_regular: bool,
     #[serde(default)]

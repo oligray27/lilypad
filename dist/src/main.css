@@ -182,6 +182,18 @@ input#mappingsSearch { width: 100%; padding-right: 0.35rem; box-sizing: border-b
 .mappings-table th { text-align: left; padding: 0.35rem 0.5rem; border: none; font-weight: 600; }
 .mappings-table .mappings-th-window-title { width: 1%; white-space: nowrap; padding-left: 0; }
 .mappings-table td { padding: 0.3rem 0.5rem; border: none; vertical-align: middle; }
+.mappings-table td.mappings-launch-toggle-cell { width: 1%; padding-left: 0; padding-right: 0.25rem; white-space: nowrap; }
+.mappings-launch-actions { display: flex; align-items: center; gap: 0.35rem; }
+.mappings-launch-play:disabled { opacity: 0.4; cursor: default; filter: none; }
+.mappings-launch-toggle { display: inline-flex; align-items: center; justify-content: center; margin: 0; padding: 0 0.5rem; height: 1.75rem; line-height: 0; }
+.mappings-table tbody tr:has(+ .mappings-launch-row) { border-bottom: none; }
+.mappings-launch-row td { padding-top: 0; padding-bottom: 0.4rem; }
+.mappings-launch-line { display: flex; align-items: center; gap: 0.35rem; }
+.mappings-launch-label { white-space: nowrap; margin-right: 0.15rem; }
+.mappings-launch-line input.mappings-launch { flex: 1; min-width: 0; margin-top: 0; height: 1.75rem; padding: 0.25rem 0.4rem; box-sizing: border-box; font-family: ui-monospace, monospace; font-size: 0.9em; }
+.mappings-launch-browse { margin: 0; }
+.mappings-launch-reset { margin: 0; padding: 0 0.5rem; font-size: 0.85rem; white-space: nowrap; height: 1.75rem; }
+.mappings-launch-error { margin: 0.25rem 0 0; font-size: 0.85em; }
 .mappings-table .mappings-title { max-width: 252px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mappings-table .mappings-type { color: var(--muted); font-size: 0.9em; white-space: nowrap; }
 .mappings-table td.mappings-exe-cell { width: 1%; padding: 0.3rem 0.35rem 0.3rem 0.5rem; white-space: nowrap; }

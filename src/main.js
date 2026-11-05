@@ -559,6 +559,7 @@ let pendingExePathFor = {};    // the whole path of an executable picked with Br
 let pendingTitleFilterFor = {};
 let savedExeFor = {};          // reflects what's currently on disk
 let savedTitleFilterFor = {};
+let expandedLaunchKeys = new Set(); // rows whose remote launch command is showing
 let mappingsMode = 'regular'; // 'regular' (merged Games tab, covers both regular+session-tracked rows) | 'live'
 let mappingsPage = 0;
 let mappingsSearch = '';
@@ -607,6 +608,110 @@ function titleFilterByGame(mappings) {
   return out;
 }
 
+// Fills each opened row's "Remote launch command" field, and switches each row's Play button on or off, from what a remote device's launch request would run on this PC (the Rust side applies
+// the same rules as the LAN server), and lets it be changed. A command typed in is only ever a steam://rungameid/<number> address or an
+// exe's full path, and typing back what LilyPad would run anyway removes the override.
+function launchRowFor(key) {
+  return mappingsAllRows.find((row) => mappingKey(row.type, row.id) === key);
+}
+function launchQuery(row) {
+  return { game_type: row.type === 'live' ? 'live_service' : 'game', id: row.id, steam_launch_id: row.steamLaunchId || null };
+}
+function launchElements(key) {
+  const q = (cls) => document.querySelector(`.${cls}[data-key="${CSS.escape(key)}"]`);
+  return { input: q('mappings-launch'), reset: q('mappings-launch-reset'), browse: q('mappings-launch-browse'), error: q('mappings-launch-error') };
+}
+function showLaunchError(key, message) {
+  const { error } = launchElements(key);
+  if (!error) return;
+  error.textContent = message || '';
+  error.hidden = !message;
+}
+function launchErrorText(e, fallback) {
+  return typeof e === 'string' ? e : (e && e.message) || fallback;
+}
+async function saveLaunchOverride(key, command, fallbackMessage) {
+  const row = launchRowFor(key);
+  if (!row) return;
+  const { game_type: gameType, id } = launchQuery(row);
+  try {
+    await invoke('set_launch_override', { gameType, id, command });
+    showLaunchError(key, '');
+  } catch (e) {
+    showLaunchError(key, launchErrorText(e, fallbackMessage));
+    return;
+  }
+  showLaunchCommands([row]);
+}
+function commitLaunchOverride(key) {
+  const { input } = launchElements(key);
+  if (!input) return;
+  const typed = input.value.trim();
+  if (typed === (input.dataset.shown || '')) return;
+  saveLaunchOverride(key, typed === (input.dataset.default || '') ? '' : typed, 'Could not save that command.');
+}
+function showLaunchCommands(rows) {
+  if (!rows.length) return;
+  invoke('get_launch_commands', { queries: rows.map(launchQuery) }).then((infos) => {
+    rows.forEach((row, i) => {
+      const key = mappingKey(row.type, row.id);
+      const { input, reset, browse } = launchElements(key);
+      const info = infos[i];
+      // Play needs something to run: a game with no command (nothing set, nothing LilyPad can find) has it disabled
+      const play = document.querySelector(`.mappings-launch-play[data-key="${CSS.escape(key)}"]`);
+      if (play) {
+        play.dataset.canPlay = info.command ? '1' : '';
+        play.disabled = !info.command;
+        play.title = info.command ? 'Start this game with its remote launch command' : 'No remote launch command: open the row to set one';
+      }
+      if (!input) return;
+      const value = info.custom != null ? info.custom : (info.command || '');
+      input.value = value;
+      input.dataset.shown = value;
+      input.dataset.default = info.default_command || '';
+      input.title = info.custom != null && !info.command ? "This command can't run right now, so remote launches of this game are refused." : '';
+      input.classList.toggle('mappings-launch-custom', info.custom != null);
+      if (reset) reset.hidden = info.custom == null;
+      if (!input.dataset.bound) {
+        input.dataset.bound = '1';
+        input.addEventListener('blur', () => commitLaunchOverride(key));
+        input.addEventListener('keydown', (e) => { if (e.key === 'Enter') input.blur(); });
+        if (reset) reset.addEventListener('click', () => saveLaunchOverride(key, '', 'Could not reset that command.'));
+        if (browse) {
+          browse.addEventListener('click', async () => {
+            try {
+              const path = await invoke('pick_launch_target');
+              if (path && typeof path === 'string') {
+                input.value = path;
+                commitLaunchOverride(key);
+              }
+            } catch (e) {
+              showLaunchError(key, launchErrorText(e, 'Could not open the file picker.'));
+            }
+          });
+        }
+      }
+    });
+  }).catch(() => {});
+}
+
+// Splits rows into pages of MAPPINGS_PAGE_SIZE lines, where a row with its remote launch command open takes two, so opening one pushes
+// the last row down to the next page and the table keeps its height instead of growing a scrollbar.
+function paginateMappings(rows) {
+  const pages = [[]];
+  let used = 0;
+  for (const row of rows) {
+    const cost = expandedLaunchKeys.has(mappingKey(row.type, row.id)) ? 2 : 1;
+    if (used + cost > MAPPINGS_PAGE_SIZE && pages[pages.length - 1].length) {
+      pages.push([]);
+      used = 0;
+    }
+    pages[pages.length - 1].push(row);
+    used += cost;
+  }
+  return pages;
+}
+
 function renderMappingsTable() {
   const tableBody = $('mappingsTableBody');
   if (!tableBody || !mappingsAllRows.length) return;
@@ -618,9 +723,10 @@ function renderMappingsTable() {
     const modeMatches = mappingsMode === 'live' ? r.type === 'live' : r.type !== 'live';
     return modeMatches && (!needle || r.title.toLowerCase().includes(needle));
   });
-  const totalPages = Math.max(1, Math.ceil(filtered.length / MAPPINGS_PAGE_SIZE));
+  const pages = paginateMappings(filtered);
+  const totalPages = pages.length;
   mappingsPage = Math.min(Math.max(0, mappingsPage), totalPages - 1);
-  const rows = filtered.slice(mappingsPage * MAPPINGS_PAGE_SIZE, (mappingsPage + 1) * MAPPINGS_PAGE_SIZE);
+  const rows = pages[mappingsPage];
   tableBody.innerHTML = rows
     .map((row) => {
       const key = mappingKey(row.type, row.id);
@@ -629,11 +735,13 @@ function renderMappingsTable() {
       const titleEsc = escapeHtml(row.title);
       const exeEsc = escapeAttr(exe);
       const tfEsc = escapeAttr(titleFilter);
+      const expanded = expandedLaunchKeys.has(key);
       return `<tr data-type="${escapeAttr(row.type)}" data-id="${row.id}" data-title="${escapeAttr(row.title)}">
         <td class="mappings-title">${titleEsc}</td>
         <td class="mappings-exe-cell"><div class="mappings-exe-cell-inner"><input type="text" class="mappings-exe" value="${exeEsc}" placeholder="e.g. hl2.exe" data-type="${escapeAttr(row.type)}" data-id="${row.id}" data-title="${escapeAttr(row.title)}" /><button type="button" class="mappings-browse">Browse…</button></div></td>
         <td class="mappings-title-filter-cell"><input type="text" class="mappings-title-filter" value="${tfEsc}" placeholder="optional" data-type="${escapeAttr(row.type)}" data-id="${row.id}" data-title="${escapeAttr(row.title)}" /></td>
-      </tr>`;
+        <td class="mappings-launch-toggle-cell"><div class="mappings-launch-actions"><button type="button" class="mappings-launch-toggle mappings-launch-play" data-key="${escapeAttr(key)}" disabled title="Start this game with its remote launch command" aria-label="Start ${escapeAttr(row.title)}"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 3 20 12 6 21 6 3"/></svg></button><button type="button" class="mappings-launch-toggle" data-key="${escapeAttr(key)}" aria-expanded="${expanded}" title="${expanded ? 'Hide' : 'Show'} the remote launch command"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="20" x="5" y="2" rx="2" ry="2"/><path d="M12 18h.01"/></svg></button></div></td>
+      </tr>${expanded ? `<tr class="mappings-launch-row" data-launch-for="${escapeAttr(key)}"><td colspan="4"><div class="mappings-launch-line"><span class="mappings-launch-label">Remote launch command</span><input type="text" class="mappings-launch" data-key="${escapeAttr(key)}" placeholder="A launcher link (steam://rungameid/12345) or the full path of an exe or shortcut" spellcheck="false" /><button type="button" class="mappings-browse mappings-launch-browse" data-key="${escapeAttr(key)}">Browse…</button><button type="button" class="mappings-launch-reset" data-key="${escapeAttr(key)}" hidden>Reset</button></div><p class="mappings-launch-error error" data-key="${escapeAttr(key)}" hidden></p></td></tr>` : ''}`;
     })
     .join('');
   tableBody.querySelectorAll('.mappings-exe').forEach((input) => {
@@ -645,6 +753,36 @@ function renderMappingsTable() {
   tableBody.querySelectorAll('.mappings-title-filter').forEach((input) => {
     input.addEventListener('blur', onTitleFilterBlur);
   });
+  tableBody.querySelectorAll('.mappings-launch-play').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const row = launchRowFor(btn.dataset.key);
+      if (!row) return;
+      const errEl = $('mappingsError');
+      if (errEl) errEl.textContent = '';
+      btn.disabled = true;
+      try {
+        await invoke('launch_game_now', { query: launchQuery(row) });
+      } catch (e) {
+        if (errEl) errEl.textContent = launchErrorText(e, 'Could not start that game.');
+      } finally {
+        setTimeout(() => { btn.disabled = !btn.dataset.canPlay; }, 1500);
+      }
+    });
+  });
+  tableBody.querySelectorAll('.mappings-launch-toggle:not(.mappings-launch-play)').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const key = btn.dataset.key;
+      if (expandedLaunchKeys.has(key)) expandedLaunchKeys.delete(key);
+      else expandedLaunchKeys.add(key);
+      // Follow the row, which may now sit on a different page
+      const needle = mappingsSearch.toLowerCase();
+      const visible = mappingsAllRows.filter((r) => (mappingsMode === 'live' ? r.type === 'live' : r.type !== 'live') && (!needle || r.title.toLowerCase().includes(needle)));
+      const at = paginateMappings(visible).findIndex((page) => page.some((r) => mappingKey(r.type, r.id) === key));
+      if (at >= 0) mappingsPage = at;
+      renderMappingsTable();
+    });
+  });
+  showLaunchCommands(rows);
   const btnGames = $('mappingsSwitchGames');
   const btnLive = $('mappingsSwitchLive');
   if (btnGames) btnGames.classList.toggle('active', mappingsMode === 'regular');
@@ -943,8 +1081,8 @@ async function loadMappingsView() {
     savedExeFor = { ...loadedExe };
     savedTitleFilterFor = { ...loadedTitleFilter };
     mappingsAllRows = dedupeLatestByTitle([
-      ...(games || []).map((g) => ({ id: g.id, title: g.title || `#${g.id}`, type: g.session_tracking ? 'session' : 'regular' })),
-      ...(liveService || []).map((g) => ({ id: g.id, title: g.title || `#${g.id}`, type: 'live' })),
+      ...(games || []).map((g) => ({ id: g.id, title: g.title || `#${g.id}`, type: g.session_tracking ? 'session' : 'regular', steamLaunchId: g.steam_launch_id == null ? null : String(g.steam_launch_id) })),
+      ...(liveService || []).map((g) => ({ id: g.id, title: g.title || `#${g.id}`, type: 'live', steamLaunchId: g.steam_launch_id == null ? null : String(g.steam_launch_id) })),
     ]);
     mappingsMode = 'regular';
     mappingsPage = 0;
@@ -1542,7 +1680,7 @@ app.innerHTML = `
       <p id="mappingsError" class="error"></p>
       <div id="mappingsTableWrap" class="mappings-table-wrap">
         <table class="mappings-table">
-          <thead><tr><th>Game</th><th>exe</th><th class="mappings-th-window-title">Window title filter</th></tr></thead>
+          <thead><tr><th>Game</th><th>exe</th><th class="mappings-th-window-title">Window title filter</th><th></th></tr></thead>
           <tbody id="mappingsTableBody"></tbody>
         </table>
       </div>

@@ -72,6 +72,10 @@ pub struct Game {
     /// release. `#[serde(default)]` for the same "not-yet-upgraded backend" reason as `igdb_id`.
     #[serde(default)]
     pub platform_links: Option<Vec<PlatformLink>>,
+    /// The id Steam is asked to start for "Play on PC" (steam://rungameid/<id>), when the game has one set. Shown in the mappings table as
+    /// what a remote device's launch request runs. `#[serde(default)]` so a backend that doesn't send it still parses.
+    #[serde(default)]
+    pub steam_launch_id: Option<serde_json::Value>,
 }
 
 /// Lighter "want to play" entry — same identity fields as `Game`, used to check whether a
@@ -109,6 +113,10 @@ pub struct LiveServiceGame {
     /// backend" reason as `igdb_id`.
     #[serde(default)]
     pub platform_links: Option<Vec<PlatformLink>>,
+    /// The id Steam is asked to start for "Play on PC" (steam://rungameid/<id>), when the game has one set. Shown in the mappings table as
+    /// what a remote device's launch request runs. `#[serde(default)]` so a backend that doesn't send it still parses.
+    #[serde(default)]
+    pub steam_launch_id: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]

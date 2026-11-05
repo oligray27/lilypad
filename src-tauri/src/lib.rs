@@ -1806,6 +1806,9 @@ impl lilypad_core::lan::server::LanHost for TauriLan {
     fn mappings(&self) -> Vec<ProcessMapping> {
         self.app.state::<AppState>().process_map_arc.read().unwrap().mappings.clone()
     }
+    fn launch_overrides(&self) -> Vec<lilypad_core::config::LaunchOverride> {
+        self.app.state::<AppState>().process_map_arc.read().unwrap().launch_overrides.clone()
+    }
     fn tracking(&self) -> bool {
         self.app.state::<AppState>().current_session_arc.read().unwrap().is_some()
     }
@@ -2860,6 +2863,86 @@ fn get_auth_config(state: tauri::State<AppState>) -> AuthConfig {
     state.auth.read().unwrap().clone()
 }
 
+/// One game the mappings table asks about: what its remote launch would run.
+#[derive(Debug, serde::Deserialize)]
+struct LaunchQuery {
+    /// "game" or "live_service", as a remote device sends it.
+    game_type: String,
+    id: i32,
+    steam_launch_id: Option<String>,
+}
+
+/// What a remote launch of one game runs, as the mappings table shows it.
+#[derive(Debug, serde::Serialize)]
+struct LaunchInfo {
+    /// What a launch request would run right now (a `steam://` address or an executable's path), or null when this PC can't start it.
+    command: Option<String>,
+    /// What it would run without the user's own command, so the table can tell when that is what was typed back in.
+    default_command: Option<String>,
+    /// The command the user set by hand, exactly as saved (shown even when it can't run).
+    custom: Option<String>,
+}
+
+/// What a remote device's launch request would run for each game. Uses the same rules as the LAN server, so the table never disagrees
+/// with what happens.
+#[tauri::command]
+fn get_launch_commands(app: tauri::AppHandle, queries: Vec<LaunchQuery>) -> Vec<LaunchInfo> {
+    use lilypad_core::lan::launch::{describe, plan, plan_for};
+    use lilypad_core::lan::server::LanHost;
+    let host = TauriLan { app };
+    let mappings = host.mappings();
+    let overrides = host.launch_overrides();
+    queries
+        .iter()
+        .map(|q| {
+            let steam = q.steam_launch_id.as_deref();
+            let exists = |p: &std::path::Path| p.exists();
+            LaunchInfo {
+                command: plan_for(&q.game_type, q.id, steam, &overrides, &mappings, &exists, &|m| host.resolve_launch(m)).ok().map(|p| describe(&p)),
+                default_command: plan(&q.game_type, q.id, steam, &mappings, &exists, &|m| host.resolve_launch(m)).ok().map(|p| describe(&p)),
+                custom: overrides.iter().find(|o| o.game_type == q.game_type && o.froglog_id == q.id).map(|o| o.command.clone()),
+            }
+        })
+        .collect()
+}
+
+/// Starts a game from the mappings table's Play button, with the command a remote device's request would run. The table's user is at
+/// this PC, so none of the LAN server's guards (a linked device, a session already tracking, asking first) apply.
+#[tauri::command]
+fn launch_game_now(app: tauri::AppHandle, query: LaunchQuery) -> Result<(), String> {
+    use lilypad_core::lan::launch::{plan_for, start, Refusal};
+    use lilypad_core::lan::server::LanHost;
+    let host = TauriLan { app };
+    let plan = plan_for(&query.game_type, query.id, query.steam_launch_id.as_deref(), &host.launch_overrides(), &host.mappings(), &|p| p.exists(), &|m| host.resolve_launch(m))
+        .map_err(|refusal| match refusal {
+            Refusal::NoLaunchMethod => "LilyPad has no way to start this game. Open the row and set its remote launch command.".to_string(),
+            Refusal::BadRequest => "That isn't a game LilyPad can start.".to_string(),
+        })?;
+    start(&plan).map_err(|e| format!("Could not start it: {e}"))
+}
+
+/// Sets, or with an empty command clears, the launch command for one game. Only a `scheme://` link or the full path of an executable or
+/// shortcut is accepted (never arguments), and the reason is returned when it isn't.
+#[tauri::command]
+fn set_launch_override(state: tauri::State<AppState>, game_type: String, id: i32, command: String) -> Result<(), String> {
+    use lilypad_core::config::LaunchOverride;
+    if game_type != "game" && game_type != "live_service" {
+        return Err("Unknown game type.".into());
+    }
+    let command = command.trim().to_string();
+    if !command.is_empty() && lilypad_core::lan::launch::parse_command(&command).is_none() {
+        return Err("Use a launcher link like steam://rungameid/<number> or curseforge://..., or the full path of an executable or shortcut, with no arguments.".into());
+    }
+    let mut map = state.process_map_arc.read().unwrap().clone();
+    map.launch_overrides.retain(|o| !(o.game_type == game_type && o.froglog_id == id));
+    if !command.is_empty() {
+        map.launch_overrides.push(LaunchOverride { froglog_id: id, game_type, command });
+    }
+    map.save_to(&process_map_path_for_auth(&state.auth.read().unwrap())).map_err(|e| e.to_string())?;
+    *state.process_map_arc.write().unwrap() = map;
+    Ok(())
+}
+
 #[tauri::command]
 fn get_process_mappings(state: tauri::State<AppState>) -> ProcessMapConfig {
     state.process_map_arc.read().unwrap().clone()
@@ -3183,6 +3266,18 @@ fn pick_exe_file(app: tauri::AppHandle) -> Result<Option<String>, String> {
     Ok(path.and_then(|p| p.as_path().map(|path| path.display().to_string())))
 }
 
+/// Picks what a remote launch should run: an executable or a shortcut. Windows' file dialog may hand back a shortcut's target in place
+/// of the shortcut itself; a shortcut's own path can be pasted into the field instead when its arguments matter.
+#[tauri::command]
+fn pick_launch_target(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let dialog = app.dialog().file();
+    #[cfg(windows)]
+    let dialog = dialog.add_filter("Programs and shortcuts", &["exe", "lnk", "url"]).add_filter("All files", &["*"]);
+    let path = dialog.blocking_pick_file();
+    Ok(path.and_then(|p| p.as_path().map(|path| path.display().to_string())))
+}
+
 #[tauri::command]
 fn pick_directory(app: tauri::AppHandle) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
@@ -3352,6 +3447,9 @@ pub fn run() {
             intercept_auto_submit,
             get_auth_config,
             get_process_mappings,
+            get_launch_commands,
+            set_launch_override,
+            launch_game_now,
             save_process_mapping,
             enable_session_tracking,
             refresh_library_index,
@@ -3375,6 +3473,7 @@ pub fn run() {
             set_window_size,
             open_url,
             pick_exe_file,
+            pick_launch_target,
             pick_directory,
             get_watched_directories,
             add_watched_directory,

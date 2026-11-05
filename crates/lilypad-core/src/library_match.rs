@@ -318,6 +318,7 @@ mod tests {
             steam_app_id: appid.map(|a| serde_json::json!(a)),
             igdb_id: igdb_id.map(|i| serde_json::json!(i)),
             platform_links,
+            steam_launch_id: None,
         }
     }
 
@@ -477,6 +478,7 @@ mod tests {
             last_session_date: None,
             steam_app_id: appid.map(|a| serde_json::json!(a)),
             igdb_id: None,
+            steam_launch_id: None,
             platform_links,
         }
     }

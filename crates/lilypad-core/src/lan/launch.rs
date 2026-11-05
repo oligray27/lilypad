@@ -8,15 +8,17 @@
 //!    only learned when the game has been seen running, so without this a game that has never been tracked could not be started.
 //! Nothing else is ever run. In particular no path, command line or argument from the phone reaches a process.
 
-use crate::config::ProcessMapping;
+use crate::config::{LaunchOverride, ProcessMapping};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Plan {
     /// Open `steam://rungameid/<id>`.
     Steam(String),
-    /// Start this executable, in its own folder.
+    /// Start this executable, in its own folder. A Windows shortcut (.lnk, .url) works too: the shell follows it as a double-click would.
     Exe(PathBuf),
+    /// Open this address with whatever program is registered for it (`curseforge://launch-game?...`, `com.epicgames.launcher://...`).
+    Url(String),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -77,6 +79,67 @@ pub fn find_file(dir: &std::path::Path, name: &str, depth: usize) -> Option<Path
         return None;
     }
     subdirs.into_iter().find_map(|sub| find_file(&sub, name, depth - 1))
+}
+
+/// Address schemes that open or run content rather than a launcher, so are never accepted as a launch command.
+const BLOCKED_SCHEMES: &[&str] = &["file", "javascript", "data", "vbscript"];
+
+/// `scheme://rest` with no spaces, where the scheme is a real one (two or more characters, so a drive letter like `C://` is not).
+fn parse_url(text: &str) -> Option<String> {
+    let (scheme, rest) = text.split_once("://")?;
+    let valid = scheme.len() >= 2
+        && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    let allowed = !BLOCKED_SCHEMES.iter().any(|b| scheme.eq_ignore_ascii_case(b));
+    (valid && allowed && !rest.is_empty() && !text.chars().any(char::is_whitespace)).then(|| text.to_string())
+}
+
+/// Reads a launch command someone typed in on this PC: a `steam://rungameid/<digits>` address, any other `scheme://` address (a launcher's
+/// own link), or the full path of an executable or shortcut (optionally in quotes). Anything else, including a relative path, or
+/// arguments after a path, is rejected, so nothing a remote device sends can ever become part of what runs.
+pub fn parse_command(raw: &str) -> Option<Plan> {
+    let text = raw.trim();
+    if text.is_empty() || text.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    if let Some(rest) = text.strip_prefix("steam://rungameid/") {
+        return clean_steam_id(Some(rest)).map(Plan::Steam);
+    }
+    if let Some(url) = parse_url(text) {
+        return Some(Plan::Url(url));
+    }
+    let path = text.strip_prefix('"').and_then(|t| t.strip_suffix('"')).unwrap_or(text);
+    (!path.contains('"') && Path::new(path).is_absolute()).then(|| Plan::Exe(PathBuf::from(path)))
+}
+
+/// The command shown for a plan, in the form `parse_command` reads back.
+pub fn describe(plan: &Plan) -> String {
+    match plan {
+        Plan::Steam(id) => format!("steam://rungameid/{id}"),
+        Plan::Exe(path) => path.display().to_string(),
+        Plan::Url(url) => url.clone(),
+    }
+}
+
+/// `plan`, but a command set for this game by hand comes first. One that can't be used (not a valid command, or an executable that
+/// is gone) is refused, not quietly replaced with something else, so what the user typed is what runs or nothing does.
+pub fn plan_for(
+    game_type: &str,
+    froglog_id: i32,
+    steam_launch_id: Option<&str>,
+    overrides: &[LaunchOverride],
+    mappings: &[ProcessMapping],
+    exists: &dyn Fn(&std::path::Path) -> bool,
+    fallback: &dyn Fn(&ProcessMapping) -> Option<Plan>,
+) -> Result<Plan, Refusal> {
+    if let Some(custom) = overrides.iter().find(|o| o.game_type == game_type && o.froglog_id == froglog_id) {
+        return match parse_command(&custom.command) {
+            Some(Plan::Exe(path)) if !exists(&path) => Err(Refusal::NoLaunchMethod),
+            Some(plan) => Ok(plan),
+            None => Err(Refusal::NoLaunchMethod),
+        };
+    }
+    plan(game_type, froglog_id, steam_launch_id, mappings, exists, fallback)
 }
 
 pub fn plan(
@@ -151,6 +214,12 @@ fn shell_open(target: &std::ffi::OsStr, dir: Option<&Path>) -> std::io::Result<(
     }
 }
 
+/// A Windows shortcut or internet shortcut, which the shell opens for us.
+#[cfg(windows)]
+fn is_shortcut(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("lnk") || e.eq_ignore_ascii_case("url"))
+}
+
 /// Starts the plan. Windows hands it to the shell (see `shell_open`); Linux uses `xdg-open` for a Steam URL and runs an executable
 /// directly. The executable gets its own folder as the working directory, which many games need.
 pub fn start(plan: &Plan) -> std::io::Result<()> {
@@ -158,6 +227,9 @@ pub fn start(plan: &Plan) -> std::io::Result<()> {
     {
         match plan {
             Plan::Steam(id) => shell_open(std::ffi::OsStr::new(&format!("steam://rungameid/{id}")), None),
+            Plan::Url(url) => shell_open(std::ffi::OsStr::new(url), None),
+            // A shortcut carries its own working folder, which passing the shortcut's own would override.
+            Plan::Exe(path) if is_shortcut(path) => shell_open(path.as_os_str(), None),
             Plan::Exe(path) => shell_open(path.as_os_str(), path.parent()),
         }
     }
@@ -168,6 +240,11 @@ pub fn start(plan: &Plan) -> std::io::Result<()> {
             Plan::Steam(id) => {
                 let mut c = Command::new("xdg-open");
                 c.arg(format!("steam://rungameid/{id}"));
+                c
+            }
+            Plan::Url(url) => {
+                let mut c = Command::new("xdg-open");
+                c.arg(url);
                 c
             }
             Plan::Exe(path) => {
@@ -197,6 +274,71 @@ mod tests {
     }
     fn none(_: &ProcessMapping) -> Option<Plan> {
         None
+    }
+
+    #[test]
+    fn typed_commands_are_a_steam_address_or_an_absolute_path_only() {
+        assert_eq!(parse_command("steam://rungameid/620"), Some(Plan::Steam("620".into())));
+        assert_eq!(parse_command("  steam://rungameid/620  "), Some(Plan::Steam("620".into())));
+        assert_eq!(parse_command("steam://rungameid/620 -novid"), None);
+        assert_eq!(parse_command("steam://rungameid/"), None);
+        assert_eq!(parse_command("steam://rungameid/abc"), None);
+        assert_eq!(parse_command("game.exe"), None);
+        assert_eq!(parse_command(""), None);
+        assert_eq!(parse_command("calc.exe & del *"), None);
+        #[cfg(windows)]
+        {
+            assert_eq!(parse_command(r"C:\Games\a.exe"), Some(Plan::Exe(PathBuf::from(r"C:\Games\a.exe"))));
+            assert_eq!(parse_command(r#""C:\Games\a.exe""#), Some(Plan::Exe(PathBuf::from(r"C:\Games\a.exe"))));
+        }
+        #[cfg(not(windows))]
+        assert_eq!(parse_command("/games/a.sh"), Some(Plan::Exe(PathBuf::from("/games/a.sh"))));
+    }
+
+    #[test]
+    fn a_launchers_own_link_is_accepted_but_not_something_that_opens_files() {
+        let link = "curseforge://launch-game?instanceId=71127f30-e169-4e9e-a97f-70846b8a9f7c&gameId=432";
+        assert_eq!(parse_command(link), Some(Plan::Url(link.into())));
+        assert_eq!(parse_command("steam://run/620"), Some(Plan::Url("steam://run/620".into())));
+        assert_eq!(parse_command("com.epicgames.launcher://apps/x?action=launch"), Some(Plan::Url("com.epicgames.launcher://apps/x?action=launch".into())));
+        assert_eq!(parse_command("curseforge://launch-game?a=1 && calc"), None);
+        assert_eq!(parse_command("file:///C:/Windows/System32/calc.exe"), None);
+        assert_eq!(parse_command("FILE://x"), None);
+        assert_eq!(parse_command("javascript://alert(1)"), None);
+        assert_eq!(parse_command("curseforge://"), None);
+        // A drive letter is not a scheme: on Windows this is just a path
+        #[cfg(windows)]
+        assert_eq!(parse_command("C://Games/a.exe"), Some(Plan::Exe(PathBuf::from("C://Games/a.exe"))));
+        #[cfg(not(windows))]
+        assert_eq!(parse_command("C://Games/a.exe"), None);
+        #[cfg(windows)]
+        assert_eq!(parse_command(r"C:\Users\me\Desktop\Game.lnk"), Some(Plan::Exe(PathBuf::from(r"C:\Users\me\Desktop\Game.lnk"))));
+    }
+
+    fn custom(kind: &str, id: i32, command: &str) -> LaunchOverride {
+        LaunchOverride { froglog_id: id, game_type: kind.into(), command: command.into() }
+    }
+
+    #[test]
+    fn a_typed_command_wins_over_the_phone_and_the_mapping() {
+        let m = vec![mapping("regular", 7, Some("C:/old/game.exe"))];
+        let overrides = vec![custom("game", 7, "steam://rungameid/99")];
+        assert_eq!(plan_for("game", 7, Some("620"), &overrides, &m, &there, &none), Ok(Plan::Steam("99".into())));
+        // Another game, or the other kind of game, is not affected
+        assert_eq!(plan_for("game", 8, Some("620"), &overrides, &m, &there, &none), Ok(Plan::Steam("620".into())));
+        assert_eq!(plan_for("live_service", 7, Some("620"), &overrides, &m, &there, &none), Ok(Plan::Steam("620".into())));
+    }
+
+    #[test]
+    fn a_typed_command_that_cannot_run_is_refused_rather_than_replaced() {
+        let m = vec![mapping("regular", 7, Some("C:/old/game.exe"))];
+        let bad = vec![custom("game", 7, "not a command")];
+        assert_eq!(plan_for("game", 7, Some("620"), &bad, &m, &there, &none), Err(Refusal::NoLaunchMethod));
+        #[cfg(windows)]
+        let missing = vec![custom("game", 7, r"C:\gone\game.exe")];
+        #[cfg(not(windows))]
+        let missing = vec![custom("game", 7, "/gone/game.exe")];
+        assert_eq!(plan_for("game", 7, Some("620"), &missing, &m, &gone, &none), Err(Refusal::NoLaunchMethod));
     }
 
     #[test]

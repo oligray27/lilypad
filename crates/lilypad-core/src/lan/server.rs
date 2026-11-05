@@ -50,6 +50,10 @@ pub trait LanHost: Send + Sync + 'static {
     /// "Ask me on this PC before launching".
     fn ask_before_launch(&self) -> bool;
     fn mappings(&self) -> Vec<ProcessMapping>;
+    /// Launch commands the user set by hand for particular games; they replace everything else.
+    fn launch_overrides(&self) -> Vec<crate::config::LaunchOverride> {
+        Vec::new()
+    }
     /// A session is being tracked now, so no game is launched on top of it.
     fn tracking(&self) -> bool;
     /// The Steam app ids installed on this PC. A game that is installed has a licence, so starting it through Steam will work.
@@ -420,7 +424,7 @@ fn route(inner: &Arc<Inner>, request: &Request, phone_fp: &str) -> (u16, Value) 
                 ("GET", "/launchable") => {
                     // Only real Steam app ids (the digits), not the "local:" ids LilyPad gives games it finds in watched folders.
                     let steam: Vec<String> = inner.host.installed_steam_ids().into_iter().filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())).collect();
-                    (200, json!({ "games": launchable(&inner.host.mappings()), "steam_installed": steam }))
+                    (200, json!({ "games": launchable(&inner.host.mappings(), &inner.host.launch_overrides()), "steam_installed": steam }))
                 }
                 ("POST", "/launch") => launch_game(inner, &phone, &json_body),
                 ("DELETE", "/pair") => {
@@ -434,16 +438,28 @@ fn route(inner: &Arc<Inner>, request: &Request, phone_fp: &str) -> (u16, Value) 
 }
 
 /// The games this PC can start from a recorded executable (Steam ones the phone already knows from the site).
-fn launchable(mappings: &[ProcessMapping]) -> Vec<Value> {
+fn launchable(mappings: &[ProcessMapping], overrides: &[crate::config::LaunchOverride]) -> Vec<Value> {
     let mut seen = std::collections::HashSet::new();
-    mappings
+    // A command typed in for a game makes it launchable, as long as it can run.
+    let custom: Vec<Value> = overrides
+        .iter()
+        .filter(|o| match launch::parse_command(&o.command) {
+            Some(launch::Plan::Exe(path)) => path.exists(),
+            Some(_) => true,
+            None => false,
+        })
+        .filter(|o| seen.insert((o.game_type.clone(), o.froglog_id)))
+        .map(|o| json!({ "account": "tester", "game_type": o.game_type, "game_id": o.froglog_id }))
+        .collect();
+    let from_mappings = mappings
         .iter()
         .filter(|m| m.exe_path.as_deref().map(|p| std::path::Path::new(p).exists()).unwrap_or(false))
         .filter_map(|m| {
             let kind = if m.r#type == "live" { "live_service" } else { "game" };
-            seen.insert((kind, m.froglog_id)).then(|| json!({ "account": "tester", "game_type": kind, "game_id": m.froglog_id }))
+            seen.insert((kind.to_string(), m.froglog_id)).then(|| json!({ "account": "tester", "game_type": kind, "game_id": m.froglog_id }))
         })
-        .collect()
+        .collect::<Vec<_>>();
+    custom.into_iter().chain(from_mappings).collect()
 }
 
 fn launch_game(inner: &Arc<Inner>, phone: &store::PairedPhone, body: &Value) -> (u16, Value) {
@@ -464,7 +480,7 @@ fn launch_game(inner: &Arc<Inner>, phone: &store::PairedPhone, body: &Value) -> 
     if inner.host.tracking() {
         return (409, json!({ "error": "session_running" }));
     }
-    let plan = match launch::plan(game_type, game_id, body["steam_launch_id"].as_str(), &inner.host.mappings(), &|p| p.exists(), &|m| inner.host.resolve_launch(m)) {
+    let plan = match launch::plan_for(game_type, game_id, body["steam_launch_id"].as_str(), &inner.host.launch_overrides(), &inner.host.mappings(), &|p| p.exists(), &|m| inner.host.resolve_launch(m)) {
         Ok(plan) => plan,
         Err(refusal) => return (if refusal == launch::Refusal::BadRequest { 400 } else { 409 }, json!({ "error": refusal.code() })),
     };
@@ -474,8 +490,9 @@ fn launch_game(inner: &Arc<Inner>, phone: &store::PairedPhone, body: &Value) -> 
     let method = match plan {
         launch::Plan::Steam(_) => "steam",
         launch::Plan::Exe(_) => "exe",
+        launch::Plan::Url(_) => "url",
     };
-    log::info!("[LilyPad] starting game {game_id} for {} by {}", phone.name, match &plan { launch::Plan::Steam(id) => format!("Steam {id}"), launch::Plan::Exe(path) => path.display().to_string() });
+    log::info!("[LilyPad] starting game {game_id} for {} by {}", phone.name, match &plan { launch::Plan::Steam(id) => format!("Steam {id}"), launch::Plan::Exe(path) => path.display().to_string(), launch::Plan::Url(url) => url.clone() });
     match launch::start(&plan) {
         Ok(()) => {
             inner.host.event(Event::Launched { phone: phone.name.clone(), title, method, game_id, game_type: game_type.to_string() });

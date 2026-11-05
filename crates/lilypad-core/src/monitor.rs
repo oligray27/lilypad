@@ -1832,6 +1832,7 @@ mod tests {
             session_tracking: Some(session_tracking),
             steam_app_id: Some(serde_json::json!(appid)),
             igdb_id: None,
+            steam_launch_id: None,
             platform_links: None,
         }
     }
@@ -1845,6 +1846,7 @@ mod tests {
             last_session_date: None,
             steam_app_id: Some(serde_json::json!(appid)),
             igdb_id: None,
+            steam_launch_id: None,
             platform_links: None,
         }
     }
