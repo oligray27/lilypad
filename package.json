@@ -1,6 +1,6 @@
 {
   "name": "lilypad",
-  "version": "0.6.6",
+  "version": "0.6.7",
   "description": "Froglog game time tracker - system tray app",
   "private": true,
   "scripts": {
