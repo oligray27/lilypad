@@ -334,9 +334,9 @@ fn submit_now(
     ledger_id: Option<String>,
 ) {
     let client = client_for(auth);
-    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
     let title = mapping.title.clone().unwrap_or_else(|| mapping.process.clone());
     let store = state.store();
+    let date = store.session_date(ledger_id.as_deref(), hours);
     let submission = submission_for(mapping, hours, date.clone(), notes.clone(), false, true);
     if let Some(id) = &ledger_id {
         store.save_attempt(id, &submission);

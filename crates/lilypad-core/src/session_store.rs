@@ -372,6 +372,16 @@ impl SessionStore {
             .map_or(0, |stored| stored.record.paused_secs_at(at))
     }
 
+    /// The date to log `hours` of play under, counted back from when record `id` ended (or from
+    /// now, without one), so a session finished after midnight keeps the day it started on.
+    pub fn session_date(&self, id: Option<&str>, hours: f64) -> String {
+        let ended = id
+            .and_then(|id| self.with_ledger("reading a session's end", |l| l.get(id)).flatten())
+            .and_then(|stored| stored.record.ended_at_secs)
+            .unwrap_or_else(now_secs);
+        crate::duration::session_date(ended, hours)
+    }
+
     /// Credits a normally-ended unmapped session into New Games and settles its record in one
     /// transaction. Returns the entry's new total hours.
     pub fn complete_unmapped(&self, id: &str) -> Option<f64> {
@@ -382,7 +392,7 @@ impl SessionStore {
     }
 
     /// Credits an unmapped session that has no start record (its start could not be stored)
-    /// straight into New Games, dated today. Returns the entry's new total hours.
+    /// straight into New Games, dated the day it started. Returns the entry's new total hours.
     pub fn record_new_game(
         &self,
         account: &AccountIdentity,
@@ -392,7 +402,7 @@ impl SessionStore {
         hours: f64,
         replay_of: Option<ReplayOf>,
     ) -> Option<f64> {
-        let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let date = crate::duration::session_date(now_secs(), hours);
         self.with_ledger("recording a new game session", |l| {
             l.record_new_game_session(Some(account), appid, title, exe_name, hours, replay_of, date, now_secs())
         })

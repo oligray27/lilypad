@@ -671,6 +671,11 @@ fn save_attempt(app: &tauri::AppHandle, ledger_id: Option<&str>, submission: Sub
     }
 }
 
+/// The date `hours` of play is logged under: the day the session must have started.
+fn session_date(app: &tauri::AppHandle, ledger_id: Option<&str>, hours: f64) -> String {
+    app.state::<AppState>().store().session_date(ledger_id, hours)
+}
+
 /// Consumes the force-stop block for `process_name` if one is set, returning whether it was.
 ///
 /// The flag both suppresses the duplicate end event for a session the user already stopped by
@@ -1529,7 +1534,8 @@ fn handle_session_ended(
                     }
                     let auth2 = auth.clone();
                     let game_type2 = mapping.r#type.clone();
-                    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+                    let date = session_date(&app, ledger_id.as_deref(), hours);
+                    let failed_date = date.clone();
                     save_attempt(&app, ledger_id.as_deref(), Submission {
                         game_id: mapping.froglog_id, game_type: mapping.r#type.clone(), title: title_str.clone(),
                         hours, date: date.clone(), notes: Some("Session auto submitted with LilyPad".to_string()),
@@ -1557,7 +1563,7 @@ fn handle_session_ended(
                                 game_type: mapping.r#type.clone(),
                                 title: title_str.clone(),
                                 hours,
-                                date: chrono::Local::now().format("%Y-%m-%d").to_string(),
+                                date: failed_date,
                                 notes: None,
                                 spoiler: false,
                                 is_public: true,
@@ -1588,7 +1594,7 @@ fn handle_session_ended(
             }
 
             // Regular games: silent auto-submit (no notes support)
-            let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+            let date = session_date(&app, ledger_id.as_deref(), hours);
             let mapping2 = mapping.clone();
             let date2 = date.clone();
             let game_type2 = mapping2.r#type.clone();
@@ -2425,10 +2431,10 @@ fn submit_session(
     ledger_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let auth = state.auth.read().unwrap().clone();
-    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
     let spoiler = spoiler.unwrap_or(false);
     let is_public = is_public.unwrap_or(true);
     let ledger_id = submission_ledger_id(&state, ledger_id);
+    let date = state.store().session_date(ledger_id.as_deref(), hours);
 
     save_attempt(&app, ledger_id.as_deref(), Submission {
         game_id, game_type: game_type.clone(), title: title.clone().unwrap_or_default(),

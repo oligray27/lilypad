@@ -46,7 +46,7 @@ pub fn submit_decision(
         );
     }
     let client = client_for(&auth);
-    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let date = store.session_date(ledger_id.as_deref(), hours);
     let submission = submission_for(mapping, hours, date.clone(), notes.clone(), spoiler, is_public);
     if let Some(id) = &ledger_id {
         store.save_attempt(id, &submission);
